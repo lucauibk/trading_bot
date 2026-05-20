@@ -44,13 +44,6 @@
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .msg { font-size: 13px; color: #888; margin-top: 8px; min-height: 20px; }
 
-  /* ── Coin Budget ── */
-  .coin-budget-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; margin-bottom: 12px; }
-  .coin-budget-card { background: #0f0f1a; border: 1px solid #2a2a4a; border-radius: 10px; padding: 14px; }
-  .coin-budget-card .sym { font-size: 14px; font-weight: bold; color: #00c896; margin-bottom: 8px; display: flex; align-items: center; gap: 10px; }
-  .coin-budget-card label { font-size: 11px; color: #888; display: block; margin-bottom: 4px; }
-  .coin-budget-card input[type=number] { width: 100%; background: #1a1a2e; color: #e0e0e0; border: 1px solid #2a2a4a; border-radius: 6px; padding: 7px 10px; font-size: 14px; }
-  .coin-budget-card input[type=number]:focus { outline: none; border-color: #00c896; }
   .toggle { position: relative; display: inline-block; width: 36px; height: 20px; }
   .toggle input { opacity: 0; width: 0; height: 0; }
   .slider { position: absolute; inset: 0; background: #444; border-radius: 20px; cursor: pointer; transition: .2s; }
@@ -120,15 +113,6 @@
     <div class="msg" id="ctrl-msg"></div>
   </div>
 
-  <!-- Coin Budget -->
-  <div class="controls" id="coin-budget-section">
-    <h2>Coin-Budget (USDT pro Coin)</h2>
-    <div class="coin-budget-grid" id="coin-budget-grid"></div>
-    <div style="display:flex;gap:12px;align-items:center">
-      <button class="btn btn-start" onclick="saveCoinBudgets()" style="padding:8px 20px;font-size:13px">💾 Speichern</button>
-      <span class="msg" id="budget-msg"></span>
-    </div>
-  </div>
 
   <!-- Equity Curve -->
   <div class="chart-card">
@@ -420,65 +404,9 @@ async function refreshGrids() {
   }).join('');
 }
 
-// ── Coin Budget ──────────────────────────────────────────────────────────────
-async function loadCoinBudgets() {
-  const settings = await fetch('/api/coin-settings').then(r => r.json()).catch(() => []);
-  const grid = document.getElementById('coin-budget-grid');
-  if (!settings.length) {
-    document.getElementById('coin-budget-section').style.display = 'none';
-    return;
-  }
-  document.getElementById('coin-budget-section').style.display = '';
-  grid.innerHTML = settings.map(s => `
-    <div class="coin-budget-card">
-      <div class="sym">
-        <span>${s.symbol}</span>
-        <label class="toggle" title="Coin aktivieren/deaktivieren">
-          <input type="checkbox" id="en-${s.symbol}" ${s.enabled ? 'checked' : ''}
-                 onchange="toggleCoin('${s.symbol}')">
-          <span class="slider"></span>
-        </label>
-      </div>
-      <label>Max Investment (USDT)</label>
-      <input type="number" id="inv-${s.symbol}" value="${s.max_investment}" min="10" step="10">
-    </div>`).join('');
-}
-
-async function saveCoinBudgets() {
-  const cards = document.querySelectorAll('.coin-budget-card');
-  const results = [];
-  for (const card of cards) {
-    const sym = card.querySelector('.sym span').textContent;
-    const inv = parseFloat(document.getElementById('inv-' + sym).value);
-    const en  = document.getElementById('en-' + sym).checked ? 1 : 0;
-    const res = await fetch('/api/coin-settings', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({symbol: sym, max_investment: inv, enabled: en})
-    }).then(r => r.json());
-    results.push(res);
-  }
-  const ok = results.every(r => r.ok);
-  const msg = document.getElementById('budget-msg');
-  msg.textContent = ok ? 'Gespeichert ✓ (beim nächsten Bot-Start aktiv)' : results.find(r => !r.ok)?.msg;
-  msg.style.color = ok ? '#00c896' : '#ff4d4d';
-  setTimeout(() => { msg.textContent = ''; }, 4000);
-}
-
-async function toggleCoin(symbol) {
-  const en = document.getElementById('en-' + symbol).checked ? 1 : 0;
-  const inv = parseFloat(document.getElementById('inv-' + symbol).value);
-  await fetch('/api/coin-settings', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({symbol, max_investment: inv, enabled: en})
-  });
-}
-
 initChart();
 refresh();
 refreshGrids();
-loadCoinBudgets();
 setInterval(refresh, 10000);
 setInterval(refreshGrids, 10000);
 </script>
