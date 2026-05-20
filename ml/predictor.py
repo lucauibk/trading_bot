@@ -7,12 +7,13 @@ import ta as ta_lib
 
 from .data_store import MLDataStore
 from .features import extract_features
+from .llm_analyst import analyse as llm_analyse, blend_scores
 from .model import LABEL_TO_STR, TradingModel
 from .trainer import ModelTrainer, bootstrap_from_history
 
 logger = logging.getLogger("ml.predictor")
 
-MIN_CONFIDENCE  = 0.52  # Mindest-Konfidenz um ML-Vorhersage zu verwenden
+MIN_CONFIDENCE  = 0.45  # Mindest-Konfidenz (gesenkt da LLM als zweite Instanz)
 RULE_THRESHOLD  = 3     # Score-Schwelle für regelbasiertes Fallback
 
 
@@ -49,7 +50,7 @@ class MLPredictor:
     def predict(self, symbol: str) -> str:
         """
         Gibt 'up', 'down' oder 'neutral' zurück.
-        Kompatibel mit dem bestehenden predict_direction()-Interface.
+        Kombiniert LightGBM + Claude Haiku wenn API-Key vorhanden.
         """
         try:
             df    = self._fetch_ohlcv(symbol, "1h", 120)
@@ -57,30 +58,47 @@ class MLPredictor:
             price = float(df["close"].iloc[-1])
             model = self._models.get(symbol)
 
+            lgbm_score = 0.0
+            lgbm_conf  = 0.0
+            label_int  = 1  # hold
+
             if model and model.is_ready():
-                label_int, confidence = model.predict(feats)
+                label_int, lgbm_conf = model.predict(feats)
+                lgbm_score = {"sell": -1.0, "hold": 0.0, "buy": 1.0}[LABEL_TO_STR[label_int]] * lgbm_conf
                 ts = int(time.time())
                 if self._trainer:
                     self._trainer.record(symbol, ts, feats, price, label_int)
-                    # Retrain asynchron – nicht im predict-Hot-Path blockieren
                     threading.Thread(
                         target=self._trainer.label_and_maybe_retrain,
                         args=(symbol, df),
                         daemon=True,
                     ).start()
 
-                if confidence >= MIN_CONFIDENCE:
-                    direction = {"sell": "down", "hold": "neutral", "buy": "up"}[LABEL_TO_STR[label_int]]
-                    logger.info(
-                        "ML %-12s → %-7s (konfidenz=%.2f, n=%d)",
-                        symbol, direction.upper(), confidence, model._n_samples,
-                    )
-                    return direction
+            # LLM-Analyse (gecacht, ~1×/Stunde pro Coin)
+            llm_indicators = self._build_llm_indicators(df, symbol)
+            llm_result = llm_analyse(symbol, llm_indicators)
 
+            # Blending: LightGBM + Claude Haiku
+            blended_score, blended_conf = blend_scores(lgbm_score, lgbm_conf, llm_result)
+
+            if blended_conf >= MIN_CONFIDENCE or (llm_result and llm_result["confidence"] >= 0.60):
+                if blended_score > 0.15:
+                    direction = "up"
+                elif blended_score < -0.15:
+                    direction = "down"
+                else:
+                    direction = "neutral"
+
+                src = "LGBM+LLM" if llm_result else "LGBM"
                 logger.info(
-                    "ML %s: Konfidenz %.2f < %.2f → regelbasiertes Fallback",
-                    symbol, confidence, MIN_CONFIDENCE,
+                    "%-12s → %-7s [%s] score=%+.2f conf=%.2f%s",
+                    symbol, direction.upper(), src, blended_score, blended_conf,
+                    f" | LLM: {llm_result['reason']}" if llm_result else "",
                 )
+                return direction
+
+            if lgbm_conf < MIN_CONFIDENCE:
+                logger.info("ML %s: Konfidenz %.2f < %.2f → Fallback", symbol, lgbm_conf, MIN_CONFIDENCE)
 
             result = self._rule_based(df)
             logger.info("Fallback %-12s → %s", symbol, result.upper())
@@ -89,6 +107,42 @@ class MLPredictor:
         except Exception as e:
             logger.warning("ML Fehler %s: %s", symbol, e)
             return "neutral"
+
+    def _build_llm_indicators(self, df, symbol: str) -> dict:
+        """Bereitet Indikatoren für den LLM-Prompt auf."""
+        try:
+            close  = df["close"]
+            high   = df["high"]
+            low    = df["low"]
+            ema9   = float(ta_lib.trend.ema_indicator(close, window=9).iloc[-1])
+            ema21  = float(ta_lib.trend.ema_indicator(close, window=21).iloc[-1])
+            rsi    = float(ta_lib.momentum.rsi(close, window=7).iloc[-1])
+            atr    = ta_lib.volatility.average_true_range(high, low, close, window=14)
+            atr_pct = float(atr.iloc[-1] / close.iloc[-1] * 100)
+            bb_h   = ta_lib.volatility.bollinger_hband(close).iloc[-1]
+            bb_l   = ta_lib.volatility.bollinger_lband(close).iloc[-1]
+            bb_pos = float((close.iloc[-1] - bb_l) / (bb_h - bb_l)) if bb_h != bb_l else 0.5
+
+            candles = []
+            for i in range(-5, 0):
+                row = df.iloc[i]
+                candles.append({
+                    "time":  str(df.index[i])[:13] if hasattr(df.index[i], '__str__') else "",
+                    "open":  float(row["open"]),
+                    "high":  float(row["high"]),
+                    "low":   float(row["low"]),
+                    "close": float(row["close"]),
+                })
+
+            return {
+                "price": float(close.iloc[-1]),
+                "rsi": rsi, "ema9": ema9, "ema21": ema21,
+                "atr_pct": atr_pct, "bb_position": bb_pos,
+                "regime": "ranging",
+                "last_candles": candles,
+            }
+        except Exception:
+            return {"price": float(df["close"].iloc[-1])}
 
     # ── Regelbasiertes Fallback (identisch zu original predict_direction) ──────
 
