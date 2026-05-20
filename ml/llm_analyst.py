@@ -113,7 +113,20 @@ def analyse(symbol: str, indicators: dict) -> Optional[dict]:
         return result
 
     except Exception as e:
-        logger.warning("LLM Fehler %s: %s", symbol, e)
+        err = str(e).lower()
+        if any(k in err for k in ("credit", "billing", "quota", "insufficient", "payment", "permission")):
+            logger.error("LLM CREDITS AUFGEBRAUCHT oder API-Fehler: %s", e)
+            try:
+                import notifier
+                notifier._send(
+                    "⚠️ <b>Anthropic API – Credits aufgebraucht!</b>\n"
+                    "LLM-Analyse deaktiviert. Bot läuft nur noch mit LightGBM weiter.\n"
+                    f"Fehler: {e}"
+                )
+            except Exception:
+                pass
+        else:
+            logger.warning("LLM Fehler %s: %s", symbol, e)
         return None
 
 
