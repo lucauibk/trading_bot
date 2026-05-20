@@ -60,18 +60,40 @@ def api_start():
                     "msg": f"Bot gestartet ({strategy.upper()}, {mode.upper()})"})
 
 
-@app.route("/api/bot/stop", methods=["POST"])
-def api_stop():
+def _stop_bot_process():
+    """Beendet den Bot-Prozess – via Subprocess-Handle ODER PID-File (extern gestartet)."""
     global _bot_process
 
+    # 1) Via Subprocess-Handle (Dashboard hat den Bot gestartet)
     if _bot_process and _bot_process.poll() is None:
         _bot_process.terminate()
         try:
             _bot_process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             _bot_process.kill()
+        _bot_process = None
 
-    (_ROOT / ".bot.pid").unlink(missing_ok=True)
+    # 2) Fallback: Bot wurde extern gestartet (z.B. ./start.sh --bot) → PID-File lesen
+    pid_file = _ROOT / ".bot.pid"
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            if pid != os.getpid():           # nie sich selbst killen
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(1)
+                try:
+                    os.kill(pid, 0)          # noch am Leben?
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass                     # bereits beendet
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+        pid_file.unlink(missing_ok=True)
+
+
+@app.route("/api/bot/stop", methods=["POST"])
+def api_stop():
+    _stop_bot_process()
     set_status(running=False)
     return jsonify({"ok": True, "msg": "Bot gestoppt"})
 
@@ -79,16 +101,7 @@ def api_stop():
 @app.route("/api/shutdown", methods=["POST"])
 def api_shutdown():
     """Stoppt Bot + Dashboard komplett (nichts läuft danach im Hintergrund)."""
-    global _bot_process
-
-    if _bot_process and _bot_process.poll() is None:
-        _bot_process.terminate()
-        try:
-            _bot_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            _bot_process.kill()
-
-    (_ROOT / ".bot.pid").unlink(missing_ok=True)
+    _stop_bot_process()
     set_status(running=False)
 
     def _kill():
