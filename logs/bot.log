@@ -1,0 +1,40 @@
+2026-04-22 12:40:25,438 [INFO] bot – ============================================================
+2026-04-22 12:40:25,438 [INFO] bot – Trading Bot startet | Paper=True | Symbole=['BTC/USD', 'ETH/USD']
+2026-04-22 12:40:25,438 [INFO] bot – ============================================================
+2026-04-22 12:40:25,438 [INFO] executor – Paper Trading Modus aktiv
+2026-04-22 12:40:31,141 [INFO] bot – Tick abgeschlossen | Offene Positionen: 0 | Kapital: 1000.00 USDT
+2026-04-22 12:41:34,674 [INFO] bot – Tick abgeschlossen | Offene Positionen: 0 | Kapital: 1000.00 USDT
+2026-04-22 12:42:38,178 [INFO] bot – Tick abgeschlossen | Offene Positionen: 0 | Kapital: 1000.00 USDT
+2026-04-22 12:43:41,724 [INFO] bot – Tick abgeschlossen | Offene Positionen: 0 | Kapital: 1000.00 USDT
+2026-04-22 12:44:45,268 [INFO] bot – Tick abgeschlossen | Offene Positionen: 0 | Kapital: 1000.00 USDT
+2026-04-22 12:45:48,815 [INFO] bot – Tick abgeschlossen | Offene Positionen: 0 | Kapital: 1000.00 USDT
+2026-04-22 12:46:52,346 [INFO] bot – Tick abgeschlossen | Offene Positionen: 0 | Kapital: 1000.00 USDT
+2026-04-22 12:47:55,902 [INFO] bot – Tick abgeschlossen | Offene Positionen: 0 | Kapital: 1000.00 USDT
+2026-04-22 12:48:59,423 [INFO] bot – Tick abgeschlossen | Offene Positionen: 0 | Kapital: 1000.00 USDT
+2026-04-22 12:50:02,959 [INFO] bot – Tick abgeschlossen | Offene Positionen: 0 | Kapital: 1000.00 USDT
+2026-04-22 12:50:58,756 [INFO] bot – Shutdown Signal empfangen – beende Bot…
+2026-04-22 12:50:59,177 [INFO] bot – Bot gestoppt.
+2026-04-22 16:16:32,606 [INFO] bot – ============================================================
+2026-04-22 16:16:32,607 [INFO] bot – Trading Bot startet | Paper=True | Symbole=['SOL/USD', 'MATIC/USD', 'ETH/USD', 'DOT/USD']
+2026-04-22 16:16:32,607 [INFO] bot – ============================================================
+2026-04-22 16:16:32,607 [INFO] executor – Paper Trading Modus aktiv
+2026-04-22 16:16:36,060 [ERROR] bot – Fehler im Bot-Loop: kraken does not have market symbol MATIC/USD
+Traceback (most recent call last):
+  File "/Users/lucasturz/Projects/trading-bot/bot.py", line 59, in run
+    df = fetch_ohlcv(symbol, config.TIMEFRAME, config.LOOKBACK_CANDLES)
+  File "/Users/lucasturz/Projects/trading-bot/data_fetcher.py", line 40, in fetch_ohlcv
+    raw = get_public_exchange().fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+  File "/Users/lucasturz/Library/Python/3.9/lib/python/site-packages/ccxt/kraken.py", line 1173, in fetch_ohlcv
+    market = self.market(symbol)
+  File "/Users/lucasturz/Library/Python/3.9/lib/python/site-packages/ccxt/base/exchange.py", line 6589, in market
+    raise BadSymbol(self.id + ' does not have market symbol ' + symbol)
+ccxt.base.errors.BadSymbol: kraken does not have market symbol MATIC/USD
+2026-04-22 16:17:09,243 [INFO] bot – Shutdown Signal empfangen – beende Bot…
+2026-04-22 16:17:09,351 [INFO] bot – Bot gestoppt.
+2026-04-22 16:17:12,249 [INFO] bot – ============================================================
+2026-04-22 16:17:12,249 [INFO] bot – Trading Bot startet | Paper=True | Symbole=['SOL/USD', 'ETH/USD', 'DOT/USD', 'LINK/USD']
+2026-04-22 16:17:12,249 [INFO] bot – ============================================================
+2026-04-22 16:17:12,249 [INFO] executor – Paper Trading Modus aktiv
+2026-04-22 16:17:22,327 [INFO] bot – Tick abgeschlossen | Offene Positionen: 0 | Kapital: 1000.00 USDT
+2026-04-22 16:18:15,862 [INFO] bot – Shutdown Signal empfangen – beende Bot…
+2026-04-22 16:18:16,542 [INFO] bot – Bot gestoppt.

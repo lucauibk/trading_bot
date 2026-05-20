@@ -1,0 +1,23 @@
+exchange: kraken
+symbol: SOL/USD
+timeframe: 1h
+paper_trading: true
+initial_capital: 1000
+
+symbols:
+  - SOL/USD
+  - ETH/USD
+  - LINK/USD
+  - DOT/USD
+
+risk:
+  max_risk_per_trade: 0.01      # 1% Kapital pro Trade
+  max_portfolio_risk: 0.05      # 5% gleichzeitiges Risiko
+  max_daily_drawdown: 0.03      # Bot stoppt bei 3% Tagesverlust
+  max_position_size: 0.10       # Max 10% Kapital pro Position
+  max_open_positions: 3
+
+telegram:
+  enabled: false
+  token: ""
+  chat_id: ""

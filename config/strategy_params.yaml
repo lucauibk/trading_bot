@@ -1,0 +1,30 @@
+ema_crossover:
+  ema_fast: 9
+  ema_slow: 21
+  ema_trend: 50
+  rr_ratio: 2.0
+  atr_period: 14
+  atr_stop_mult: 1.5
+  volume_confirm: true
+
+rsi_mean_rev:
+  rsi_period: 7
+  rsi_oversold: 30
+  rsi_exit: 65
+  ema_trend: 50
+  bb_period: 20
+  bb_std: 2.0
+  atr_period: 14
+  atr_stop_mult: 1.5
+  atr_tp_mult: 2.0
+
+grid:
+  investment_per_coin: 300
+  levels: 6
+  range_min: 0.03
+  range_max: 0.25
+  atr_candles: 24
+  compound_every: 5
+  max_loss_usdt: 50.0
+  use_prediction: true
+  prediction_recheck: 30
