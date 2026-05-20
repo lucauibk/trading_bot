@@ -53,6 +53,7 @@ def api_start():
     cmd = [sys.executable, "main.py", "--mode", mode,
            "--strategy", strategy, "--no-confirm"]
     _bot_process = subprocess.Popen(cmd, cwd=str(_ROOT))
+    (_ROOT / ".bot.pid").write_text(str(_bot_process.pid))
 
     set_status(running=True, mode=mode, strategy=strategy)
     return jsonify({"ok": True,
@@ -70,6 +71,7 @@ def api_stop():
         except subprocess.TimeoutExpired:
             _bot_process.kill()
 
+    (_ROOT / ".bot.pid").unlink(missing_ok=True)
     set_status(running=False)
     return jsonify({"ok": True, "msg": "Bot gestoppt"})
 
@@ -86,6 +88,7 @@ def api_shutdown():
         except subprocess.TimeoutExpired:
             _bot_process.kill()
 
+    (_ROOT / ".bot.pid").unlink(missing_ok=True)
     set_status(running=False)
 
     def _kill():
