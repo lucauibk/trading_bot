@@ -49,7 +49,7 @@ MAX_INVESTMENT_MULT  = 3.0    # Compounding-Cap: max. 3× Initial-Investment pro
 
 # ── Directional Trades (KI kauft aktiv bei UP-Signal) ─────────────────────────
 DIRECTIONAL_ENABLED   = True
-DIRECTIONAL_SCORE_MIN = 0.15   # Score > 0.15 bei UP-Signal → kaufen
+DIRECTIONAL_SCORE_MIN = 0.08   # Score > 0.08 bei UP-Signal → kaufen
 DIRECTIONAL_PCT       = 0.15   # 15% des Investments pro Directional Trade
 DIRECTIONAL_TP_ATR    = 2.5    # Take-Profit: Einstieg + 2.5 × ATR
 DIRECTIONAL_SL_ATR    = 1.5    # Stop-Loss:   Einstieg − 1.5 × ATR
@@ -638,12 +638,24 @@ class PaperGridBot:
                               "paper" if config.PAPER_TRADING else "live")
                 except Exception:
                     pass
-                # Neue Kauf-Order am alten Kauflevel – nur wenn ML nicht DOWN
+                # Neue Kauf-Order – nur wenn ML nicht DOWN
                 if self.with_position:
                     replenish_usdt = self._level_allocations.get(buy_price, self.usdt_per_grid)
-                    self.orders[buy_price] = {
+                    # Bei bullischem Score: Buy eine Stufe unter Verkaufs-Level (folgt Kurs nach oben)
+                    # Bei neutralem/bärischem Score: zurück ans originale Kauf-Level (warte auf Pullback)
+                    direction_score = get_last_direction_score(self.symbol)
+                    try:
+                        sell_idx = self.grid_lines.index(price)
+                        higher_buy = sell_idx > 0 and direction_score > 0.1
+                    except ValueError:
+                        higher_buy = False
+                    if higher_buy:
+                        new_buy_price = self.grid_lines[sell_idx - 1]  # eine Stufe unter sell
+                    else:
+                        new_buy_price = buy_price
+                    self.orders[new_buy_price] = {
                         "side": "buy",
-                        "qty": replenish_usdt / buy_price,
+                        "qty": replenish_usdt / new_buy_price,
                         "filled": False,
                     }
                 # Auto-Compounding: Gewinne alle X Trades reinvestieren

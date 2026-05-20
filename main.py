@@ -116,6 +116,12 @@ def main():
     cfg["paper_trading"] = paper
     logger.info("Modus: %s | Strategie: %s", args.mode.upper(), args.strategy.upper())
 
+    try:
+        from dashboard.db import set_status
+        set_status(running=True, mode=args.mode, strategy=args.strategy)
+    except Exception:
+        pass
+
     if args.strategy == "grid":
         run_grid(paper)
         return
