@@ -72,6 +72,69 @@ def _init(con: sqlite3.Connection):
             enabled        INTEGER DEFAULT 1,
             updated_at     TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS trade_context (
+            id              INTEGER PRIMARY KEY,
+            trade_id        INTEGER REFERENCES trades(id),
+            symbol          TEXT,
+            ts              TEXT,
+            atr_pct         REAL,
+            rsi             REAL,
+            ema9            REAL,
+            ema21           REAL,
+            macd_hist       REAL,
+            bb_position     REAL,
+            volume_ratio    REAL,
+            regime          TEXT,
+            ml_prediction   TEXT,
+            ml_confidence   REAL,
+            predicted_low   REAL,
+            predicted_high  REAL,
+            grid_level_idx  INTEGER,
+            holding_seconds REAL,
+            fees_usdt       REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS grid_sessions (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol             TEXT,
+            started_at         TEXT,
+            ended_at           TEXT,
+            total_profit       REAL,
+            n_trades           INTEGER,
+            n_wins             INTEGER,
+            max_drawdown       REAL,
+            range_pct_avg      REAL,
+            levels             INTEGER,
+            initial_investment REAL,
+            final_investment   REAL,
+            exit_reason        TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS predictions (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol           TEXT,
+            ts               TEXT,
+            prediction       TEXT,
+            confidence       REAL,
+            predicted_low    REAL,
+            predicted_high   REAL,
+            realized_high_6h REAL,
+            realized_low_6h  REAL,
+            hit              INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS optimizer_runs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol      TEXT,
+            regime      TEXT,
+            params_json TEXT,
+            score       REAL,
+            daily_pct   REAL,
+            max_dd      REAL,
+            sample_size INTEGER,
+            created_at  TEXT
+        );
     """)
     for col, coldef in [
         ("predicted_low",  "REAL DEFAULT 0"),
@@ -87,13 +150,66 @@ def _init(con: sqlite3.Connection):
 
 
 def log_trade(symbol: str, direction: str, entry: float, exit_: float,
-              pnl: float, reason: str, strategy: str = "grid", mode: str = "paper"):
+              pnl: float, reason: str, strategy: str = "grid", mode: str = "paper",
+              context: dict = None) -> int:
+    """Schreibt einen Trade und optional seinen Kontext. Gibt die Trade-ID zurück."""
+    from datetime import datetime
+    now = datetime.utcnow().isoformat()
+    con = get_conn()
+    cur = con.execute(
+        "INSERT INTO trades (timestamp,symbol,direction,entry,exit,pnl,reason,strategy,mode) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (now, symbol, direction, entry, exit_, pnl, reason, strategy, mode)
+    )
+    trade_id = cur.lastrowid
+    if context:
+        con.execute(
+            """INSERT INTO trade_context
+               (trade_id, symbol, ts, atr_pct, rsi, ema9, ema21, macd_hist,
+                bb_position, volume_ratio, regime, ml_prediction, ml_confidence,
+                predicted_low, predicted_high, grid_level_idx, holding_seconds, fees_usdt)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                trade_id, symbol, now,
+                context.get("atr_pct"), context.get("rsi"),
+                context.get("ema9"), context.get("ema21"),
+                context.get("macd_hist"), context.get("bb_position"),
+                context.get("volume_ratio"), context.get("regime"),
+                context.get("ml_prediction"), context.get("ml_confidence"),
+                context.get("predicted_low"), context.get("predicted_high"),
+                context.get("grid_level_idx"), context.get("holding_seconds"),
+                context.get("fees_usdt"),
+            )
+        )
+    con.commit()
+    con.close()
+    return trade_id
+
+
+def log_prediction(symbol: str, prediction: str, confidence: float,
+                   predicted_low: float, predicted_high: float):
+    """Speichert eine ML/PricePredictor-Vorhersage für spätere Kalibrierungsauswertung."""
     from datetime import datetime
     con = get_conn()
     con.execute(
-        "INSERT INTO trades (timestamp,symbol,direction,entry,exit,pnl,reason,strategy,mode) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
-        (datetime.utcnow().isoformat(), symbol, direction, entry, exit_, pnl, reason, strategy, mode)
+        """INSERT INTO predictions (symbol, ts, prediction, confidence, predicted_low, predicted_high)
+           VALUES (?,?,?,?,?,?)""",
+        (symbol, datetime.utcnow().isoformat(), prediction, confidence, predicted_low, predicted_high)
+    )
+    con.commit()
+    con.close()
+
+
+def log_optimizer_run(symbol: str, regime: str, params: dict, score: float,
+                      daily_pct: float, max_dd: float, sample_size: int):
+    import json
+    from datetime import datetime
+    con = get_conn()
+    con.execute(
+        """INSERT INTO optimizer_runs (symbol, regime, params_json, score, daily_pct, max_dd, sample_size, created_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (symbol, regime, json.dumps(params), score, daily_pct, max_dd, sample_size,
+         datetime.utcnow().isoformat())
     )
     con.commit()
     con.close()

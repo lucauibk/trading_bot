@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 from typing import Callable, Dict, List, Optional
 
@@ -61,7 +62,12 @@ class MLPredictor:
                 ts = int(time.time())
                 if self._trainer:
                     self._trainer.record(symbol, ts, feats, price, label_int)
-                    self._trainer.label_and_maybe_retrain(symbol, df)
+                    # Retrain asynchron – nicht im predict-Hot-Path blockieren
+                    threading.Thread(
+                        target=self._trainer.label_and_maybe_retrain,
+                        args=(symbol, df),
+                        daemon=True,
+                    ).start()
 
                 if confidence >= MIN_CONFIDENCE:
                     direction = {"sell": "down", "hold": "neutral", "buy": "up"}[LABEL_TO_STR[label_int]]

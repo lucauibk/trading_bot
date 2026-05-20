@@ -5,8 +5,8 @@ load_dotenv()
 
 # ── Exchange ──────────────────────────────────────────────────────────────────
 EXCHANGE_ID = "kraken"
-API_KEY = os.getenv("BINANCE_API_KEY", "")
-API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+API_KEY = os.getenv("KRAKEN_API_KEY") or os.getenv("BINANCE_API_KEY", "")
+API_SECRET = os.getenv("KRAKEN_API_SECRET") or os.getenv("BINANCE_API_SECRET", "")
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
 
 # ── Märkte & Timeframe ────────────────────────────────────────────────────────

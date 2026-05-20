@@ -38,8 +38,9 @@
   select:focus { outline: none; border-color: #00c896; }
   .btn { padding: 10px 24px; border: none; border-radius: 8px; font-size: 14px; font-weight: bold; cursor: pointer; transition: opacity .2s; }
   .btn:hover { opacity: 0.85; }
-  .btn-start { background: #00c896; color: #000; }
-  .btn-stop  { background: #ff4d4d; color: #fff; }
+  .btn-start    { background: #00c896; color: #000; }
+  .btn-stop     { background: #ff4d4d; color: #fff; }
+  .btn-shutdown { background: #555; color: #fff; }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .msg { font-size: 13px; color: #888; margin-top: 8px; min-height: 20px; }
 
@@ -114,6 +115,7 @@
       </select>
       <button class="btn btn-start" id="btn-start" onclick="startBot()">▶ Starten</button>
       <button class="btn btn-stop"  id="btn-stop"  onclick="stopBot()" disabled>⏹ Stoppen</button>
+      <button class="btn btn-shutdown" onclick="shutdownAll()" title="Bot + Dashboard komplett beenden">⏻ Alles beenden</button>
     </div>
     <div class="msg" id="ctrl-msg"></div>
   </div>
@@ -220,6 +222,18 @@ async function stopBot() {
   const data = await res.json();
   setMsg(data.msg, !data.ok);
   if (data.ok) updateControls(false);
+}
+
+async function shutdownAll() {
+  if (!confirm('Bot + Dashboard komplett beenden? Danach läuft nichts mehr im Hintergrund.')) return;
+  setMsg('Beende alles…', false);
+  try {
+    await fetch('/api/shutdown', { method: 'POST' });
+  } catch (_) {}
+  setMsg('Dashboard beendet. Fenster kann geschlossen werden.', false);
+  document.getElementById('btn-start').disabled = true;
+  document.getElementById('btn-stop').disabled  = true;
+  document.querySelector('.btn-shutdown').disabled = true;
 }
 
 function setMsg(text, isError) {

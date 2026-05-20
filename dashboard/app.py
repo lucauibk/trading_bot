@@ -5,8 +5,11 @@ Aufruf: python3 dashboard/app.py
 """
 
 import json
+import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -69,6 +72,28 @@ def api_stop():
 
     set_status(running=False)
     return jsonify({"ok": True, "msg": "Bot gestoppt"})
+
+
+@app.route("/api/shutdown", methods=["POST"])
+def api_shutdown():
+    """Stoppt Bot + Dashboard komplett (nichts läuft danach im Hintergrund)."""
+    global _bot_process
+
+    if _bot_process and _bot_process.poll() is None:
+        _bot_process.terminate()
+        try:
+            _bot_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _bot_process.kill()
+
+    set_status(running=False)
+
+    def _kill():
+        time.sleep(0.5)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=_kill, daemon=True).start()
+    return jsonify({"ok": True, "msg": "Dashboard wird beendet…"})
 
 
 # ── Status prüfen (Prozess wirklich aktiv?) ───────────────────────────────────

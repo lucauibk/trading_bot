@@ -11,34 +11,52 @@ from .model import TradingModel
 
 logger = logging.getLogger("ml.trainer")
 
-LOOKFORWARD_H  = 6      # 1h-Candles vorausschauen für Label-Berechnung
-THRESHOLD      = 0.015  # 1.5% Preisbewegung = gerichtetes Signal
-RETRAIN_EVERY_N = 50    # Retrain nach N neuen gelabelten Samples
+LOOKFORWARD_H   = 12     # Timeout in Candles (12h) für Triple-Barrier
+RETRAIN_EVERY_N = 50     # Retrain nach N neuen gelabelten Samples
+
+# Triple-Barrier-Parameter: Faktoren auf ATR als Schwelle
+TB_UPPER_ATR = 2.0   # Gewinn-Barriere = 2× ATR
+TB_LOWER_ATR = 1.5   # Verlust-Barriere = 1.5× ATR (asymmetrisch: enger Stop)
 
 
-def _compute_label(close: pd.Series, idx: int) -> int:
+def _compute_label_triple_barrier(
+    df: pd.DataFrame, idx: int, atr_pct: float
+) -> int:
     """
-    0=sell, 1=hold, 2=buy basierend auf den nächsten LOOKFORWARD_H Candles.
-    Wenn beide Schwellen überschritten werden, gewinnt der erste Treffer.
+    Triple-Barrier-Methode (López de Prado):
+    0=sell (untere Barriere getroffen), 1=hold (Timeout), 2=buy (obere Barriere).
+    Verwendet ATR-skalierte Barrieren statt fixer Prozentwerte.
     """
-    if idx + LOOKFORWARD_H >= len(close):
+    if idx + LOOKFORWARD_H >= len(df):
         return 1
-    p0     = float(close.iloc[idx])
-    future = close.iloc[idx + 1: idx + 1 + LOOKFORWARD_H]
-    max_ret = (float(future.max()) - p0) / p0
-    min_ret = (float(future.min()) - p0) / p0
-    up = max_ret >  THRESHOLD
-    dn = min_ret < -THRESHOLD
+    p0 = float(df["close"].iloc[idx])
+    upper = p0 * (1 + TB_UPPER_ATR * atr_pct)
+    lower = p0 * (1 - TB_LOWER_ATR * atr_pct)
 
-    if up and not dn:
-        return 2
-    if dn and not up:
-        return 0
-    if up and dn:
-        up_first = int((future >= p0 * (1 + THRESHOLD)).values.argmax())
-        dn_first = int((future <= p0 * (1 - THRESHOLD)).values.argmax())
-        return 2 if up_first <= dn_first else 0
+    for j in range(idx + 1, min(idx + 1 + LOOKFORWARD_H, len(df))):
+        h = float(df["high"].iloc[j])
+        l = float(df["low"].iloc[j])
+        if h >= upper:
+            return 2
+        if l <= lower:
+            return 0
     return 1
+
+
+def _get_atr_pct(df: pd.DataFrame, idx: int) -> float:
+    """ATR% für Triple-Barrier: gleitend, Fallback auf 1.5%."""
+    try:
+        import ta as ta_lib
+        window = df.iloc[max(0, idx - 14): idx + 1]
+        if len(window) < 5:
+            return 0.015
+        atr = float(ta_lib.volatility.average_true_range(
+            window["high"], window["low"], window["close"], window=min(14, len(window))
+        ).iloc[-1])
+        price = float(df["close"].iloc[idx])
+        return max(0.005, min(0.10, atr / price if price > 0 else 0.015))
+    except Exception:
+        return 0.015
 
 
 def bootstrap_from_history(
@@ -55,7 +73,8 @@ def bootstrap_from_history(
         window = df.iloc[: i + 1]
         try:
             feats = extract_features(window)
-            label = _compute_label(df["close"], i)
+            atr_pct = _get_atr_pct(df, i)
+            label = _compute_label_triple_barrier(df, i, atr_pct)
             xs.append(feats)
             ys.append(label)
 
@@ -106,7 +125,8 @@ class ModelTrainer:
             idx    = int(current_df.index.get_indexer([target], method="nearest")[0])
             if idx < 0 or idx + LOOKFORWARD_H >= len(current_df):
                 continue
-            label = _compute_label(current_df["close"], idx)
+            atr_pct = _get_atr_pct(current_df, idx)
+            label = _compute_label_triple_barrier(current_df, idx, atr_pct)
             self.store.set_label(symbol, ts, label)
             labeled += 1
 
