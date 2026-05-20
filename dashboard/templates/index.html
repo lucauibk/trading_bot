@@ -110,6 +110,16 @@
       <button class="btn btn-stop"  id="btn-stop"  onclick="stopBot()" disabled>⏹ Stoppen</button>
       <button class="btn btn-shutdown" onclick="shutdownAll()" title="Bot + Dashboard komplett beenden">⏻ Alles beenden</button>
     </div>
+    <div style="margin-top:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <span style="font-size:13px;color:#888">Hebel:</span>
+      <select id="leverage-select" onchange="setLeverage(this.value)" style="width:auto">
+        <option value="1.0">1× – kein Hebel (sicher)</option>
+        <option value="2.0">2× – moderater Hebel</option>
+        <option value="3.0">3× – aggressiv</option>
+      </select>
+      <span id="leverage-badge" class="badge" style="background:#2a2a6a;color:#aaa">1×</span>
+      <span style="font-size:11px;color:#555" id="leverage-msg"></span>
+    </div>
     <div class="msg" id="ctrl-msg"></div>
   </div>
 
@@ -404,11 +414,45 @@ async function refreshGrids() {
   }).join('');
 }
 
+// ── Hebel-Toggle ─────────────────────────────────────────────────────────────
+async function loadLeverage() {
+  try {
+    const r = await fetch('/api/leverage');
+    const d = await r.json();
+    const lev = parseFloat(d.leverage) || 1.0;
+    document.getElementById('leverage-select').value = lev.toFixed(1);
+    const badge = document.getElementById('leverage-badge');
+    badge.textContent = lev.toFixed(0) + '×';
+    badge.style.background = lev >= 3 ? '#ff4d4d44' : lev >= 2 ? '#f0a50044' : '#2a2a6a';
+    badge.style.color       = lev >= 3 ? '#ff4d4d'   : lev >= 2 ? '#f0a500'   : '#aaa';
+  } catch (_) {}
+}
+
+async function setLeverage(val) {
+  const lev = parseFloat(val);
+  const msg = document.getElementById('leverage-msg');
+  try {
+    const r = await fetch('/api/leverage', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ leverage: lev })
+    });
+    const d = await r.json();
+    msg.textContent = d.msg || '';
+    await loadLeverage();
+    setTimeout(() => { msg.textContent = ''; }, 3000);
+  } catch (e) {
+    msg.textContent = 'Fehler: ' + e;
+  }
+}
+
 initChart();
 refresh();
 refreshGrids();
+loadLeverage();
 setInterval(refresh, 10000);
 setInterval(refreshGrids, 10000);
+setInterval(loadLeverage, 15000);
 </script>
 </body>
 </html>

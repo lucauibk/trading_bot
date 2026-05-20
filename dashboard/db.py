@@ -146,20 +146,31 @@ def _init(con: sqlite3.Connection):
             con.execute(f"ALTER TABLE grid_state ADD COLUMN {col} {coldef}")
         except Exception:
             pass
+    for col, coldef in [
+        ("leverage", "REAL DEFAULT 1.0"),
+    ]:
+        try:
+            con.execute(f"ALTER TABLE bot_status ADD COLUMN {col} {coldef}")
+        except Exception:
+            pass
+        try:
+            con.execute(f"ALTER TABLE trades ADD COLUMN {col} {coldef}")
+        except Exception:
+            pass
     con.commit()
 
 
 def log_trade(symbol: str, direction: str, entry: float, exit_: float,
               pnl: float, reason: str, strategy: str = "grid", mode: str = "paper",
-              context: dict = None) -> int:
+              context: dict = None, leverage: float = 1.0) -> int:
     """Schreibt einen Trade und optional seinen Kontext. Gibt die Trade-ID zurück."""
     from datetime import datetime
     now = datetime.utcnow().isoformat()
     con = get_conn()
     cur = con.execute(
-        "INSERT INTO trades (timestamp,symbol,direction,entry,exit,pnl,reason,strategy,mode) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
-        (now, symbol, direction, entry, exit_, pnl, reason, strategy, mode)
+        "INSERT INTO trades (timestamp,symbol,direction,entry,exit,pnl,reason,strategy,mode,leverage) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (now, symbol, direction, entry, exit_, pnl, reason, strategy, mode, leverage)
     )
     trade_id = cur.lastrowid
     if context:
@@ -304,6 +315,21 @@ def set_coin_setting(symbol: str, max_investment: float, enabled: int = 1):
                updated_at=excluded.updated_at""",
         (symbol, max_investment, enabled, datetime.utcnow().isoformat())
     )
+    con.commit()
+    con.close()
+
+
+def get_leverage() -> float:
+    con = get_conn()
+    row = con.execute("SELECT leverage FROM bot_status WHERE id=1").fetchone()
+    con.close()
+    return float(row["leverage"]) if row and row["leverage"] else 1.0
+
+
+def set_leverage(value: float):
+    value = max(1.0, min(3.0, float(value)))
+    con = get_conn()
+    con.execute("UPDATE bot_status SET leverage=? WHERE id=1", (value,))
     con.commit()
     con.close()
 

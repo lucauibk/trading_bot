@@ -43,9 +43,14 @@ GRID_RANGE_MAX   = 0.25    # Maximum-Range bei sehr volatiler Markt
 ATR_CANDLES      = 24     # ATR über letzte 24h berechnen
 
 # ── Notbremse ─────────────────────────────────────────────────────────────────
-MAX_LOSS_PCT         = 0.08   # Pro Coin – 8% des aktuellen Investments → skaliert mit Compounding
+MAX_LOSS_PCT         = 0.05   # Pro Coin – 5% des aktuellen Investments (bei 3× = 15% Preis-Move)
 PER_POS_SL_PCT       = 0.04   # Per-Position Stop-Loss: 4% unter Buy-Preis
 MAX_INVESTMENT_MULT  = 3.0    # Compounding-Cap: max. 3× Initial-Investment pro Coin
+
+# ── Hebel (Leverage) ───────────────────────────────────────────────────────────
+DEFAULT_LEVERAGE     = 1.0    # Kein Hebel = Paper-sicherer Modus
+MAX_LEVERAGE         = 3.0    # Maximum erlaubter Hebel
+LIQUIDATION_BUFFER   = 0.95   # Force-Close bei 95% Margin-Verlust
 
 # ── Directional Trades (KI kauft aktiv bei UP-Signal) ─────────────────────────
 DIRECTIONAL_ENABLED   = True
@@ -146,6 +151,18 @@ def _calc_level_allocations(grid_lines: list, current_price: float,
 def get_last_direction_score(symbol: str) -> float:
     """Letzter normierter Richtungs-Score für das Symbol (-1.0 … +1.0)."""
     return _last_scores.get(symbol, 0.0)
+
+
+def _current_leverage() -> float:
+    """Liest aktuelle Hebel-Einstellung aus DB – jederzeit über Dashboard änderbar."""
+    try:
+        from dashboard.db import get_conn
+        con = get_conn()
+        row = con.execute("SELECT leverage FROM bot_status WHERE id=1").fetchone()
+        con.close()
+        return float(row["leverage"]) if row and row["leverage"] else DEFAULT_LEVERAGE
+    except Exception:
+        return DEFAULT_LEVERAGE
 
 
 def predict_direction(symbol: str) -> str:
@@ -426,13 +443,14 @@ class PaperGridBot:
         # ATR aus letzten 24 Candles schätzen (vereinfacht: range_pct als Proxy)
         atr = current_price * self.range_pct * 0.5
         usdt = self.investment * DIRECTIONAL_PCT
-        qty  = usdt / current_price
+        lev  = _current_leverage()
+        qty  = (usdt * lev) / current_price
         tp   = current_price + DIRECTIONAL_TP_ATR * atr
         sl   = current_price - DIRECTIONAL_SL_ATR * atr
 
         self._directional = {
             "entry": current_price, "qty": qty,
-            "usdt": usdt, "tp": tp, "sl": sl,
+            "usdt": usdt, "tp": tp, "sl": sl, "leverage": lev,
         }
         logger.info(
             "[DIRECTIONAL] %s KAUF @ %.4f | %.2f USDT | TP=%.4f (+%.1f%%) | SL=%.4f (-%.1f%%)",
@@ -471,7 +489,8 @@ class PaperGridBot:
             from dashboard.db import log_trade
             log_trade(self.symbol, "DIRECTIONAL", d["entry"], current_price,
                       net, f"directional_{reason.lower()}", "grid",
-                      "paper" if config.PAPER_TRADING else "live")
+                      "paper" if config.PAPER_TRADING else "live",
+                      leverage=d.get("leverage", DEFAULT_LEVERAGE))
         except Exception:
             pass
         self._directional = {}
@@ -494,20 +513,21 @@ class PaperGridBot:
         )
         self.usdt_per_grid = self.investment / self.levels  # Durchschnitt für Logging
 
+        lev = _current_leverage()
         for i, price in enumerate(self.grid_lines):
             usdt = self._level_allocations.get(price, self.usdt_per_grid)
-            qty = usdt / price
+            qty = (usdt * lev) / price
             if price < current_price:
-                self.orders[price] = {"side": "buy", "qty": qty, "filled": False}
+                self.orders[price] = {"side": "buy", "qty": qty, "filled": False, "leverage": lev}
             elif self.with_position:
                 buy_price = self.grid_lines[i - 1] if i > 0 else current_price
                 buy_usdt = self._level_allocations.get(buy_price, self.usdt_per_grid)
                 self.orders[price] = {
-                    "side": "sell", "qty": buy_usdt / buy_price,
-                    "filled": False, "bought_at": buy_price,
+                    "side": "sell", "qty": (buy_usdt * lev) / buy_price,
+                    "filled": False, "bought_at": buy_price, "leverage": lev,
                 }
             else:
-                self.orders[price] = {"side": "sell", "qty": qty, "filled": False}
+                self.orders[price] = {"side": "sell", "qty": qty, "filled": False, "leverage": lev}
 
         logger.info(
             "Grid aufgebaut | %s | %.4f – %.4f | %d Stufen | ø %.2f USDT/Stufe | Score=%+.2f",
@@ -555,7 +575,8 @@ class PaperGridBot:
                     from dashboard.db import log_trade
                     log_trade(self.symbol, "SELL", buy_price, current_price, net_profit,
                               "stop_loss", "grid",
-                              "paper" if config.PAPER_TRADING else "live")
+                              "paper" if config.PAPER_TRADING else "live",
+                              leverage=order.get("leverage", DEFAULT_LEVERAGE))
                 except Exception:
                     pass
 
@@ -588,6 +609,7 @@ class PaperGridBot:
                         "filled": False,
                         "bought_at": price,
                         "sl_price": sl_price,
+                        "leverage": order.get("leverage", DEFAULT_LEVERAGE),
                     }
                     logger.info("[PAPER GRID] BUY  %s @ %.4f | Qty: %.4f | Wert: %.2f USDT | SL @ %.4f (%.1f%%)",
                                 self.symbol, price, order["qty"], price * order["qty"],
@@ -631,11 +653,13 @@ class PaperGridBot:
                 notifier.notify_trade_close(
                     self.symbol, "GRID", buy_price, price, net_profit, "grid_fill"
                 )
+                order_lev = order.get("leverage", DEFAULT_LEVERAGE)
                 try:
                     from dashboard.db import log_trade
                     log_trade(self.symbol, "GRID", buy_price, price, net_profit,
                               "grid_fill", "grid",
-                              "paper" if config.PAPER_TRADING else "live")
+                              "paper" if config.PAPER_TRADING else "live",
+                              leverage=order_lev)
                 except Exception:
                     pass
                 # Neue Kauf-Order – nur wenn ML nicht DOWN
@@ -653,10 +677,12 @@ class PaperGridBot:
                         new_buy_price = self.grid_lines[sell_idx - 1]  # eine Stufe unter sell
                     else:
                         new_buy_price = buy_price
+                    new_lev = _current_leverage()
                     self.orders[new_buy_price] = {
                         "side": "buy",
-                        "qty": replenish_usdt / new_buy_price,
+                        "qty": (replenish_usdt * new_lev) / new_buy_price,
                         "filled": False,
+                        "leverage": new_lev,
                     }
                 # Auto-Compounding: Gewinne alle X Trades reinvestieren
                 self._maybe_compound(price)
@@ -708,7 +734,8 @@ class PaperGridBot:
                 try:
                     from dashboard.db import log_trade
                     log_trade(self.symbol, "SELL", buy_price, current_price, net_profit,
-                              reason, "grid", "paper" if config.PAPER_TRADING else "live")
+                              reason, "grid", "paper" if config.PAPER_TRADING else "live",
+                              leverage=order.get("leverage", DEFAULT_LEVERAGE))
                 except Exception:
                     pass
         if sold_count:
@@ -734,6 +761,31 @@ class PaperGridBot:
             )
             return True
         return False
+
+    def check_liquidation(self, current_price: float):
+        """Force-Close wenn unrealisierter Verlust ≥ 95% der Margin (Liquidation bei Hebel)."""
+        lev = _current_leverage()
+        if lev <= 1.0:
+            return
+        margin_remaining = self.investment + self.total_profit
+        if margin_remaining <= 0:
+            return
+        unrealized = sum(
+            (current_price - o["bought_at"]) * o["qty"]
+            for o in self.orders.values()
+            if not o.get("filled") and o["side"] == "sell" and "bought_at" in o
+        )
+        if unrealized < -margin_remaining * LIQUIDATION_BUFFER:
+            logger.error(
+                "[LIQUIDATION] %s @ %.4f | Hebel=%.1f× | Unrealized: %.2f USDT – Force-Close",
+                self.symbol, current_price, lev, unrealized,
+            )
+            notifier._send(
+                f"💥 <b>LIQUIDATION {self.symbol}</b>\n"
+                f"Hebel: {lev:.1f}×\nUnrealisierter Verlust: {unrealized:.2f} USDT\n"
+                f"Alle Positionen werden geschlossen."
+            )
+            self.emergency_sell(current_price, "Liquidation")
 
     def status(self) -> str:
         filled = sum(1 for o in self.orders.values() if o["filled"])
@@ -1247,6 +1299,8 @@ def run():
                 if bot.check_stop_loss():
                     logger.warning("%s Grid gestoppt (Notbremse)", bot.symbol)
                     continue
+
+                bot.check_liquidation(current_price)
 
                 if _freeze_mode:
                     bot.check_fills(current_price)  # nur Sells abwickeln

@@ -208,6 +208,21 @@ def api_summary():
                     "today_pnl": total})
 
 
+@app.route("/api/leverage", methods=["GET"])
+def api_leverage_get():
+    from dashboard.db import get_leverage
+    return jsonify({"leverage": get_leverage()})
+
+
+@app.route("/api/leverage", methods=["POST"])
+def api_leverage_set():
+    from dashboard.db import set_leverage
+    data = request.get_json() or {}
+    val = float(data.get("leverage", 1.0))
+    set_leverage(val)
+    return jsonify({"ok": True, "leverage": val, "msg": f"Hebel auf {val:.1f}× gesetzt"})
+
+
 @app.route("/api/coin-settings", methods=["GET"])
 def api_coin_settings_get():
     from dashboard.db import get_all_coin_settings
