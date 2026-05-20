@@ -47,6 +47,13 @@ MAX_LOSS_PCT         = 0.08   # Pro Coin – 8% des aktuellen Investments → sk
 PER_POS_SL_PCT       = 0.04   # Per-Position Stop-Loss: 4% unter Buy-Preis
 MAX_INVESTMENT_MULT  = 3.0    # Compounding-Cap: max. 3× Initial-Investment pro Coin
 
+# ── Directional Trades (KI kauft aktiv bei UP-Signal) ─────────────────────────
+DIRECTIONAL_ENABLED   = True
+DIRECTIONAL_SCORE_MIN = 0.50   # Blended-Score muss ≥ 0.50 sein (hohe Konfidenz)
+DIRECTIONAL_PCT       = 0.15   # 15% des Investments pro Directional Trade
+DIRECTIONAL_TP_ATR    = 2.5    # Take-Profit: Einstieg + 2.5 × ATR
+DIRECTIONAL_SL_ATR    = 1.5    # Stop-Loss:   Einstieg − 1.5 × ATR
+
 # ── Graceful Shutdown ─────────────────────────────────────────────────────────
 _running = True
 def _shutdown(sig, frame):
@@ -150,7 +157,10 @@ def predict_direction(symbol: str) -> str:
     global _ml_predictor
     if USE_ML and _ml_predictor is not None:
         direction = _ml_predictor.predict(symbol)
-        _last_scores[symbol] = 0.5 if direction == "up" else (-0.5 if direction == "down" else 0.0)
+        # Echten Blended-Score (LGBM+LLM) verwenden, nicht hardcoded ±0.5
+        _last_scores[symbol] = _ml_predictor.get_score(symbol) or (
+            0.5 if direction == "up" else (-0.5 if direction == "down" else 0.0)
+        )
         return direction
     try:
         df = fetch_ohlcv(symbol, "1h", 100)
@@ -399,6 +409,70 @@ class PaperGridBot:
         self._last_confidence = 0.0
         self._last_pred_low = 0.0
         self._last_pred_high = 0.0
+        self._directional: dict = {}  # aktiver Directional Trade: {qty, entry, tp, sl, usdt}
+
+    def _maybe_open_directional(self, current_price: float):
+        """Öffnet einen Directional Trade wenn Score hoch genug und kein Trade offen."""
+        if not DIRECTIONAL_ENABLED:
+            return
+        if self._directional:
+            return  # bereits offen
+        score = self._direction_score
+        if score < DIRECTIONAL_SCORE_MIN:
+            return
+
+        # ATR aus letzten 24 Candles schätzen (vereinfacht: range_pct als Proxy)
+        atr = current_price * self.range_pct * 0.5
+        usdt = self.investment * DIRECTIONAL_PCT
+        qty  = usdt / current_price
+        tp   = current_price + DIRECTIONAL_TP_ATR * atr
+        sl   = current_price - DIRECTIONAL_SL_ATR * atr
+
+        self._directional = {
+            "entry": current_price, "qty": qty,
+            "usdt": usdt, "tp": tp, "sl": sl,
+        }
+        logger.info(
+            "[DIRECTIONAL] %s KAUF @ %.4f | %.2f USDT | TP=%.4f (+%.1f%%) | SL=%.4f (-%.1f%%)",
+            self.symbol, current_price, usdt,
+            tp, (tp / current_price - 1) * 100,
+            sl, (1 - sl / current_price) * 100,
+        )
+
+    def _check_directional(self, current_price: float):
+        """Prüft ob TP oder SL des Directional Trades erreicht wurde."""
+        if not self._directional:
+            return
+        d = self._directional
+        hit_tp = current_price >= d["tp"]
+        hit_sl = current_price <= d["sl"]
+        score  = self._direction_score
+
+        # Auch schließen wenn Signal dreht
+        signal_flipped = score < 0
+
+        if not (hit_tp or hit_sl or signal_flipped):
+            return
+
+        pnl = (current_price - d["entry"]) * d["qty"]
+        fee = (current_price + d["entry"]) * d["qty"] * KRAKEN_FEE
+        net = pnl - fee
+        self.total_profit += net
+        self.trade_count  += 1
+
+        reason = "TP" if hit_tp else ("SL" if hit_sl else "Signal-Flip")
+        logger.info(
+            "[DIRECTIONAL] %s VERKAUF @ %.4f | Grund: %s | PnL: %+.4f USDT",
+            self.symbol, current_price, reason, net,
+        )
+        try:
+            from dashboard.db import log_trade
+            log_trade(self.symbol, "DIRECTIONAL", d["entry"], current_price,
+                      net, f"directional_{reason.lower()}", "grid",
+                      "paper" if config.PAPER_TRADING else "live")
+        except Exception:
+            pass
+        self._directional = {}
 
     def setup_grid(self, current_price: float,
                    lower: float = None, upper: float = None):
@@ -485,6 +559,8 @@ class PaperGridBot:
 
     def check_fills(self, current_price: float):
         self._check_position_stop_losses(current_price)
+        self._check_directional(current_price)
+        self._maybe_open_directional(current_price)
 
         for price, order in list(self.orders.items()):
             if order["filled"]:

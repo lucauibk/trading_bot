@@ -24,10 +24,15 @@ class MLPredictor:
     """
 
     def __init__(self, fetch_ohlcv_fn: Callable):
-        self._fetch_ohlcv = fetch_ohlcv_fn
-        self._store       = MLDataStore()
+        self._fetch_ohlcv  = fetch_ohlcv_fn
+        self._store        = MLDataStore()
         self._models:  Dict[str, TradingModel]  = {}
         self._trainer: Optional[ModelTrainer]   = None
+        self._last_scores: Dict[str, float]     = {}  # symbol → blended score (-1..+1)
+
+    def get_score(self, symbol: str) -> float:
+        """Letzter normierter Blended-Score (-1.0=down … +1.0=up) für adaptive Sizing."""
+        return self._last_scores.get(symbol, 0.0)
 
     def initialize(self, symbols: List[str]):
         """Bootstrap-Training beim Start. Lädt vorhandene Modelle, trainiert neue."""
@@ -88,6 +93,9 @@ class MLPredictor:
                     direction = "down"
                 else:
                     direction = "neutral"
+
+                # Echten Score für adaptive Positionsgröße speichern (statt fixem ±0.5)
+                self._last_scores[symbol] = max(-1.0, min(1.0, blended_score))
 
                 src = "LGBM+LLM" if llm_result else "LGBM"
                 logger.info(

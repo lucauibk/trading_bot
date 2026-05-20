@@ -102,7 +102,18 @@ def api_shutdown():
 # ── Status prüfen (Prozess wirklich aktiv?) ───────────────────────────────────
 
 def _is_running() -> bool:
-    return _bot_process is not None and _bot_process.poll() is None
+    if _bot_process is not None and _bot_process.poll() is None:
+        return True
+    # Fallback: PID-File prüfen (Bot via start.sh gestartet)
+    pid_file = _ROOT / ".bot.pid"
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 0)  # Signal 0 = nur prüfen ob Prozess existiert
+            return True
+        except (ProcessLookupError, ValueError):
+            pid_file.unlink(missing_ok=True)
+    return False
 
 
 # ── Daten-Endpunkte ───────────────────────────────────────────────────────────
