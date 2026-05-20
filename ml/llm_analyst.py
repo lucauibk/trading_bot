@@ -7,7 +7,9 @@ die mit dem LightGBM-Score geblended wird.
 import json
 import logging
 import os
+import sqlite3
 import time
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger("ml.llm_analyst")
@@ -17,7 +19,58 @@ LLM_WEIGHT         = 0.45   # 45% LLM, 55% LightGBM im Blend
 CACHE_SECONDS      = 3600   # Ergebnis 1h cachen (pro Coin-Candle)
 MODEL              = "claude-haiku-4-5-20251001"
 
-_cache: dict = {}   # symbol → {"ts": float, "direction": str, "confidence": float, "score": float}
+_cache: dict = {}   # RAM-Cache (schnell); wird beim Start aus DB befüllt
+
+_CACHE_DB = Path(__file__).parents[1] / "data" / "llm_cache.db"
+
+
+def _db_conn():
+    _CACHE_DB.parent.mkdir(exist_ok=True)
+    con = sqlite3.connect(_CACHE_DB)
+    con.execute("""CREATE TABLE IF NOT EXISTS llm_cache (
+        symbol TEXT PRIMARY KEY,
+        ts     REAL,
+        direction TEXT,
+        confidence REAL,
+        score  REAL,
+        reason TEXT
+    )""")
+    con.commit()
+    return con
+
+
+def _load_cache_from_db():
+    """Füllt den RAM-Cache beim Start aus der DB – verhindert API-Calls nach Neustart."""
+    try:
+        con = _db_conn()
+        rows = con.execute("SELECT symbol, ts, direction, confidence, score, reason FROM llm_cache").fetchall()
+        con.close()
+        for sym, ts, direction, confidence, score, reason in rows:
+            if time.time() - ts < CACHE_SECONDS:
+                _cache[sym] = {"ts": ts, "direction": direction,
+                               "confidence": confidence, "score": score, "reason": reason}
+    except Exception as e:
+        logger.debug("LLM Cache-Load fehlgeschlagen: %s", e)
+
+
+def _save_to_db(symbol: str, result: dict):
+    try:
+        con = _db_conn()
+        con.execute("""INSERT INTO llm_cache (symbol, ts, direction, confidence, score, reason)
+                       VALUES (?,?,?,?,?,?)
+                       ON CONFLICT(symbol) DO UPDATE SET
+                           ts=excluded.ts, direction=excluded.direction,
+                           confidence=excluded.confidence, score=excluded.score,
+                           reason=excluded.reason""",
+                    (symbol, result["ts"], result["direction"],
+                     result["confidence"], result["score"], result.get("reason", "")))
+        con.commit()
+        con.close()
+    except Exception as e:
+        logger.debug("LLM Cache-Save fehlgeschlagen: %s", e)
+
+
+_load_cache_from_db()
 
 
 def _build_prompt(symbol: str, indicators: dict) -> str:
@@ -105,6 +158,7 @@ def analyse(symbol: str, indicators: dict) -> Optional[dict]:
             "reason": reason,
         }
         _cache[symbol] = result
+        _save_to_db(symbol, result)
 
         logger.info(
             "LLM %s → %s (conf=%.2f, score=%+.2f) | %s",
