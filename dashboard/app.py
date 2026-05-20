@@ -185,6 +185,7 @@ def api_grids():
     for r in rows:
         d = dict(r)
         d["levels"] = json.loads(d["levels"]) if d["levels"] else []
+        d["directional"] = json.loads(d["directional"]) if d.get("directional") else {}
         result.append(d)
     return jsonify(result)
 

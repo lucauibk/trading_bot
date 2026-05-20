@@ -228,7 +228,8 @@ def update_grid_state(symbol: str, current_price: float, orders: dict,
                       range_pct: float, investment: float,
                       total_profit: float, trade_count: int, prediction: str = "",
                       predicted_low: float = 0.0, predicted_high: float = 0.0,
-                      confidence: float = 0.0, regime: str = ""):
+                      confidence: float = 0.0, regime: str = "",
+                      directional: dict = None):
     import json
     from datetime import datetime
     levels = [
@@ -245,8 +246,8 @@ def update_grid_state(symbol: str, current_price: float, orders: dict,
         """INSERT INTO grid_state
                (symbol, current_price, levels, range_pct, investment,
                 total_profit, trade_count, prediction, updated_at,
-                predicted_low, predicted_high, confidence, regime)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                predicted_low, predicted_high, confidence, regime, directional)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(symbol) DO UPDATE SET
                current_price=excluded.current_price,
                levels=excluded.levels,
@@ -259,10 +260,12 @@ def update_grid_state(symbol: str, current_price: float, orders: dict,
                predicted_low=excluded.predicted_low,
                predicted_high=excluded.predicted_high,
                confidence=excluded.confidence,
-               regime=excluded.regime""",
+               regime=excluded.regime,
+               directional=excluded.directional""",
         (symbol, current_price, json.dumps(levels), range_pct, investment,
          total_profit, trade_count, prediction, datetime.utcnow().isoformat(),
-         predicted_low, predicted_high, confidence, regime)
+         predicted_low, predicted_high, confidence, regime,
+         json.dumps(directional or {}))
     )
     con.commit()
     con.close()

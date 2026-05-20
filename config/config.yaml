@@ -6,9 +6,10 @@ initial_capital: 1000
 
 symbols:
   - SOL/USD
-  - ETH/USD
   - LINK/USD
-  - DOT/USD
+  - INJ/USD
+  - AVAX/USD
+  - NEAR/USD
 
 risk:
   max_risk_per_trade: 0.01      # 1% Kapital pro Trade

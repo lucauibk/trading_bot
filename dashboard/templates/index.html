@@ -333,6 +333,26 @@ async function refreshGrids() {
     const confBadge = g.confidence > 0
       ? `<span style="font-size:10px;color:#666">Conf: ${(g.confidence*100).toFixed(0)}%</span>`
       : '';
+
+    // Directional Trade Badge
+    let dirBadge = '';
+    if (g.directional && g.directional.entry) {
+      const d = g.directional;
+      const pnlPct = ((g.current_price - d.entry) / d.entry * 100).toFixed(2);
+      const pnlColor = pnlPct >= 0 ? '#00c896' : '#ff4d4d';
+      const pnlSign  = pnlPct >= 0 ? '+' : '';
+      dirBadge = `
+        <div style="margin-top:8px;padding:8px 10px;background:#1a1a0a;border:1px solid #f0a50044;border-radius:8px;font-size:11px">
+          <div style="color:#f0a500;font-weight:bold;margin-bottom:4px">⚡ DIRECTIONAL AKTIV</div>
+          <div style="display:flex;gap:12px;flex-wrap:wrap;color:#aaa">
+            <span>Einstieg: <b style="color:#fff">${d.entry.toFixed(4)}</b></span>
+            <span>TP: <b style="color:#00c896">${d.tp.toFixed(4)}</b></span>
+            <span>SL: <b style="color:#ff4d4d">${d.sl.toFixed(4)}</b></span>
+          </div>
+          <div style="margin-top:4px">PnL: <b style="color:${pnlColor}">${pnlSign}${pnlPct}%</b> | ${(d.usdt||0).toFixed(0)} USDT</div>
+        </div>`;
+    }
+
     const predRange = (g.predicted_low > 0 && g.predicted_high > 0)
       ? `<div style="font-size:10px;color:#555;margin-top:4px">Pred: ${g.predicted_low.toFixed(2)} – ${g.predicted_high.toFixed(2)}</div>`
       : '';
@@ -393,6 +413,7 @@ async function refreshGrids() {
           <span style="color:${g.total_profit>=0?'#00c896':'#ff4d4d'}">${g.total_profit>=0?'+':''}${g.total_profit.toFixed(2)} USDT</span>
         </div>
         ${predRange}
+        ${dirBadge}
         <div style="margin:8px 0">${rows}</div>
         <div style="font-size:10px;color:#444;text-align:right">Stand: ${updatedAt}</div>
       </div>`;

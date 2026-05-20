@@ -29,11 +29,11 @@ logger = logging.getLogger("grid_bot")
 
 # ── Grid Parameter ────────────────────────────────────────────────────────────
 GRIDS = [
-    {"symbol": "SOL/USD",  "investment": 300.0, "levels": 8},
+    {"symbol": "SOL/USD",  "investment": 300.0, "levels": 10},  # 10 Level wegen hoher Vol
     {"symbol": "LINK/USD", "investment": 300.0, "levels": 8},
-    {"symbol": "DOT/USD",  "investment": 300.0, "levels": 8},
-    {"symbol": "ETH/USD",  "investment": 300.0, "levels": 8},
-    {"symbol": "DOGE/USD", "investment": 300.0, "levels": 8},
+    {"symbol": "INJ/USD",  "investment": 300.0, "levels": 8},
+    {"symbol": "AVAX/USD", "investment": 300.0, "levels": 8},   # statt ETH
+    {"symbol": "NEAR/USD", "investment": 300.0, "levels": 8},
 ]
 CHECK_INTERVAL   = 15
 
@@ -959,6 +959,9 @@ AUTO_TUNE_INTERVAL_H = 6     # Hintergrund-Optimizer alle 6 Stunden
 AUTO_TUNE_MIN_TRADES = 20    # Mind. X Trades pro Regime nötig für Anpassung
 AUTO_TUNE_WIN_THRESH = 0.55  # Win-Rate > 55% → +1 Level; < 45% → -1 Level
 
+ML_REFRESH_INTERVAL_H = 24  # Täglicher ML-Refresh auf frischen OHLCV-Daten
+ML_REFRESH_CANDLES    = 720  # 30 Tage × 24h Candles (1h-Timeframe)
+
 
 def _auto_tune_once():
     """Liest Trade-Historie, passt REGIME_CONFIGS-Levels nach echten Win-Rates an."""
@@ -1019,6 +1022,32 @@ def _start_auto_tuner():
     logger.info("Hintergrund-Optimizer gestartet (alle %dh).", AUTO_TUNE_INTERVAL_H)
 
 
+def _start_ml_refresher(symbols: list):
+    """Täglicher LightGBM-Refresh auf frischen 30-Tage-OHLCV-Daten (kein LLM)."""
+    def _loop():
+        time.sleep(ML_REFRESH_INTERVAL_H * 3600)
+        while _running:
+            logger.info("[ML REFRESH] Starte täglichen ML-Refresh für %d Coins…", len(symbols))
+            from data_fetcher import fetch_ohlcv as _fetch
+            from ml.trainer import refresh_from_recent_history
+            for sym in symbols:
+                if not _running:
+                    break
+                try:
+                    model = _ml_predictor._models.get(sym) if _ml_predictor else None
+                    if model is None:
+                        continue
+                    df = _fetch(sym, "1h", ML_REFRESH_CANDLES)
+                    refresh_from_recent_history(sym, df, _ml_predictor._store, model)
+                except Exception as e:
+                    logger.warning("[ML REFRESH] %s fehlgeschlagen: %s", sym, e)
+            logger.info("[ML REFRESH] Abgeschlossen.")
+            time.sleep(ML_REFRESH_INTERVAL_H * 3600)
+    t = threading.Thread(target=_loop, name="ml-refresher", daemon=True)
+    t.start()
+    logger.info("ML-Refresher gestartet (alle %dh, %d Candles).", ML_REFRESH_INTERVAL_H, ML_REFRESH_CANDLES)
+
+
 def run():
     # Coin-Budget aus Dashboard-Settings lesen (überschreibt GRIDS-Defaults)
     try:
@@ -1070,6 +1099,7 @@ def run():
         logger.info("KI-Modell wird initialisiert (Bootstrap aus 1000 Candles je Coin)…")
         _ml_predictor.initialize(symbols)
         logger.info("KI-Modell bereit.")
+        _start_ml_refresher(symbols)
 
     # ── PricePredictor initialisieren ──────────────────────────────────────────
     if USE_PRICE_PREDICTOR:
@@ -1098,6 +1128,7 @@ def run():
                 predicted_high=bot._last_pred_high,
                 confidence=bot._last_confidence,
                 regime=bot._last_regime,
+                directional=getattr(bot, "_directional", {}) or {},
             )
         except Exception:
             pass
@@ -1246,8 +1277,9 @@ def run():
                             bot.symbol, reason, new_range * 100, bot.levels,
                             regime or "–", confidence,
                         )
-                        if prediction_flipped and not bot.with_position:
-                            bot.emergency_sell(current_price, "Vorhersage DOWN")
+                        # Bei DOWN-Flip: neue Käufe blockiert (with_position=False).
+                        # Kein Emergency-Sell — Positionen schließen normal am Grid-Level.
+                        # Per-Position-SL (4%) deckt Crash-Szenario ab.
                         bot.setup_grid(current_price, lower=lower, upper=upper)
                     # Dashboard immer aktualisieren wenn Prediction geprüft wurde
                     _log_bot_state(bot, current_price)
