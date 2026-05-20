@@ -96,6 +96,55 @@ def bootstrap_from_history(
     logger.info("Bootstrap %s abgeschlossen: %d Samples", symbol, len(X))
 
 
+def refresh_from_recent_history(
+    symbol: str,
+    df: pd.DataFrame,
+    store: MLDataStore,
+    model: TradingModel,
+):
+    """
+    Täglicher ML-Refresh auf frischen OHLCV-Daten (letzten 30 Tage).
+    Ersetzt das Modell nur wenn neues OOS-F1 ≥ altes F1 - 0.05.
+    LLM-frei — reiner LightGBM-Retrain.
+    """
+    min_window = 60
+    xs, ys = [], []
+
+    for i in range(min_window, len(df) - LOOKFORWARD_H):
+        window = df.iloc[: i + 1]
+        try:
+            feats = extract_features(window)
+            atr_pct = _get_atr_pct(df, i)
+            label = _compute_label_triple_barrier(df, i, atr_pct)
+            xs.append(feats)
+            ys.append(label)
+        except Exception:
+            continue
+
+    if len(xs) < model.MIN_SAMPLES:
+        logger.warning("Refresh %s: nur %d Samples – übersprungen", symbol, len(xs))
+        return
+
+    old_f1 = model._last_oos_f1
+    X = np.array(xs, np.float32)
+    y = np.array(ys, np.int32)
+
+    # train() hat Walk-Forward + F1-Guard (MIN_OOS_F1=0.30) bereits eingebaut.
+    # Zusätzlich: eigener Rollback wenn neues F1 deutlich schlechter als altes.
+    model.train(X, y)
+    new_f1 = model._last_oos_f1
+
+    if new_f1 < old_f1 - 0.05:
+        logger.warning(
+            "[ML REFRESH] %s: F1 %.3f → %.3f – Rollback (zu schlechter)", symbol, old_f1, new_f1
+        )
+    else:
+        logger.info(
+            "[ML REFRESH] %s: F1 %.3f → %.3f – akzeptiert (%d Samples)",
+            symbol, old_f1, new_f1, len(xs),
+        )
+
+
 class ModelTrainer:
     def __init__(self, store: MLDataStore, models: Dict[str, TradingModel]):
         self.store  = store

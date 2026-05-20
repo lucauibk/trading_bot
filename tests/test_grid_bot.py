@@ -43,6 +43,7 @@ def _make_paper_bot(investment=300.0, levels=6):
         bot._last_pred_low = 0.0
         bot._last_pred_high = 0.0
         bot._directional = {}
+        bot._last_prediction = "neutral"
         return bot
 
 

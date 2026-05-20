@@ -18,6 +18,21 @@ import yaml
 
 # Logs
 Path("logs").mkdir(exist_ok=True)
+
+# ── Singleton-Schutz: verhindert mehrere Bot-Instanzen ───────────────────────
+_PIDFILE = Path(".bot.pid")
+if _PIDFILE.exists():
+    try:
+        _existing_pid = int(_PIDFILE.read_text().strip())
+        if _existing_pid != os.getpid():
+            import os as _os
+            _os.kill(_existing_pid, 0)  # prüfen ob Prozess noch läuft
+            print(f"[main] Bot läuft bereits (PID {_existing_pid}) – Abbruch.")
+            sys.exit(0)
+    except (ProcessLookupError, ValueError):
+        pass  # Prozess tot → PID-File veraltet, weitermachen
+_PIDFILE.write_text(str(os.getpid()))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",

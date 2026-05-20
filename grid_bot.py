@@ -49,7 +49,7 @@ MAX_INVESTMENT_MULT  = 3.0    # Compounding-Cap: max. 3× Initial-Investment pro
 
 # ── Directional Trades (KI kauft aktiv bei UP-Signal) ─────────────────────────
 DIRECTIONAL_ENABLED   = True
-DIRECTIONAL_SCORE_MIN = 0.50   # Blended-Score muss ≥ 0.50 sein (hohe Konfidenz)
+DIRECTIONAL_SCORE_MIN = 0.15   # Score > 0.15 bei UP-Signal → kaufen
 DIRECTIONAL_PCT       = 0.15   # 15% des Investments pro Directional Trade
 DIRECTIONAL_TP_ATR    = 2.5    # Take-Profit: Einstieg + 2.5 × ATR
 DIRECTIONAL_SL_ATR    = 1.5    # Stop-Loss:   Einstieg − 1.5 × ATR
@@ -412,13 +412,15 @@ class PaperGridBot:
         self._directional: dict = {}  # aktiver Directional Trade: {qty, entry, tp, sl, usdt}
 
     def _maybe_open_directional(self, current_price: float):
-        """Öffnet einen Directional Trade wenn Score hoch genug und kein Trade offen."""
+        """Öffnet einen Directional Trade wenn ML 'up' signalisiert und kein Trade offen."""
         if not DIRECTIONAL_ENABLED:
             return
         if self._directional:
             return  # bereits offen
-        score = self._direction_score
-        if score < DIRECTIONAL_SCORE_MIN:
+        # Kaufen wenn Direction UP ist (Dashboard zeigt UP → Bot kauft)
+        if self._last_prediction != "up":
+            return
+        if self._direction_score < DIRECTIONAL_SCORE_MIN:
             return
 
         # ATR aus letzten 24 Candles schätzen (vereinfacht: range_pct als Proxy)
@@ -568,6 +570,9 @@ class PaperGridBot:
 
             # Kauf-Order: Preis fällt auf oder unter Grid-Level
             if order["side"] == "buy" and current_price <= price:
+                if not self.with_position:
+                    # ML sagt DOWN → kein neuer Kauf, Order überspringen
+                    continue
                 order["filled"] = True
                 order["fill_price"] = price
                 idx = self.grid_lines.index(price)
@@ -633,13 +638,14 @@ class PaperGridBot:
                               "paper" if config.PAPER_TRADING else "live")
                 except Exception:
                     pass
-                # Neue Kauf-Order am alten Kauflevel mit aktuellem Score
-                replenish_usdt = self._level_allocations.get(buy_price, self.usdt_per_grid)
-                self.orders[buy_price] = {
-                    "side": "buy",
-                    "qty": replenish_usdt / buy_price,
-                    "filled": False,
-                }
+                # Neue Kauf-Order am alten Kauflevel – nur wenn ML nicht DOWN
+                if self.with_position:
+                    replenish_usdt = self._level_allocations.get(buy_price, self.usdt_per_grid)
+                    self.orders[buy_price] = {
+                        "side": "buy",
+                        "qty": replenish_usdt / buy_price,
+                        "filled": False,
+                    }
                 # Auto-Compounding: Gewinne alle X Trades reinvestieren
                 self._maybe_compound(price)
 
@@ -1243,7 +1249,8 @@ def run():
                         if prediction_flipped and not bot.with_position:
                             bot.emergency_sell(current_price, "Vorhersage DOWN")
                         bot.setup_grid(current_price, lower=lower, upper=upper)
-                        _log_bot_state(bot, current_price)
+                    # Dashboard immer aktualisieren wenn Prediction geprüft wurde
+                    _log_bot_state(bot, current_price)
 
             # Zusammenfassung + Dashboard-State
             logger.info("─"*55)
