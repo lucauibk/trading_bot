@@ -1300,6 +1300,7 @@ def run():
                         predicted_high=bot._last_pred_high,
                         confidence=bot._last_confidence,
                         regime=bot._last_regime,
+                        directional=getattr(bot, "_directional", {}) or {},
                     )
                 except Exception:
                     pass

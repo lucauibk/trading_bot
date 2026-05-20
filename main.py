@@ -33,12 +33,15 @@ if _PIDFILE.exists():
         pass  # Prozess tot → PID-File veraltet, weitermachen
 _PIDFILE.write_text(str(os.getpid()))
 
+from logging.handlers import RotatingFileHandler
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("logs/trading_bot.log", encoding="utf-8"),
+        RotatingFileHandler(
+            "logs/trading_bot.log", maxBytes=5*1024*1024, backupCount=2, encoding="utf-8"
+        ),
     ],
 )
 logger = logging.getLogger("main")
