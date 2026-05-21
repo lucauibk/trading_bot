@@ -62,6 +62,25 @@
 </head>
 <body>
 
+<!-- Stop-Modus Modal -->
+<div class="modal-overlay" id="stop-modal" style="display:none">
+  <div class="modal">
+    <h3>⏹ Bot stoppen</h3>
+    <p>Was soll mit offenen Positionen passieren?</p>
+    <div class="modal-btns" style="flex-direction:column;gap:10px">
+      <button class="btn btn-stop" onclick="stopGraceful('sell_all')">
+        💰 Sofort alle Positionen verkaufen
+      </button>
+      <button class="btn" style="background:#e6a817;color:#fff;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-size:14px" onclick="stopGraceful('wait_fills')">
+        ⏳ Auf Grid-Fills warten, dann beenden
+      </button>
+      <button class="btn" style="background:#555;color:#fff;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-size:14px" onclick="closeStopModal()">
+        Abbrechen
+      </button>
+    </div>
+  </div>
+</div>
+
 <!-- Live-Bestätigung Modal -->
 <div class="modal-overlay" id="confirm-modal">
   <div class="modal">
@@ -210,12 +229,23 @@ async function _doStart(strategy, mode, confirmed) {
 }
 
 // ── Bot stoppen ───────────────────────────────────────────────────────────────
-async function stopBot() {
-  setMsg('Stoppe Bot…', false);
-  const res  = await fetch('/api/bot/stop', { method: 'POST' });
+function stopBot() {
+  document.getElementById('stop-modal').style.display = 'flex';
+}
+function closeStopModal() {
+  document.getElementById('stop-modal').style.display = 'none';
+}
+async function stopGraceful(mode) {
+  closeStopModal();
+  setMsg(mode === 'sell_all' ? 'Verkaufe alle Positionen…' : 'Sell-Only-Modus aktiv…', false);
+  const res  = await fetch('/api/bot/stop-graceful', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode })
+  });
   const data = await res.json();
   setMsg(data.msg, !data.ok);
-  if (data.ok) updateControls(false);
+  if (data.ok) document.getElementById('btn-stop').disabled = true;
 }
 
 async function shutdownAll() {

@@ -53,11 +53,13 @@ MAX_LEVERAGE         = 3.0    # Maximum erlaubter Hebel
 LIQUIDATION_BUFFER   = 0.95   # Force-Close bei 95% Margin-Verlust
 
 # ── Directional Trades (KI kauft aktiv bei UP-Signal) ─────────────────────────
-DIRECTIONAL_ENABLED   = True
-DIRECTIONAL_SCORE_MIN = 0.08   # Score > 0.08 bei UP-Signal → kaufen
-DIRECTIONAL_PCT       = 0.15   # 15% des Investments pro Directional Trade
-DIRECTIONAL_TP_ATR    = 2.5    # Take-Profit: Einstieg + 2.5 × ATR
-DIRECTIONAL_SL_ATR    = 1.5    # Stop-Loss:   Einstieg − 1.5 × ATR
+DIRECTIONAL_ENABLED             = True
+DIRECTIONAL_SCORE_MIN           = 0.08   # Score > 0.08 bei UP-Signal → kaufen
+DIRECTIONAL_PCT                 = 0.15   # 15% des Investments pro Directional Trade
+DIRECTIONAL_TP_ATR              = 2.5    # Take-Profit: Einstieg + 2.5 × ATR
+DIRECTIONAL_SL_ATR              = 1.5    # Stop-Loss:   Einstieg − 1.5 × ATR
+DIRECTIONAL_DOWN_TRAIL_PCT      = 0.005  # Bei ML:DOWN im Plus: erst nach 0.5% Rückgang verkaufen
+DIRECTIONAL_RECHECK_SCORE_MIN   = 0.25   # Nach SL: frische Prediction braucht Score > 0.25
 
 # ── Graceful Shutdown ─────────────────────────────────────────────────────────
 _running = True
@@ -174,10 +176,15 @@ def predict_direction(symbol: str) -> str:
     global _ml_predictor
     if USE_ML and _ml_predictor is not None:
         direction = _ml_predictor.predict(symbol)
-        # Echten Blended-Score (LGBM+LLM) verwenden, nicht hardcoded ±0.5
-        _last_scores[symbol] = _ml_predictor.get_score(symbol) or (
-            0.5 if direction == "up" else (-0.5 if direction == "down" else 0.0)
-        )
+        raw = _ml_predictor.get_score(symbol)
+        if raw == 0.0 or raw is None:
+            raw = 0.5 if direction == "up" else (-0.5 if direction == "down" else 0.0)
+        # Score-Vorzeichen muss immer zur Direction passen (Fallback-Score kann veraltet sein)
+        if direction == "down" and raw > 0:
+            raw = -raw
+        elif direction == "up" and raw < 0:
+            raw = -raw
+        _last_scores[symbol] = raw
         return direction
     try:
         df = fetch_ohlcv(symbol, "1h", 100)
@@ -427,6 +434,7 @@ class PaperGridBot:
         self._last_pred_low = 0.0
         self._last_pred_high = 0.0
         self._directional: dict = {}  # aktiver Directional Trade: {qty, entry, tp, sl, usdt}
+        self._directional_needs_recheck = False  # True nach SL → frische Prediction vor Re-Entry
 
     def _maybe_open_directional(self, current_price: float):
         """Öffnet einen Directional Trade wenn ML 'up' signalisiert und kein Trade offen."""
@@ -434,6 +442,25 @@ class PaperGridBot:
             return
         if self._directional:
             return  # bereits offen
+
+        # Nach SL: frische Live-Prediction holen und striktere Schwelle anlegen
+        if self._directional_needs_recheck:
+            fresh_direction = predict_direction(self.symbol)
+            fresh_score = get_last_direction_score(self.symbol)
+            self._last_prediction = fresh_direction
+            self._direction_score = fresh_score
+            logger.info(
+                "[DIRECTIONAL] %s Recheck nach SL → %s (Score=%+.2f, Threshold=%.2f)",
+                self.symbol, fresh_direction.upper(), fresh_score, DIRECTIONAL_RECHECK_SCORE_MIN,
+            )
+            self._directional_needs_recheck = False
+            if fresh_direction != "up" or fresh_score < DIRECTIONAL_RECHECK_SCORE_MIN:
+                logger.info(
+                    "[DIRECTIONAL] %s Re-Entry abgelehnt (Signal=%s, Score=%+.2f)",
+                    self.symbol, fresh_direction.upper(), fresh_score,
+                )
+                return
+
         # Kaufen wenn Direction UP ist (Dashboard zeigt UP → Bot kauft)
         if self._last_prediction != "up":
             return
@@ -460,18 +487,50 @@ class PaperGridBot:
         )
 
     def _check_directional(self, current_price: float):
-        """Prüft ob TP oder SL des Directional Trades erreicht wurde."""
+        """Prüft ob TP, SL oder Signal-Flip des Directional Trades erreicht wurde.
+
+        ML:DOWN-Verhalten:
+        - Position im Plus  → Trail-Lock: erst nach DIRECTIONAL_DOWN_TRAIL_PCT Rückgang verkaufen
+        - Position im Minus → Signal ignorieren, SL übernimmt
+        """
         if not self._directional:
             return
         d = self._directional
         hit_tp = current_price >= d["tp"]
         hit_sl = current_price <= d["sl"]
         score  = self._direction_score
+        signal_flipped = score < 0 or not self.with_position
 
-        # Auch schließen wenn Signal dreht
-        signal_flipped = score < 0
+        pnl_pct = (current_price - d["entry"]) / d["entry"]
 
-        if not (hit_tp or hit_sl or signal_flipped):
+        do_flip_sell = False
+        if signal_flipped:
+            if pnl_pct < 0:
+                # Im Minus: ML:DOWN ignorieren – SL-Level übernimmt den Exit
+                pass
+            else:
+                # Im Plus: Trail-Lock setzen, Verkauf erst nach minimalem Rückgang
+                if "signal_down_price" not in d:
+                    d["signal_down_price"] = current_price
+                    logger.info(
+                        "[DIRECTIONAL] %s ML:DOWN bei +%.2f%% – Trail-Lock @ %.4f"
+                        " (Verkauf unter %.4f)",
+                        self.symbol, pnl_pct * 100, current_price,
+                        current_price * (1 - DIRECTIONAL_DOWN_TRAIL_PCT),
+                    )
+                trail_trigger = d["signal_down_price"] * (1 - DIRECTIONAL_DOWN_TRAIL_PCT)
+                if current_price <= trail_trigger:
+                    do_flip_sell = True
+        else:
+            # Signal nicht mehr DOWN → Trail-Lock aufheben
+            if "signal_down_price" in d:
+                logger.info(
+                    "[DIRECTIONAL] %s Signal wieder UP – Trail-Lock aufgehoben",
+                    self.symbol,
+                )
+                del d["signal_down_price"]
+
+        if not (hit_tp or hit_sl or do_flip_sell):
             return
 
         pnl = (current_price - d["entry"]) * d["qty"]
@@ -480,7 +539,7 @@ class PaperGridBot:
         self.total_profit += net
         self.trade_count  += 1
 
-        reason = "TP" if hit_tp else ("SL" if hit_sl else "Signal-Flip")
+        reason = "TP" if hit_tp else ("SL" if hit_sl else "Signal-Flip-Trail")
         logger.info(
             "[DIRECTIONAL] %s VERKAUF @ %.4f | Grund: %s | PnL: %+.4f USDT",
             self.symbol, current_price, reason, net,
@@ -488,11 +547,18 @@ class PaperGridBot:
         try:
             from dashboard.db import log_trade
             log_trade(self.symbol, "DIRECTIONAL", d["entry"], current_price,
-                      net, f"directional_{reason.lower()}", "grid",
+                      net, f"directional_{reason.lower().replace('-', '_')}", "grid",
                       "paper" if config.PAPER_TRADING else "live",
                       leverage=d.get("leverage", DEFAULT_LEVERAGE))
         except Exception:
             pass
+        if hit_sl:
+            self._directional_needs_recheck = True
+            logger.warning(
+                "[DIRECTIONAL] %s SL getroffen – Re-Entry gesperrt bis frische Prediction"
+                " Score > %.2f bestätigt",
+                self.symbol, DIRECTIONAL_RECHECK_SCORE_MIN,
+            )
         self._directional = {}
 
     def setup_grid(self, current_price: float,
@@ -1112,6 +1178,28 @@ def _start_ml_refresher(symbols: list):
     logger.info("ML-Refresher gestartet (alle %dh, %d Candles).", ML_REFRESH_INTERVAL_H, ML_REFRESH_CANDLES)
 
 
+def _sell_all_on_exit(bots):
+    """Schließt alle offenen Grid-Positionen und Directional-Trades zum aktuellen Preis."""
+    logger.info("SELL-ALL: Verkaufe alle Positionen vor Bot-Stopp")
+    notifier._send("⏹ <b>Bot wird gestoppt</b> – Alle Positionen werden verkauft")
+    for bot in bots:
+        try:
+            price = fetch_ticker(bot.symbol)["last"]
+        except Exception as e:
+            logger.error("Sell-on-Exit %s: Ticker-Fehler %s", bot.symbol, e)
+            continue
+        if bot._directional:
+            # Directional zwangsschließen: TP auf current_price setzen → hit_tp = True
+            bot._directional["tp"] = price
+            bot._check_directional(price)
+        bot.emergency_sell(price, "Bot-Stop (manuell)")
+    try:
+        from dashboard.db import set_stop_mode
+        set_stop_mode(None)
+    except Exception:
+        pass
+
+
 def run():
     # Coin-Budget aus Dashboard-Settings lesen (überschreibt GRIDS-Defaults)
     try:
@@ -1272,6 +1360,26 @@ def run():
                     logger.warning("Ticker Fehler %s: %s", bot.symbol, e)
                     continue
 
+            # Graceful-Stop via Dashboard prüfen
+            try:
+                from dashboard.db import get_stop_mode, set_stop_mode
+                _stop_mode = get_stop_mode()
+                if _stop_mode == "sell_all":
+                    set_stop_mode(None)
+                    _sell_all_on_exit(bots)
+                    break
+                elif _stop_mode == "wait_fills":
+                    set_stop_mode(None)
+                    for _b in bots:
+                        _b.with_position = False
+                    logger.info("SELL-ONLY-MODUS aktiv – keine neuen Käufe")
+                    notifier._send(
+                        "⏸ <b>Sell-Only-Modus aktiv</b>\n"
+                        "Bot kauft nicht mehr und beendet sich sobald alle Positionen geschlossen sind."
+                    )
+            except Exception:
+                pass
+
             # Cross-Coin Daily-Drawdown prüfen
             total_capital_now = sum(b.investment for b in bots)
             total_profit_now  = sum(b.total_profit for b in bots)
@@ -1385,6 +1493,18 @@ def run():
 
         except Exception as e:
             logger.error("Fehler: %s", e)
+
+        # Auto-Exit im Sell-Only-Modus wenn alle Positionen geschlossen
+        if not any(b.with_position for b in bots):
+            open_pos = sum(
+                1 for b in bots for o in b.orders.values()
+                if o["side"] == "sell" and not o["filled"] and "bought_at" in o
+            )
+            open_dir = sum(1 for b in bots if b._directional)
+            if open_pos == 0 and open_dir == 0:
+                logger.info("Alle Positionen geschlossen – Bot beendet (Sell-Only-Modus)")
+                notifier._send("✅ <b>Alle Positionen geschlossen</b> – Bot beendet")
+                break
 
         for _ in range(CHECK_INTERVAL):
             if not _running:

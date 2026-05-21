@@ -110,6 +110,8 @@ class MLPredictor:
 
             result = self._rule_based(df)
             logger.info("Fallback %-12s → %s", symbol, result.upper())
+            # Score auch beim Fallback aktualisieren, damit _direction_score konsistent bleibt
+            self._last_scores[symbol] = 0.5 if result == "up" else (-0.5 if result == "down" else 0.0)
             return result
 
         except Exception as e:

@@ -157,6 +157,13 @@ def _init(con: sqlite3.Connection):
             con.execute(f"ALTER TABLE trades ADD COLUMN {col} {coldef}")
         except Exception:
             pass
+    for col, coldef in [
+        ("stop_mode", "TEXT DEFAULT NULL"),
+    ]:
+        try:
+            con.execute(f"ALTER TABLE bot_status ADD COLUMN {col} {coldef}")
+        except Exception:
+            pass
     con.commit()
 
 
@@ -357,3 +364,19 @@ def set_status(running: bool, mode: str = "paper", strategy: str = "grid", capit
         )
     con.commit()
     con.close()
+
+
+def set_stop_mode(mode):
+    """Setzt den gewünschten Stopp-Modus ('sell_all', 'wait_fills', oder None zum Löschen)."""
+    con = get_conn()
+    con.execute("UPDATE bot_status SET stop_mode=? WHERE id=1", (mode,))
+    con.commit()
+    con.close()
+
+
+def get_stop_mode():
+    """Liest den aktuellen Stopp-Modus aus der DB."""
+    con = get_conn()
+    row = con.execute("SELECT stop_mode FROM bot_status WHERE id=1").fetchone()
+    con.close()
+    return row["stop_mode"] if row else None

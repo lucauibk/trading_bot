@@ -98,6 +98,18 @@ def api_stop():
     return jsonify({"ok": True, "msg": "Bot gestoppt"})
 
 
+@app.route("/api/bot/stop-graceful", methods=["POST"])
+def api_stop_graceful():
+    """Sendet einen Graceful-Stop-Wunsch an den laufenden Bot via DB-Flag."""
+    from dashboard.db import set_stop_mode
+    mode = (request.get_json() or {}).get("mode", "sell_all")
+    if mode not in {"sell_all", "wait_fills"}:
+        return jsonify({"ok": False, "msg": "Ungültiger Modus"}), 400
+    set_stop_mode(mode)
+    msg = "Alle Positionen werden verkauft…" if mode == "sell_all" else "Sell-Only-Modus aktiv – Bot wartet auf Fills…"
+    return jsonify({"ok": True, "msg": msg})
+
+
 @app.route("/api/shutdown", methods=["POST"])
 def api_shutdown():
     """Stoppt Bot + Dashboard komplett (nichts läuft danach im Hintergrund)."""
