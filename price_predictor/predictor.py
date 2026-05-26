@@ -3,9 +3,13 @@ from typing import List
 
 import pandas as pd
 
-from .data_fetcher import fetch_ohlcv
+from data_fetcher import fetch_ohlcv as _fetch_root
 from .indicators import compute_indicators
 from .grid_suggester import compute_grid_levels
+
+
+def _fetch_ohlcv_compat(exchange_id: str, symbol: str, timeframe: str = "1h", limit: int = 500):
+    return _fetch_root(symbol, timeframe, limit)
 
 _ADX_TRENDING_THRESHOLD = 25.0
 _ATR_PCT_VOLATILE_THRESHOLD = 3.0
@@ -22,7 +26,7 @@ class PricePredictor:
     grid_count: int = 10
 
     def _fetch_ohlcv(self) -> pd.DataFrame:
-        return fetch_ohlcv(self.exchange_id, self.symbol, self.timeframe, self.limit)
+        return _fetch_ohlcv_compat(self.exchange_id, self.symbol, self.timeframe, self.limit)
 
     def predict(self) -> dict:
         df = self._fetch_ohlcv()

@@ -95,7 +95,7 @@ if $START_BOT; then
       [ "$confirm" = "ja" ] || { info "Abgebrochen."; exit 0; }
     fi
     info "Starte Bot im ${BOT_MODE} Modus..."
-    nohup "$PYTHON" main.py --strategy grid --mode "$BOT_MODE" --no-confirm \
+    nohup "$PYTHON" main.py --mode "$BOT_MODE" --no-confirm \
       > "$LOG_DIR/trading_bot.log" 2>&1 &
     echo $! > "$BOT_PIDFILE"
     info "Bot-PID: $(cat "$BOT_PIDFILE") | Log: logs/trading_bot.log"
