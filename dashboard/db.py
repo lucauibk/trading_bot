@@ -218,6 +218,50 @@ def log_prediction(symbol: str, prediction: str, confidence: float,
     con.close()
 
 
+def update_prediction_outcomes(fetch_ohlcv_fn):
+    """
+    Füllt realized_high_6h, realized_low_6h und hit für Predictions nach, die
+    älter als 6h sind und noch kein Ergebnis haben. Muss periodisch aufgerufen werden.
+    fetch_ohlcv_fn(symbol, timeframe, limit) → DataFrame mit high/low-Spalten.
+    """
+    from datetime import datetime, timedelta, timezone
+    con = get_conn()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+    rows = con.execute(
+        "SELECT id, symbol, ts, prediction, predicted_low, predicted_high "
+        "FROM predictions WHERE hit IS NULL AND ts <= ?",
+        (cutoff,)
+    ).fetchall()
+
+    for row in rows:
+        pid, symbol, ts_str, pred, p_low, p_high = row
+        try:
+            df = fetch_ohlcv_fn(symbol, "1h", 8)
+            ts_pred = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            if ts_pred.tzinfo is None:
+                ts_pred = ts_pred.replace(tzinfo=timezone.utc)
+            after = df[df.index >= ts_pred] if hasattr(df.index, "tz") else df.tail(6)
+            if after.empty:
+                after = df.tail(6)
+            r_high = float(after["high"].max())
+            r_low  = float(after["low"].min())
+            if pred == "up":
+                hit = 1 if (p_high and r_high >= p_high) else 0
+            elif pred == "down":
+                hit = 1 if (p_low and r_low <= p_low) else 0
+            else:
+                hit = 1 if (p_high and p_low and r_high <= p_high and r_low >= p_low) else 0
+            con.execute(
+                "UPDATE predictions SET realized_high_6h=?, realized_low_6h=?, hit=? WHERE id=?",
+                (r_high, r_low, hit, pid)
+            )
+        except Exception:
+            pass
+
+    con.commit()
+    con.close()
+
+
 def log_optimizer_run(symbol: str, regime: str, params: dict, score: float,
                       daily_pct: float, max_dd: float, sample_size: int):
     import json
@@ -252,12 +296,13 @@ def update_grid_state(symbol: str, current_price: float, orders: dict,
     from datetime import datetime
     levels = [
         {
-            "price":     price,
+            "price":     o["price"],
             "side":      o["side"],
             "filled":    o.get("filled", False),
             "bought_at": o.get("bought_at"),
         }
-        for price, o in sorted(orders.items(), reverse=True)
+        for o in sorted(orders.values(), key=lambda x: x.get("price", 0), reverse=True)
+        if isinstance(o.get("price"), (int, float))
     ]
     con = get_conn()
     con.execute(
