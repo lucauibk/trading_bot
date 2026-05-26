@@ -29,11 +29,9 @@ logger = logging.getLogger("grid_bot")
 
 # ── Grid Parameter ────────────────────────────────────────────────────────────
 GRIDS = [
-    {"symbol": "SOL/USD",  "investment": 300.0, "levels": 10},  # 10 Level wegen hoher Vol
-    {"symbol": "LINK/USD", "investment": 300.0, "levels": 8},
-    {"symbol": "INJ/USD",  "investment": 300.0, "levels": 8},
-    {"symbol": "AVAX/USD", "investment": 300.0, "levels": 8},   # statt ETH
-    {"symbol": "NEAR/USD", "investment": 300.0, "levels": 8},
+    {"symbol": "SOL/USD",  "investment": 67.0, "levels": 8},
+    {"symbol": "INJ/USD",  "investment": 67.0, "levels": 8},
+    {"symbol": "AVAX/USD", "investment": 66.0, "levels": 8},
 ]
 CHECK_INTERVAL   = 15
 
@@ -45,18 +43,18 @@ ATR_CANDLES      = 24     # ATR über letzte 24h berechnen
 # ── Notbremse ─────────────────────────────────────────────────────────────────
 MAX_LOSS_PCT         = 0.05   # Pro Coin – 5% des aktuellen Investments (bei 3× = 15% Preis-Move)
 PER_POS_SL_PCT       = 0.04   # Per-Position Stop-Loss: 4% unter Buy-Preis
-MAX_INVESTMENT_MULT  = 3.0    # Compounding-Cap: max. 3× Initial-Investment pro Coin
+MAX_INVESTMENT_MULT  = 10.0   # Compounding-Cap: max. 10× Initial-Investment pro Coin
 
 # ── Hebel (Leverage) ───────────────────────────────────────────────────────────
-DEFAULT_LEVERAGE     = 1.0    # Kein Hebel = Paper-sicherer Modus
+DEFAULT_LEVERAGE     = 3.0    # Aggressiv: Kraken-Maximum für maximalen Profit
 MAX_LEVERAGE         = 3.0    # Maximum erlaubter Hebel
-LIQUIDATION_BUFFER   = 0.95   # Force-Close bei 95% Margin-Verlust
+LIQUIDATION_BUFFER   = 0.90   # Force-Close bei 90% Margin-Verlust
 
 # ── Directional Trades (KI kauft aktiv bei UP-Signal) ─────────────────────────
 DIRECTIONAL_ENABLED             = True
-DIRECTIONAL_SCORE_MIN           = 0.08   # Score > 0.08 bei UP-Signal → kaufen
-DIRECTIONAL_PCT                 = 0.15   # 15% des Investments pro Directional Trade
-DIRECTIONAL_TP_ATR              = 2.5    # Take-Profit: Einstieg + 2.5 × ATR
+DIRECTIONAL_SCORE_MIN           = 0.12   # Score > 0.12 bei UP-Signal → kaufen (nur starke Signale)
+DIRECTIONAL_PCT                 = 0.25   # 25% des Investments pro Directional Trade (aggressiv)
+DIRECTIONAL_TP_ATR              = 3.0    # Take-Profit: Einstieg + 3.0 × ATR
 DIRECTIONAL_SL_ATR              = 1.5    # Stop-Loss:   Einstieg − 1.5 × ATR
 DIRECTIONAL_DOWN_TRAIL_PCT      = 0.005  # Bei ML:DOWN im Plus: erst nach 0.5% Rückgang verkaufen
 DIRECTIONAL_RECHECK_SCORE_MIN   = 0.25   # Nach SL: frische Prediction braucht Score > 0.25
@@ -72,11 +70,11 @@ signal.signal(signal.SIGINT, _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
 
 
-COMPOUND_EVERY_TRADES = 5      # Nach jeweils X Trades wird Gewinn reinvestiert
+COMPOUND_EVERY_TRADES = 3      # Nach jeweils 3 Trades wird Gewinn reinvestiert
 
 # ── Vorhersage ────────────────────────────────────────────────────────────────
 USE_PREDICTION       = True   # False = Vorhersage komplett deaktivieren
-PREDICTION_RECHECK   = 20    # Alle 20 Zyklen (5 Min) Vorhersage prüfen
+PREDICTION_RECHECK   = 5     # Alle 5 Zyklen (75s) Vorhersage prüfen
 USE_ML               = True  # True = KI-Modell statt regelbasierter Vorhersage
 USE_PRICE_PREDICTOR  = True  # PricePredictor für Grid-Range (ersetzt calc_dynamic_range)
 
@@ -86,18 +84,18 @@ USE_PRICE_PREDICTOR  = True  # PricePredictor für Grid-Range (ersetzt calc_dyna
 # Werte aus grid_optimizer.py – nach eigenem Lauf anpassen.
 USE_REGIME_CONFIGS = True
 REGIME_CONFIGS = {
-    "ranging":  {"levels": 10},  # Seitwärts: mehr Levels = mehr Fills
+    "ranging":  {"levels": 14},  # Seitwärts: mehr Levels = mehr Fills
     "trending": {"levels": 6},   # Trend: weniger Levels, breite Range → weniger Resets
-    "volatile": {"levels": 14},  # Volatil: viele Levels = maximale Fills bei Bewegungen
+    "volatile": {"levels": 20},  # Volatil: maximale Levels für höchste Fill-Frequenz
 }
 # Grenzen für automatisches Tuning durch den Hintergrund-Optimizer
-REGIME_LEVELS_MIN = {"ranging": 6, "trending": 4, "volatile": 10}
-REGIME_LEVELS_MAX = {"ranging": 14, "trending": 8, "volatile": 18}
+REGIME_LEVELS_MIN = {"ranging": 8, "trending": 4, "volatile": 14}
+REGIME_LEVELS_MAX = {"ranging": 18, "trending": 8, "volatile": 24}
 
 # ── Periodischer Grid-Rebuild ──────────────────────────────────────────────────
 # Erzwingt Grid-Neuaufbau mit aktueller ATR-Range, auch wenn Preis noch in Range ist.
 # 240 Zyklen × 15s = 60 Minuten. Setzt sicher dass PricePredictor immer aktuelle Daten nutzt.
-GRID_REBUILD_CYCLES = 240
+GRID_REBUILD_CYCLES = 60
 
 # ── Fee-Absicherung ────────────────────────────────────────────────────────────
 # Kraken Maker-Fee ~0.16% pro Seite. Step muss 2× Fee überschreiten sonst Verlust.
@@ -119,6 +117,28 @@ MOMENTUM_HOLD_MAX   = 2     # Max. 2× verschieben pro Position (danach immer ve
 _ml_predictor = None         # wird in run() initialisiert
 _price_predictors: dict = {} # symbol → PricePredictor Instanz
 _last_scores: dict = {}      # symbol → normierter Score (-1.0 … +1.0)
+
+
+class _DailyDrawdownGuard:
+    """Minimaler täglicher Drawdown-Schutz: pausiert Trading wenn Tagesverlust > max_dd."""
+    def __init__(self, initial_capital: float, max_dd: float = 0.08):
+        from datetime import date
+        self.initial_capital = initial_capital
+        self.max_dd          = max_dd
+        self._daily_start    = initial_capital
+        self._last_reset     = date.today()
+
+    def check_daily_drawdown(self, capital: float) -> bool:
+        from datetime import date
+        today = date.today()
+        if today != self._last_reset:
+            self._daily_start = capital
+            self._last_reset  = today
+        loss_pct = (capital - self._daily_start) / max(self._daily_start, 1)
+        if loss_pct <= -self.max_dd:
+            logger.warning("Tages-Drawdown %.1f%% erreicht – Bot pausiert", loss_pct * 100)
+            return False
+        return True
 
 
 def _calc_level_allocations(grid_lines: list, current_price: float,
@@ -195,10 +215,7 @@ def predict_direction(symbol: str) -> str:
         volume = df["volume"]
 
         # Indikatoren
-        ema9  = ta_lib.trend.ema_indicator(close, window=9).iloc[-1]
-        ema21 = ta_lib.trend.ema_indicator(close, window=21).iloc[-1]
-        rsi   = ta_lib.momentum.rsi(close, window=14).iloc[-1]
-        mom   = (close.iloc[-1] - close.iloc[-4]) / close.iloc[-4] * 100
+        mom = (close.iloc[-1] - close.iloc[-4]) / close.iloc[-4] * 100
 
         macd_line   = ta_lib.trend.macd(close).iloc[-1]
         macd_signal = ta_lib.trend.macd_signal(close).iloc[-1]
@@ -222,32 +239,24 @@ def predict_direction(symbol: str) -> str:
 
         score = 0
 
-        # 1. EMA-Kreuzung
-        if ema9 > ema21:  score += 1
-        if ema9 < ema21:  score -= 1
-
-        # 2. 3h-Momentum
+        # 1. 3h-Momentum
         if mom > 0.5:   score += 1
         if mom < -0.5:  score -= 1
 
-        # 3. RSI
-        if rsi < 35:  score += 1
-        if rsi > 65:  score -= 1
-
-        # 4. MACD
+        # 2. MACD
         if macd_line > macd_signal:  score += 1
         if macd_line < macd_signal:  score -= 1
 
-        # 5. Bollinger Band Position
+        # 3. Bollinger Band Position
         if bb_pct < 0.2:  score += 1
         if bb_pct > 0.8:  score -= 1
 
-        # 6. Volumen-bestätigtes Momentum
+        # 4. Volumen-bestätigtes Momentum
         if vol_surge and mom > 0:  score += 1
         if vol_surge and mom < 0:  score -= 1
 
-        # ── Einfache Candlestick-Muster ────────────────────────────────────────
-        # 7. Hammer / Pin Bar bullisch
+        # ── Candlestick-Muster ─────────────────────────────────────────────────
+        # 5. Hammer / Pin Bar bullisch
         if lower_shadow > 2 * body and upper_shadow < body and body / total_range < 0.4:
             score += 1
 
@@ -291,20 +300,11 @@ def predict_direction(symbol: str) -> str:
         if body / total_range < 0.05:
             score = int(score * 0.7)  # dämpfen, kein klares Signal
 
-        # 16. RSI-Divergenz (vereinfacht): Preis neues Tief, RSI steigt → bullisch
-        rsi_series = ta_lib.momentum.rsi(close, window=14)
-        if (close.iloc[-1] < close.iloc[-5]
-                and rsi_series.iloc[-1] > rsi_series.iloc[-5]):
-            score += 1
-        if (close.iloc[-1] > close.iloc[-5]
-                and rsi_series.iloc[-1] < rsi_series.iloc[-5]):
-            score -= 1
-
         direction = "up" if score >= 3 else "down" if score <= -3 else "neutral"
-        _last_scores[symbol] = max(-1.0, min(1.0, score / 12.0))
+        _last_scores[symbol] = max(-1.0, min(1.0, score / 10.0))
         logger.info(
-            "Vorhersage %-12s EMA=%+.2f RSI=%.1f Mom=%+.2f%% BB=%.2f Score=%+d → %s",
-            symbol, ema9 - ema21, rsi, mom, bb_pct, score, direction.upper()
+            "Vorhersage %-12s Mom=%+.2f%% BB=%.2f Score=%+d → %s",
+            symbol, mom, bb_pct, score, direction.upper()
         )
         return direction
     except Exception as e:
@@ -436,6 +436,19 @@ class PaperGridBot:
         self._directional: dict = {}  # aktiver Directional Trade: {qty, entry, tp, sl, usdt}
         self._directional_needs_recheck = False  # True nach SL → frische Prediction vor Re-Entry
 
+    def _build_trade_context(self, buy_price: float, sell_price: float,
+                              holding_seconds: float = None, level_idx: int = None) -> dict:
+        return {
+            "atr_pct":        self.range_pct * 0.5,
+            "regime":         self._last_regime or None,
+            "ml_prediction":  getattr(self, "_last_prediction", None),
+            "ml_confidence":  self._last_confidence or None,
+            "predicted_low":  self._last_pred_low or None,
+            "predicted_high": self._last_pred_high or None,
+            "holding_seconds": holding_seconds,
+            "grid_level_idx": level_idx,
+        }
+
     def _maybe_open_directional(self, current_price: float):
         """Öffnet einen Directional Trade wenn ML 'up' signalisiert und kein Trade offen."""
         if not DIRECTIONAL_ENABLED:
@@ -461,6 +474,11 @@ class PaperGridBot:
                 )
                 return
 
+        # Kein Entry in Stunden mit nachweislich negativem EV (05-09 UTC)
+        from datetime import datetime, timezone
+        if datetime.now(timezone.utc).hour in {5, 6, 7, 8}:
+            return
+
         # Kaufen wenn Direction UP ist (Dashboard zeigt UP → Bot kauft)
         if self._last_prediction != "up":
             return
@@ -475,9 +493,11 @@ class PaperGridBot:
         tp   = current_price + DIRECTIONAL_TP_ATR * atr
         sl   = current_price - DIRECTIONAL_SL_ATR * atr
 
+        import time as _time
         self._directional = {
             "entry": current_price, "qty": qty,
             "usdt": usdt, "tp": tp, "sl": sl, "leverage": lev,
+            "entry_ts": _time.time(),
         }
         logger.info(
             "[DIRECTIONAL] %s KAUF @ %.4f | %.2f USDT | TP=%.4f (+%.1f%%) | SL=%.4f (-%.1f%%)",
@@ -545,11 +565,14 @@ class PaperGridBot:
             self.symbol, current_price, reason, net,
         )
         try:
+            import time as _time
             from dashboard.db import log_trade
+            holding = _time.time() - d.get("entry_ts", _time.time())
+            ctx = self._build_trade_context(d["entry"], current_price, holding_seconds=holding)
             log_trade(self.symbol, "DIRECTIONAL", d["entry"], current_price,
                       net, f"directional_{reason.lower().replace('-', '_')}", "grid",
                       "paper" if config.PAPER_TRADING else "live",
-                      leverage=d.get("leverage", DEFAULT_LEVERAGE))
+                      context=ctx, leverage=d.get("leverage", DEFAULT_LEVERAGE))
         except Exception:
             pass
         if hit_sl:
@@ -639,10 +662,11 @@ class PaperGridBot:
                 )
                 try:
                     from dashboard.db import log_trade
+                    ctx = self._build_trade_context(buy_price, current_price)
                     log_trade(self.symbol, "SELL", buy_price, current_price, net_profit,
                               "stop_loss", "grid",
                               "paper" if config.PAPER_TRADING else "live",
-                              leverage=order.get("leverage", DEFAULT_LEVERAGE))
+                              context=ctx, leverage=order.get("leverage", DEFAULT_LEVERAGE))
                 except Exception:
                     pass
 
@@ -722,10 +746,15 @@ class PaperGridBot:
                 order_lev = order.get("leverage", DEFAULT_LEVERAGE)
                 try:
                     from dashboard.db import log_trade
+                    try:
+                        lvl_idx = self.grid_lines.index(price)
+                    except ValueError:
+                        lvl_idx = None
+                    ctx = self._build_trade_context(buy_price, price, level_idx=lvl_idx)
                     log_trade(self.symbol, "GRID", buy_price, price, net_profit,
                               "grid_fill", "grid",
                               "paper" if config.PAPER_TRADING else "live",
-                              leverage=order_lev)
+                              context=ctx, leverage=order_lev)
                 except Exception:
                     pass
                 # Neue Kauf-Order – nur wenn ML nicht DOWN
@@ -799,9 +828,10 @@ class PaperGridBot:
                             self.symbol, current_price, buy_price, net_profit)
                 try:
                     from dashboard.db import log_trade
+                    ctx = self._build_trade_context(buy_price, current_price)
                     log_trade(self.symbol, "SELL", buy_price, current_price, net_profit,
                               reason, "grid", "paper" if config.PAPER_TRADING else "live",
-                              leverage=order.get("leverage", DEFAULT_LEVERAGE))
+                              context=ctx, leverage=order.get("leverage", DEFAULT_LEVERAGE))
                 except Exception:
                     pass
         if sold_count:
@@ -884,6 +914,19 @@ class LiveGridBot:
         self._last_confidence = 0.0
         self._last_pred_low = 0.0
         self._last_pred_high = 0.0
+
+    def _build_trade_context(self, buy_price: float, sell_price: float,
+                              holding_seconds: float = None, level_idx: int = None) -> dict:
+        return {
+            "atr_pct":        self.range_pct * 0.5,
+            "regime":         self._last_regime or None,
+            "ml_prediction":  getattr(self, "_last_prediction", None),
+            "ml_confidence":  self._last_confidence or None,
+            "predicted_low":  self._last_pred_low or None,
+            "predicted_high": self._last_pred_high or None,
+            "holding_seconds": holding_seconds,
+            "grid_level_idx": level_idx,
+        }
 
     def _exchange(self):
         from data_fetcher import get_exchange
@@ -1224,12 +1267,8 @@ def run():
     mode = "PAPER" if config.PAPER_TRADING else "LIVE"
     BotClass = PaperGridBot if config.PAPER_TRADING else LiveGridBot
 
-    # ── Cross-Coin Risk-Manager (Daily-Drawdown -3%) ───────────────────────────
-    from src.risk.risk_manager import RiskManager
-    _risk_manager = RiskManager(
-        params={"max_daily_drawdown": 0.03, "max_open_positions": 99, "max_portfolio_risk": 1.0},
-        initial_capital=total_investment,
-    )
+    # ── Cross-Coin Daily-Drawdown-Bremse ──────────────────────────────────────
+    _risk_manager = _DailyDrawdownGuard(initial_capital=total_investment, max_dd=0.08)
     _freeze_mode = False  # wenn True: keine neuen Buy-Orders, nur Sells
 
     logger.info("="*55)
@@ -1294,14 +1333,20 @@ def run():
         if USE_PREDICTION:
             direction = predict_direction(bot.symbol)
             bot._direction_score = get_last_direction_score(bot.symbol)
-            new_pos = direction != "down"
+            regime = getattr(bot, "_last_regime", "")
+            # In Trend-Regime: kein Grid-Trading, nur Directional Trades
+            if regime == "trending":
+                new_pos = False
+            else:
+                new_pos = direction != "down"
             changed = new_pos != bot.with_position
             bot.with_position = new_pos
             bot._last_prediction = direction
             if changed:
+                trend_note = " (Trend-Regime → nur Directional)" if regime == "trending" else ""
                 notifier._send(
-                    f"🔮 <b>Vorhersage {bot.symbol}</b>: {direction.upper()}\n"
-                    f"{'➡ Position aktiv' if bot.with_position else '⬇ Abwärtstrend – kein Einstieg'}"
+                    f"🔮 <b>Vorhersage {bot.symbol}</b>: {direction.upper()}{trend_note}\n"
+                    f"{'➡ Position aktiv' if bot.with_position else '⬇ Kein Grid-Einstieg'}"
                 )
             return changed
         else:
