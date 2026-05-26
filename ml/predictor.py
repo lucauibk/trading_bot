@@ -1,6 +1,6 @@
 import logging
-import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, List, Optional
 
 import ta as ta_lib
@@ -28,7 +28,9 @@ class MLPredictor:
         self._store        = MLDataStore()
         self._models:  Dict[str, TradingModel]  = {}
         self._trainer: Optional[ModelTrainer]   = None
-        self._last_scores: Dict[str, float]     = {}  # symbol → blended score (-1..+1)
+        self._last_scores: Dict[str, float]     = {}
+        # Single-worker executor prevents multiple concurrent retrains competing on _clf
+        self._retrain_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ml-retrain")
 
     def get_score(self, symbol: str) -> float:
         """Letzter normierter Blended-Score (-1.0=down … +1.0=up) für adaptive Sizing."""
@@ -73,11 +75,9 @@ class MLPredictor:
                 ts = int(time.time())
                 if self._trainer:
                     self._trainer.record(symbol, ts, feats, price, label_int)
-                    threading.Thread(
-                        target=self._trainer.label_and_maybe_retrain,
-                        args=(symbol, df),
-                        daemon=True,
-                    ).start()
+                    self._retrain_executor.submit(
+                        self._trainer.label_and_maybe_retrain, symbol, df
+                    )
 
             # LLM-Analyse (gecacht, ~1×/Stunde pro Coin)
             llm_indicators = self._build_llm_indicators(df, symbol)
@@ -110,8 +110,9 @@ class MLPredictor:
 
             result = self._rule_based(df)
             logger.info("Fallback %-12s → %s", symbol, result.upper())
-            # Score auch beim Fallback aktualisieren, damit _direction_score konsistent bleibt
-            self._last_scores[symbol] = 0.5 if result == "up" else (-0.5 if result == "down" else 0.0)
+            # ±0.5 so rule-based can trigger momentum-hold (threshold 0.35)
+            _fallback_score = {"up": 0.5, "down": -0.5, "neutral": 0.0}
+            self._last_scores[symbol] = _fallback_score.get(result, 0.0)
             return result
 
         except Exception as e:

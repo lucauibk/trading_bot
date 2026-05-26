@@ -11,12 +11,12 @@ from .model import TradingModel
 
 logger = logging.getLogger("ml.trainer")
 
-LOOKFORWARD_H   = 12     # Timeout in Candles (12h) für Triple-Barrier
+LOOKFORWARD_H   = 2      # Timeout in Candles (2h) – grid trades are micro-moves
 RETRAIN_EVERY_N = 50     # Retrain nach N neuen gelabelten Samples
 
-# Triple-Barrier-Parameter: Faktoren auf ATR als Schwelle
-TB_UPPER_ATR = 2.0   # Gewinn-Barriere = 2× ATR
-TB_LOWER_ATR = 1.5   # Verlust-Barriere = 1.5× ATR (asymmetrisch: enger Stop)
+# Triple-Barrier-Parameter: eng genug für Grid-Mikro-Moves (0.1–0.5% per trade)
+TB_UPPER_ATR = 0.5   # Gewinn-Barriere = 0.5× ATR  (war 2.0× → zu weit für Grid)
+TB_LOWER_ATR = 0.5   # Verlust-Barriere = 0.5× ATR (war 1.5× → Swing-Trade-Skala)
 
 
 def _compute_label_triple_barrier(
