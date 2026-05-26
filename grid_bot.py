@@ -485,8 +485,14 @@ class PaperGridBot:
         if self._direction_score < DIRECTIONAL_SCORE_MIN:
             return
 
-        # ATR aus letzten 24 Candles schätzen (vereinfacht: range_pct als Proxy)
-        atr = current_price * self.range_pct * 0.5
+        # Echter ATR für präzise SL/TP-Platzierung
+        try:
+            _df_atr = fetch_ohlcv(self.symbol, "1h", 20)
+            atr = float(ta_lib.volatility.average_true_range(
+                _df_atr["high"], _df_atr["low"], _df_atr["close"], window=14
+            ).iloc[-1])
+        except Exception:
+            atr = current_price * self.range_pct * 0.5  # Fallback
         usdt = self.investment * DIRECTIONAL_PCT
         lev  = _current_leverage()
         qty  = (usdt * lev) / current_price
@@ -1455,18 +1461,14 @@ def run():
 
                 bot.check_liquidation(current_price)
 
-                if _freeze_mode:
-                    bot.check_fills(current_price)  # nur Sells abwickeln
-                    continue
-
-                bot.check_fills(current_price)
-
                 grid_lo = bot.grid_lines[0]
                 grid_hi = bot.grid_lines[-1]
                 out_of_range  = current_price < grid_lo * 0.99 or current_price > grid_hi * 1.01
                 do_recheck    = USE_PREDICTION and loop_count % PREDICTION_RECHECK == 0
                 do_rebuild    = loop_count % GRID_REBUILD_CYCLES == 0  # stündlicher Zwangs-Rebuild
 
+                # Prediction VOR check_fills aktualisieren: directional entry nutzt frische Signale
+                prediction_flipped = False
                 if out_of_range or do_recheck or do_rebuild:
                     lower, upper, levels, new_range, regime, confidence = _build_grid_params(
                         bot.symbol, current_price, bot.levels
@@ -1484,23 +1486,31 @@ def run():
                     bot._last_pred_high  = upper
 
                     prediction_flipped = _apply_prediction(bot)
-                    if out_of_range or prediction_flipped or do_rebuild:
-                        if out_of_range:
-                            reason = "außerhalb Range"
-                        elif prediction_flipped:
-                            reason = "Vorhersage geändert"
-                        else:
-                            reason = "stündlicher Rebuild"
-                        logger.warning(
-                            "%s %s – Grid neu (±%.1f%%, %d Levels, Regime=%s, Conf=%.2f)",
-                            bot.symbol, reason, new_range * 100, bot.levels,
-                            regime or "–", confidence,
-                        )
-                        # Bei DOWN-Flip: neue Käufe blockiert (with_position=False).
-                        # Kein Emergency-Sell — Positionen schließen normal am Grid-Level.
-                        # Per-Position-SL (4%) deckt Crash-Szenario ab.
-                        bot.setup_grid(current_price, lower=lower, upper=upper)
-                    # Dashboard immer aktualisieren wenn Prediction geprüft wurde
+
+                if _freeze_mode:
+                    bot.check_fills(current_price)  # nur Sells abwickeln
+                    continue
+
+                bot.check_fills(current_price)
+
+                if out_of_range or prediction_flipped or do_rebuild:
+                    if out_of_range:
+                        reason = "außerhalb Range"
+                    elif prediction_flipped:
+                        reason = "Vorhersage geändert"
+                    else:
+                        reason = "stündlicher Rebuild"
+                    logger.warning(
+                        "%s %s – Grid neu (±%.1f%%, %d Levels, Regime=%s, Conf=%.2f)",
+                        bot.symbol, reason, new_range * 100, bot.levels,
+                        regime or "–", confidence,
+                    )
+                    # Bei DOWN-Flip: neue Käufe blockiert (with_position=False).
+                    # Kein Emergency-Sell — Positionen schließen normal am Grid-Level.
+                    # Per-Position-SL (4%) deckt Crash-Szenario ab.
+                    bot.setup_grid(current_price, lower=lower, upper=upper)
+                if out_of_range or do_recheck or do_rebuild:
+                    # Dashboard aktualisieren wenn Prediction geprüft wurde
                     _log_bot_state(bot, current_price)
 
             # Zusammenfassung + Dashboard-State

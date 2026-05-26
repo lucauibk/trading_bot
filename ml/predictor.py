@@ -86,7 +86,7 @@ class MLPredictor:
             # Blending: LightGBM + Claude Haiku
             blended_score, blended_conf = blend_scores(lgbm_score, lgbm_conf, llm_result)
 
-            if blended_conf >= MIN_CONFIDENCE or (llm_result and llm_result["confidence"] >= 0.60):
+            if blended_conf >= MIN_CONFIDENCE:
                 if blended_score > 0.15:
                     direction = "up"
                 elif blended_score < -0.15:
@@ -126,12 +126,14 @@ class MLPredictor:
             low    = df["low"]
             ema9   = float(ta_lib.trend.ema_indicator(close, window=9).iloc[-1])
             ema21  = float(ta_lib.trend.ema_indicator(close, window=21).iloc[-1])
-            rsi    = float(ta_lib.momentum.rsi(close, window=7).iloc[-1])
+            rsi    = float(ta_lib.momentum.rsi(close, window=14).iloc[-1])
             atr    = ta_lib.volatility.average_true_range(high, low, close, window=14)
             atr_pct = float(atr.iloc[-1] / close.iloc[-1] * 100)
             bb_h   = ta_lib.volatility.bollinger_hband(close).iloc[-1]
             bb_l   = ta_lib.volatility.bollinger_lband(close).iloc[-1]
             bb_pos = float((close.iloc[-1] - bb_l) / (bb_h - bb_l)) if bb_h != bb_l else 0.5
+            adx_val = float(ta_lib.trend.adx(high, low, close, window=14).iloc[-1])
+            regime = "trending" if adx_val > 25 else ("volatile" if atr_pct > 3.0 else "ranging")
 
             candles = []
             for i in range(-5, 0):
@@ -148,7 +150,7 @@ class MLPredictor:
                 "price": float(close.iloc[-1]),
                 "rsi": rsi, "ema9": ema9, "ema21": ema21,
                 "atr_pct": atr_pct, "bb_position": bb_pos,
-                "regime": "ranging",
+                "regime": regime,
                 "last_candles": candles,
             }
         except Exception:
