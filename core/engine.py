@@ -54,6 +54,14 @@ class Engine:
 
     def run(self):
         logger.info("Engine starting | symbols=%s", self.symbols)
+
+        # Clear any stale stop_mode from previous session before first tick
+        try:
+            from dashboard.db import set_stop_mode
+            set_stop_mode(None)
+        except Exception:
+            pass
+
         self.strategy.init(self.symbols, self.ctx)
 
         # Initialise equity so daily-drawdown brake has a valid baseline
@@ -318,7 +326,7 @@ class Engine:
                     if state:
                         from core.strategy import Fill
                         for cid, o in list(state.orders.items()):
-                            if o.get("side") == "sell" and not o.get("filled") and "bought_at" in o:
+                            if o.get("side") == "sell" and not o.get("filled") and "bought_at" in o and not o.get("pre_seeded"):
                                 fill = Fill(
                                     client_id=cid,
                                     symbol=sym, side="sell",

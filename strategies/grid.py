@@ -420,7 +420,8 @@ class GridStrategy(Strategy):
             }
             state.price_to_id[new_buy_price] = new_cid
 
-        ctx.remove_position(fill.symbol, "grid")
+        if not order.get("pre_seeded"):
+            ctx.remove_position(fill.symbol, "grid")
         self._maybe_compound(sell_price, state)
 
     def _maybe_compound(self, price: float, state: _GridState):
@@ -691,15 +692,14 @@ class GridStrategy(Strategy):
             if gp < price:
                 state.orders[cid] = {"side": "buy", "price": gp, "qty": qty, "filled": False}
             else:
-                # Pre-seed sells above price so grid is two-sided from the start
-                bought_at = grid_lines[i - 1] if i > 0 else price
-                sell_qty = allocations.get(bought_at, usdt) * lev / bought_at
-                sl_pct = max((gp - bought_at) / bought_at * 1.5, 0.008)
-                sl_price = bought_at * (1 - sl_pct)
+                # Pre-seed sells above price so grid is two-sided from the start.
+                # bought_at = current price (not a grid line above price) so that:
+                #   a) P&L is positive when the sell fills
+                #   b) no sl_price → _check_position_stops skips these (no phantom SL fires)
+                sell_qty = usdt * lev / gp
                 state.orders[cid] = {
                     "side": "sell", "price": gp, "qty": sell_qty, "filled": False,
-                    "bought_at": bought_at, "sl_price": sl_price,
-                    "trailing_activated": False, "momentum_holds": 0,
+                    "bought_at": price, "pre_seeded": True,
                 }
             state.price_to_id[gp] = cid
 
