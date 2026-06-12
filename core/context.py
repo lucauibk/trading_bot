@@ -106,6 +106,10 @@ class MarketContext:
         with self._lock:
             return sum(len(v) for v in self.positions.values())
 
+    def get_positions(self, symbol: str) -> list:
+        with self._lock:
+            return list(self.positions.get(symbol, []))
+
     def symbol_position_usdt(self, symbol: str) -> float:
         with self._lock:
             return sum(p.usdt_value for p in self.positions.get(symbol, []))
