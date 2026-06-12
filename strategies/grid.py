@@ -7,6 +7,7 @@ When a sell fills, a new buy is replenished.
 """
 
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ import ta as ta_lib
 
 from core.context import MarketContext, Position
 from core.strategy import Fill, Order, Strategy
+from strategies.grid_params import GridParams
 
 logger = logging.getLogger("strategies.grid")
 
@@ -25,20 +27,13 @@ logger = logging.getLogger("strategies.grid")
 KRAKEN_FEE = 0.0016
 MIN_STEP_FEE_MULTIPLE = 2.5
 MAX_LOSS_PCT = 0.05
-MOMENTUM_HOLD_SCORE = 0.35
-MOMENTUM_HOLD_MAX = 2
 COMPOUND_EVERY_TRADES = 3
 MAX_INVESTMENT_MULT = 3.0          # Compounding cap: max 3× initial investment
 
 ADAPTIVE_SIZING = True             # Bullish → more budget on lower levels
 SIZE_BIAS_FACTOR = 0.30
 
-# Directional trade config
-DIRECTIONAL_ENABLED = True
-DIRECTIONAL_SCORE_MIN = 0.12
-DIRECTIONAL_PCT = 0.20
-DIRECTIONAL_TP_ATR = 3.0
-DIRECTIONAL_SL_ATR = 1.5
+# Directional trade config (non-swept parts; swept ones live in GridParams)
 DIRECTIONAL_RECHECK_SCORE_MIN = 0.25
 DIRECTIONAL_DOWN_TRAIL_PCT = 0.005
 DIRECTIONAL_COOLOFF_SECONDS = 4 * 3600
@@ -114,17 +109,29 @@ class _GridState:
         self._atr: float = 0.0
         self._last_df: object = None
 
+        # Floor-SL + hard trend filter state
+        self.grid_lower: float = 0.0
+        self.floor_sl: float = 0.0
+        self._hard_trend_down: bool = False
+        self._trend_up_count: int = 0
+
 
 class GridStrategy(Strategy):
     name = "grid"
 
-    def __init__(self, grids_config: list, risk_manager=None, ml_enabled: bool = True):
+    def __init__(self, grids_config: list, risk_manager=None, ml_enabled: bool = True,
+                 params: Optional[GridParams] = None):
         self._config = {g["symbol"]: g for g in grids_config}
         self._risk = risk_manager
         self._ml_enabled = ml_enabled
+        self.p = params or GridParams()
         self._states: Dict[str, _GridState] = {}
         self._ml_predictor = None
         self._price_predictors: dict = {}
+
+    def _lev(self) -> float:
+        """Pinned leverage from params (backtest/sweep determinism) or live dashboard value."""
+        return self.p.leverage if self.p.leverage > 0 else _get_leverage()
 
     def init(self, symbols: List[str], ctx: MarketContext) -> None:
         for sym in symbols:
@@ -168,7 +175,44 @@ class GridStrategy(Strategy):
             pass
         state._last_df = df
 
+        if self.p.trend_filter_enabled:
+            self._update_trend_filter(state, df)
+
         self._refresh_prediction(symbol, df, ctx)
+
+    def _update_trend_filter(self, state: _GridState, df: pd.DataFrame) -> None:
+        """ML-independent hard downtrend detection with 2-candle exit hysteresis."""
+        try:
+            tail = df.tail(150)
+            close = tail["close"]
+            ema9 = close.ewm(span=9, adjust=False).mean().iloc[-1]
+            ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1]
+            ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+            adx_ind = ta_lib.trend.ADXIndicator(tail["high"], tail["low"], close, window=14)
+            adx = float(adx_ind.adx().iloc[-1])
+            di_plus = float(adx_ind.adx_pos().iloc[-1])
+            di_minus = float(adx_ind.adx_neg().iloc[-1])
+        except Exception:
+            return
+
+        hard_down = (ema9 < ema21 < ema50) or (adx > self.p.trend_adx_min and di_minus > di_plus)
+        if hard_down:
+            if not state._hard_trend_down:
+                logger.info("[TREND] %s hard downtrend → grid buys paused", state.symbol)
+            state._hard_trend_down = True
+            state._trend_up_count = 0
+        elif state._hard_trend_down:
+            state._trend_up_count += 1
+            if state._trend_up_count >= 2:
+                state._hard_trend_down = False
+                logger.info("[TREND] %s downtrend cleared → grid buys resumed", state.symbol)
+
+    def _buys_allowed(self, state: _GridState) -> bool:
+        if not state.with_position:
+            return False
+        if self.p.trend_filter_enabled and state._hard_trend_down:
+            return False
+        return True
 
     def _refresh_prediction(self, symbol: str, df: pd.DataFrame, ctx: MarketContext):
         state = self._states[symbol]
@@ -229,10 +273,10 @@ class GridStrategy(Strategy):
                 adx_val = float(ta_lib.trend.adx(df["high"], df["low"], close, window=14).iloc[-1])
                 atr_pct = state._atr / price if price > 0 else 0.03
                 if adx_val > 25:
-                    half = state._atr * 2.0
+                    half = state._atr * self.p.range_atr_mult_trending
                     lower, upper, regime = price - half, price + half, "trending"
                 elif atr_pct > 0.03:
-                    half = state._atr * 1.5
+                    half = state._atr * self.p.range_atr_mult_volatile
                     lower, upper, regime = price - half, price + half, "volatile"
                 elif bb_upper > bb_lower:
                     lower, upper, regime = bb_lower, bb_upper, "ranging"
@@ -245,7 +289,7 @@ class GridStrategy(Strategy):
                 pass
 
         levels = state.levels
-        regime_configs = {"ranging": 14, "trending": 6, "volatile": 20}
+        regime_configs = self.p.regime_levels
         if regime in regime_configs:
             levels = regime_configs[regime]
 
@@ -262,6 +306,13 @@ class GridStrategy(Strategy):
             lower = price * (1 - range_pct)
             upper = price * (1 + range_pct)
 
+        # Fee-aware minimum step: cap levels (not range — range reflects expected
+        # volatility) so each grid step clears round-trip costs with margin.
+        if self.p.min_step_pct > 0 and upper > lower:
+            step_pct = (upper - lower) / levels / price
+            if step_pct < self.p.min_step_pct:
+                levels = max(2, int((upper - lower) / (price * self.p.min_step_pct)))
+
         return lower, upper, levels, range_pct, regime or "ranging", confidence or 0.5
 
     def desired_orders(self, symbol: str, price: float, ctx: MarketContext) -> List[Order]:
@@ -270,10 +321,11 @@ class GridStrategy(Strategy):
             return []
 
         orders = []
+        buys_ok = self._buys_allowed(state)
         for cid, o in state.orders.items():
             if o.get("filled"):
                 continue
-            if not state.with_position and o["side"] == "buy":
+            if not buys_ok and o["side"] == "buy":
                 continue
             # BTC crash gate for new grid buys (not for existing sell positions)
             if o["side"] == "buy" and "bought_at" not in o:
@@ -316,7 +368,7 @@ class GridStrategy(Strategy):
         buy_price = fill.price
         buy_cid = fill.client_id
         order = state.orders[buy_cid]
-        lev = _get_leverage()
+        lev = self._lev()
         qty = order["qty"]  # qty already has leverage factored in at setup
 
         try:
@@ -326,9 +378,12 @@ class GridStrategy(Strategy):
 
         if idx is not None and idx < len(state.grid_lines) - 1:
             sell_price = state.grid_lines[idx + 1]
-            step_pct = (sell_price - buy_price) / buy_price
-            sl_pct = max(step_pct * 1.5, 0.008)
-            sl_price = buy_price * (1 - sl_pct)
+            if self.p.sl_mode == "floor" and state.floor_sl > 0:
+                sl_price = state.floor_sl
+            else:
+                step_pct = (sell_price - buy_price) / buy_price
+                sl_pct = max(step_pct * self.p.per_pos_sl_step_mult, self.p.per_pos_sl_min_pct)
+                sl_price = buy_price * (1 - sl_pct)
 
             sell_cid = str(uuid.uuid4())
             state.orders[sell_cid] = {
@@ -358,7 +413,7 @@ class GridStrategy(Strategy):
         order = state.orders[sell_cid]
         buy_price = order.get("bought_at", sell_price)
         qty = order["qty"]
-        lev = _get_leverage()
+        lev = self._lev()
 
         profit = (sell_price - buy_price) * qty
         fee = (sell_price + buy_price) * qty * KRAKEN_FEE
@@ -371,6 +426,8 @@ class GridStrategy(Strategy):
                     fill.symbol, sell_price, buy_price, net)
 
         try:
+            if os.getenv("GRIDBOT_BACKTEST"):
+                raise ImportError("backtest: dashboard logging disabled")
             from dashboard.db import log_trade
             log_trade(
                 fill.symbol, "GRID", buy_price, sell_price, net,
@@ -390,13 +447,15 @@ class GridStrategy(Strategy):
             pass
 
         try:
+            if os.getenv("GRIDBOT_BACKTEST"):
+                raise ImportError("backtest: notifier disabled")
             import notifier
             notifier.notify_trade_close(fill.symbol, "GRID", buy_price, sell_price, net, "grid_fill")
         except Exception:
             pass
 
         # Smart-replenish: follow trend one level higher when bullish
-        if state.with_position:
+        if self._buys_allowed(state):
             new_cid = str(uuid.uuid4())
             replenish_usdt = state.usdt_per_grid
             if state._direction_score > 0.1:
@@ -486,7 +545,7 @@ class GridStrategy(Strategy):
 
     def _check_position_stops(self, symbol: str, price: float,
                                state: _GridState, ctx: MarketContext):
-        lev = _get_leverage()
+        lev = self._lev()
         for cid, order in list(state.orders.items()):
             if order.get("filled") or order["side"] != "sell":
                 continue
@@ -496,7 +555,7 @@ class GridStrategy(Strategy):
             # Momentum-hold: if score is strong bullish, delay SL by one cycle
             if price <= order["sl_price"]:
                 holds = order.get("momentum_holds", 0)
-                if state._direction_score > MOMENTUM_HOLD_SCORE and holds < MOMENTUM_HOLD_MAX:
+                if state._direction_score > self.p.momentum_hold_score and holds < self.p.momentum_hold_max:
                     order["momentum_holds"] = holds + 1
                     logger.debug("[HOLD] %s SL delayed (score=%.2f, hold=%d)",
                                  symbol, state._direction_score, holds + 1)
@@ -513,6 +572,8 @@ class GridStrategy(Strategy):
                 logger.warning("[SL] %s @ %.4f | bought @ %.4f | net=%.4f",
                                symbol, price, buy_price, net)
                 try:
+                    if os.getenv("GRIDBOT_BACKTEST"):
+                        raise ImportError("backtest: dashboard logging disabled")
                     from dashboard.db import log_trade
                     log_trade(symbol, "SELL", buy_price, price, net,
                               "stop_loss", "grid", "paper",
@@ -530,7 +591,7 @@ class GridStrategy(Strategy):
 
     def _maybe_open_directional(self, symbol: str, price: float,
                                  state: _GridState, ctx: MarketContext):
-        if not DIRECTIONAL_ENABLED or not state.with_position:
+        if not self.p.directional_enabled or not self._buys_allowed(state):
             return
         if state._directional:
             return
@@ -548,7 +609,7 @@ class GridStrategy(Strategy):
                 return
             state._directional_needs_recheck = False
 
-        if state._last_prediction != "up" or state._direction_score < DIRECTIONAL_SCORE_MIN:
+        if state._last_prediction != "up" or state._direction_score < self.p.directional_score_min:
             return
 
         # BTC context guard
@@ -557,8 +618,8 @@ class GridStrategy(Strategy):
             return
 
         atr = state._atr if state._atr > 0 else price * 0.02
-        usdt = state.investment * DIRECTIONAL_PCT
-        lev = _get_leverage()
+        usdt = state.investment * self.p.directional_pct
+        lev = self._lev()
 
         # RiskManager gate
         if self._risk is not None:
@@ -568,8 +629,8 @@ class GridStrategy(Strategy):
                 return
 
         qty = usdt * lev / price
-        tp = price + DIRECTIONAL_TP_ATR * atr
-        sl = price - DIRECTIONAL_SL_ATR * atr
+        tp = price + self.p.directional_tp_atr * atr
+        sl = price - self.p.directional_sl_atr * atr
 
         state._directional = {
             "entry": price, "qty": qty, "usdt": usdt,
@@ -603,7 +664,7 @@ class GridStrategy(Strategy):
         if not (hit_tp or hit_sl or do_flip_sell):
             return
 
-        lev = _get_leverage()
+        lev = self._lev()
         pnl = (price - d["entry"]) * d["qty"]
         fee = (price + d["entry"]) * d["qty"] * KRAKEN_FEE
         net = pnl - fee
@@ -617,6 +678,8 @@ class GridStrategy(Strategy):
             state._directional_sl_ts = time.time()
 
         try:
+            if os.getenv("GRIDBOT_BACKTEST"):
+                raise ImportError("backtest: dashboard logging disabled")
             from dashboard.db import log_trade
             log_trade(symbol, "DIRECTIONAL", d["entry"], price, net,
                       f"directional_{reason.lower()}", "grid", "paper",
@@ -631,6 +694,8 @@ class GridStrategy(Strategy):
             pass
 
         try:
+            if os.getenv("GRIDBOT_BACKTEST"):
+                raise ImportError("backtest: notifier disabled")
             import notifier
             notifier.notify_trade_close(symbol, "DIRECTIONAL", d["entry"], price, net,
                                         f"directional_{reason.lower()}")
@@ -661,10 +726,15 @@ class GridStrategy(Strategy):
         state._last_pred_high = upper
         state.usdt_per_grid = state.investment / levels
 
-        lev = _get_leverage()
+        lev = self._lev()
         step = (upper - lower) / levels
         grid_lines = [lower + (i + 0.5) * step for i in range(levels)]
         state.grid_lines = grid_lines
+
+        state.grid_lower = lower
+        if self.p.sl_mode == "floor":
+            atr = state._atr if state._atr > 0 else price * 0.02
+            state.floor_sl = max(lower - self.p.floor_sl_atr_mult * atr, 0.0)
 
         # Adaptive sizing: more budget on lower levels when bullish
         allocations = _calc_level_allocations(grid_lines, price, state.investment,
@@ -675,6 +745,11 @@ class GridStrategy(Strategy):
             cid: o for cid, o in state.orders.items()
             if not o.get("filled") and o.get("side") == "sell" and "bought_at" in o
         }
+        # Floor ratchet: never lower an existing position's SL on rebuild
+        if self.p.sl_mode == "floor" and state.floor_sl > 0:
+            for o in open_positions.values():
+                if "sl_price" in o:
+                    o["sl_price"] = max(o["sl_price"], state.floor_sl)
         state.orders = dict(open_positions)
 
         # Build new price → client_id map, recycling existing IDs where possible

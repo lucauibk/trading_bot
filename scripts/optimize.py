@@ -649,6 +649,8 @@ def cmd_run_sweep(symbol: str):
         from backtest.engine import run_backtest
         strategy = GridStrategy([{"symbol": symbol, "investment": 200.0, "levels": 8}])
         results = run_backtest(strategy, df, symbol, initial_balance=200.0)
+        results.pop("equity_curve", None)
+        results.pop("pnls", None)
         print()
         for k, v in results.items():
             print(f"  {k:<25} {v}")

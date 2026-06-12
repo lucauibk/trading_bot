@@ -275,7 +275,7 @@ class TestGridStrategy:
         sells_after = sum(1 for o in state.orders.values() if o["side"] == "sell")
         assert sells_after > sells_before
 
-    def test_stop_loss_fires_on_tick(self):
+    def test_per_position_sl_fires_on_tick(self):
         from core.context import MarketContext
         strategy = self._strategy()
         ctx = MarketContext()
@@ -326,3 +326,228 @@ class TestGridStrategy:
         initial = state.investment
         strategy._maybe_compound(100.0, state)
         assert state.investment > initial
+
+
+# ── GridParams ────────────────────────────────────────────────────────────────
+
+class TestGridParams:
+
+    def test_defaults_match_legacy_behaviour(self):
+        from strategies.grid_params import GridParams
+        p = GridParams()
+        assert p.sl_mode == "per_position"
+        assert p.per_pos_sl_step_mult == 1.5
+        assert p.per_pos_sl_min_pct == 0.008
+        assert p.momentum_hold_score == 0.35
+        assert p.momentum_hold_max == 2
+        assert p.regime_levels == {"ranging": 14, "trending": 6, "volatile": 20}
+        assert p.trend_filter_enabled is True  # sweep winner 2026-06-12
+        assert p.min_step_pct == 0.0
+        assert p.directional_enabled is True
+
+    def test_from_dict_roundtrip(self):
+        from strategies.grid_params import GridParams
+        p = GridParams.from_dict({"sl_mode": "floor", "floor_sl_atr_mult": 1.5,
+                                  "levels_by_regime": {"ranging": 10, "trending": 5}})
+        d = p.to_dict()
+        assert d["sl_mode"] == "floor"
+        assert d["floor_sl_atr_mult"] == 1.5
+        assert d["levels_by_regime"] == {"ranging": 10, "trending": 5}
+        assert GridParams.from_dict(d) == p
+
+    def test_from_dict_ignores_unknown_keys(self):
+        from strategies.grid_params import GridParams
+        p = GridParams.from_dict({"sl_mode": "floor", "nonsense_key": 42})
+        assert p.sl_mode == "floor"
+
+
+# ── Floor-SL ──────────────────────────────────────────────────────────────────
+
+class TestFloorSL:
+
+    def _strategy(self, **overrides):
+        from strategies.grid import GridStrategy
+        from strategies.grid_params import GridParams
+        params = GridParams.from_dict({"sl_mode": "floor", "leverage": 1.0, **overrides})
+        return GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                            ml_enabled=False, params=params)
+
+    def _setup(self, strategy, price=100.0, atr=2.0):
+        from core.context import MarketContext
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state._atr = atr
+        strategy.setup_grid("SOL/USD", price, ctx)
+        return ctx, state
+
+    def test_buy_fill_uses_floor_sl(self):
+        from core.strategy import Fill
+        strategy = self._strategy(floor_sl_atr_mult=1.0)
+        ctx, state = self._setup(strategy)
+        assert state.floor_sl > 0
+        assert state.floor_sl == pytest.approx(state.grid_lower - 2.0)
+
+        cid, order = [(c, o) for c, o in state.orders.items() if o["side"] == "buy"][0]
+        fill = Fill(client_id=cid, symbol="SOL/USD", side="buy",
+                    price=order["price"], qty=order["qty"], fee=0.0, ts=time.time())
+        strategy.on_fill(fill, ctx)
+        sells = [o for o in state.orders.values()
+                 if o["side"] == "sell" and "sl_price" in o and not o.get("pre_seeded")]
+        assert sells and all(o["sl_price"] == pytest.approx(state.floor_sl) for o in sells)
+
+    def test_no_stop_inside_grid(self):
+        from core.strategy import Fill
+        strategy = self._strategy(floor_sl_atr_mult=1.0, momentum_hold_max=0)
+        ctx, state = self._setup(strategy)
+        cid, order = [(c, o) for c, o in state.orders.items() if o["side"] == "buy"][0]
+        fill = Fill(client_id=cid, symbol="SOL/USD", side="buy",
+                    price=order["price"], qty=order["qty"], fee=0.0, ts=time.time())
+        strategy.on_fill(fill, ctx)
+        profit_before = state.total_profit
+        # Price at the lowest grid line: inside the grid → no stop may fire
+        strategy.on_tick("SOL/USD", min(state.grid_lines), ctx)
+        assert state.total_profit == profit_before
+
+    def test_floor_break_flushes_all_positions(self):
+        from core.strategy import Fill
+        strategy = self._strategy(floor_sl_atr_mult=1.0, momentum_hold_max=0)
+        ctx, state = self._setup(strategy)
+        buys = [(c, o) for c, o in state.orders.items() if o["side"] == "buy"][:2]
+        for cid, order in buys:
+            fill = Fill(client_id=cid, symbol="SOL/USD", side="buy",
+                        price=order["price"], qty=order["qty"], fee=0.0, ts=time.time())
+            strategy.on_fill(fill, ctx)
+        open_pos = [o for o in state.orders.values()
+                    if o["side"] == "sell" and "sl_price" in o and not o.get("pre_seeded")]
+        assert len(open_pos) == 2
+
+        strategy.on_tick("SOL/USD", state.floor_sl - 0.01, ctx)
+        remaining = [o for o in state.orders.values()
+                     if o["side"] == "sell" and "sl_price" in o and not o.get("pre_seeded")]
+        assert remaining == []
+        assert state.total_profit < 0
+
+    def test_rebuild_never_lowers_sl(self):
+        from core.strategy import Fill
+        strategy = self._strategy(floor_sl_atr_mult=1.0)
+        ctx, state = self._setup(strategy)
+        cid, order = [(c, o) for c, o in state.orders.items() if o["side"] == "buy"][0]
+        fill = Fill(client_id=cid, symbol="SOL/USD", side="buy",
+                    price=order["price"], qty=order["qty"], fee=0.0, ts=time.time())
+        strategy.on_fill(fill, ctx)
+        pos = [o for o in state.orders.values()
+               if o["side"] == "sell" and "sl_price" in o and not o.get("pre_seeded")][0]
+        sl_before = pos["sl_price"]
+
+        # Rebuild far lower → new floor far below; existing SL must NOT drop
+        strategy.setup_grid("SOL/USD", 80.0, ctx)
+        assert pos["sl_price"] >= sl_before
+
+
+# ── Trend filter ──────────────────────────────────────────────────────────────
+
+class TestTrendFilter:
+
+    def _strategy(self):
+        from strategies.grid import GridStrategy
+        from strategies.grid_params import GridParams
+        params = GridParams.from_dict({"trend_filter_enabled": True, "leverage": 1.0})
+        return GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                            ml_enabled=False, params=params)
+
+    def _df(self, closes):
+        closes = np.asarray(closes, dtype=float)
+        idx = pd.date_range("2026-01-01", periods=len(closes), freq="h", tz="UTC")
+        return pd.DataFrame({
+            "open": closes, "high": closes + 0.5, "low": closes - 0.5,
+            "close": closes, "volume": 1000.0,
+        }, index=idx)
+
+    def test_downtrend_sets_flag_and_blocks_buys(self):
+        from core.context import MarketContext
+        strategy = self._strategy()
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+
+        down = self._df(np.linspace(120, 80, 200))
+        strategy._update_trend_filter(state, down)
+        assert state._hard_trend_down is True
+        assert strategy._buys_allowed(state) is False
+
+        state.with_position = True
+        strategy.setup_grid("SOL/USD", 80.0, ctx)
+        buys = [o for o in strategy.desired_orders("SOL/USD", 80.0, ctx) if o.side == "buy"]
+        assert buys == []
+
+    def test_hysteresis_needs_two_clear_candles(self):
+        from core.context import MarketContext
+        strategy = self._strategy()
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state._hard_trend_down = True
+
+        up = self._df(np.linspace(80, 120, 200))
+        strategy._update_trend_filter(state, up)
+        assert state._hard_trend_down is True  # 1st clear candle: still paused
+        strategy._update_trend_filter(state, up)
+        assert state._hard_trend_down is False  # 2nd clear candle: resumed
+
+
+# ── Fee-aware min step ────────────────────────────────────────────────────────
+
+class TestMinStep:
+
+    def test_levels_capped_to_min_step(self):
+        from core.context import MarketContext
+        from strategies.grid import GridStrategy
+        from strategies.grid_params import GridParams
+        params = GridParams.from_dict({"min_step_pct": 0.01, "leverage": 1.0})
+        strategy = GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 20}],
+                                ml_enabled=False, params=params)
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state._atr = 1.0  # tight volatility → tight range → would violate min step
+
+        strategy.setup_grid("SOL/USD", 100.0, ctx)
+        step_pct = (state.grid_lines[1] - state.grid_lines[0]) / 100.0
+        assert step_pct >= 0.0099
+
+
+# ── Backtest equity fidelity ──────────────────────────────────────────────────
+
+class TestBacktestEquity:
+
+    def test_unrealized_losses_visible_in_equity_curve(self):
+        """Open underwater positions must drag the equity curve down even
+        without realized losses (regression for realized-only equity bug)."""
+        from backtest.engine import run_backtest
+        from strategies.grid import GridStrategy
+        from strategies.grid_params import GridParams
+
+        n_flat, n_drop, n_tail = 70, 20, 30
+        closes = np.concatenate([
+            100 + 0.3 * np.sin(np.arange(n_flat)),
+            np.linspace(100, 90, n_drop),
+            90 + 0.3 * np.sin(np.arange(n_tail)),
+        ])
+        idx = pd.date_range("2026-01-01", periods=len(closes), freq="h", tz="UTC")
+        df = pd.DataFrame({
+            "open": closes, "high": closes + 0.5, "low": closes - 0.5,
+            "close": closes, "volume": 1000.0,
+        }, index=idx)
+
+        # Deep floor → nothing stops out → losses stay unrealized.
+        # Trend filter off: it would block the buys this test depends on.
+        params = GridParams.from_dict({
+            "sl_mode": "floor", "floor_sl_atr_mult": 50.0,
+            "directional_enabled": False, "leverage": 1.0,
+            "trend_filter_enabled": False,
+        })
+        strategy = GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                                ml_enabled=False, params=params)
+        metrics = run_backtest(strategy, df, "SOL/USD", initial_balance=100.0)
+        assert min(metrics["equity_curve"]) < 100.0

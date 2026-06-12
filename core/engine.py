@@ -26,6 +26,10 @@ PREDICTION_RECHECK = 5     # every N ticks refresh prediction (~75s)
 GRID_REBUILD_CYCLES = 60   # every N ticks force grid rebuild (~15min)
 BTC_REFRESH_CYCLES = 4     # every N ticks refresh BTC context (~1min)
 FUNDING_REFRESH_CYCLES = 240  # every N ticks refresh funding (~1h)
+# Per-symbol kill switch on realized loss. Must be wider than one full
+# floor-SL flush (which can realize several % at once), otherwise a single
+# flush permanently halts the symbol.
+EMERGENCY_STOP_PCT = 0.12
 
 
 class Engine:
@@ -124,7 +128,7 @@ class Engine:
                 continue
 
             state_obj = getattr(self.strategy, "get_state", lambda s: None)(sym)
-            if state_obj and state_obj.total_profit <= -(state_obj.investment * 0.05):
+            if state_obj and state_obj.total_profit <= -(state_obj.investment * EMERGENCY_STOP_PCT):
                 logger.warning("[ENGINE] %s emergency stop (max loss)", sym)
                 continue
 
