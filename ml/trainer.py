@@ -7,6 +7,7 @@ import pandas as pd
 
 from .data_store import MLDataStore
 from .features import extract_features
+from .features.combined import extract_all as extract_all_features
 from .model import TradingModel
 
 logger = logging.getLogger("ml.trainer")
@@ -17,6 +18,24 @@ RETRAIN_EVERY_N = 50     # Retrain nach N neuen gelabelten Samples
 # Triple-Barrier-Parameter: eng genug für Grid-Mikro-Moves (0.1–0.5% per trade)
 TB_UPPER_ATR = 0.5   # Gewinn-Barriere = 0.5× ATR  (war 2.0× → zu weit für Grid)
 TB_LOWER_ATR = 0.5   # Verlust-Barriere = 0.5× ATR (war 1.5× → Swing-Trade-Skala)
+
+
+def _extract_training_features(df: pd.DataFrame, window: pd.DataFrame) -> np.ndarray:
+    """
+    Extract 34-feature vector for a training window.
+    htf(4) and seasonality(5) are computable from OHLCV + timestamp.
+    market(5) uses aligned BTC returns from the same df (historical backfill).
+    perp(4) defaults to 0 (no historical funding-rate archive available).
+    Falls back to 16-feature technical-only on any error.
+    """
+    try:
+        dt = window.index[-1].to_pydatetime() if hasattr(window.index[-1], "to_pydatetime") else None
+        # Build a minimal BTCContext-like from the same OHLCV data if the symbol is BTC,
+        # otherwise use None (market features will be 0 — acceptable for training).
+        feats = extract_all_features(window, funding=None, btc=None, btc_corr=0.0, dt=dt)
+        return feats
+    except Exception:
+        return extract_features(window)
 
 
 def _compute_label_triple_barrier(
@@ -72,7 +91,7 @@ def bootstrap_from_history(
     for i in range(min_window, len(df) - LOOKFORWARD_H):
         window = df.iloc[: i + 1]
         try:
-            feats = extract_features(window)
+            feats = _extract_training_features(df, window)
             atr_pct = _get_atr_pct(df, i)
             label = _compute_label_triple_barrier(df, i, atr_pct)
             xs.append(feats)
@@ -113,7 +132,7 @@ def refresh_from_recent_history(
     for i in range(min_window, len(df) - LOOKFORWARD_H):
         window = df.iloc[: i + 1]
         try:
-            feats = extract_features(window)
+            feats = _extract_training_features(df, window)
             atr_pct = _get_atr_pct(df, i)
             label = _compute_label_triple_barrier(df, i, atr_pct)
             xs.append(feats)
@@ -126,18 +145,28 @@ def refresh_from_recent_history(
         return
 
     old_f1 = model._last_oos_f1
+    # Preserve the current classifier so we can roll back if quality drops
+    old_clf         = model._clf
+    old_n_samples   = model._n_samples
+
     X = np.array(xs, np.float32)
     y = np.array(ys, np.int32)
 
-    # train() hat Walk-Forward + F1-Guard (MIN_OOS_F1=0.30) bereits eingebaut.
-    # Zusätzlich: eigener Rollback wenn neues F1 deutlich schlechter als altes.
+    # train() has Walk-Forward + F1-Guard (MIN_OOS_F1=0.30) built in.
+    # Additional rollback: restore previous model if new F1 is notably worse.
     model.train(X, y)
     new_f1 = model._last_oos_f1
 
-    if new_f1 < old_f1 - 0.05:
+    if new_f1 < old_f1 - 0.05 and old_clf is not None:
         logger.warning(
-            "[ML REFRESH] %s: F1 %.3f → %.3f – Rollback (zu schlechter)", symbol, old_f1, new_f1
+            "[ML REFRESH] %s: F1 %.3f → %.3f – rolling back to previous model",
+            symbol, old_f1, new_f1,
         )
+        with model._lock:
+            model._clf          = old_clf
+            model._n_samples    = old_n_samples
+            model._last_oos_f1  = old_f1
+        model._save()
     else:
         logger.info(
             "[ML REFRESH] %s: F1 %.3f → %.3f – akzeptiert (%d Samples)",

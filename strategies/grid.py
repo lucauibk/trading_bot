@@ -26,7 +26,6 @@ logger = logging.getLogger("strategies.grid")
 # ── Constants ──────────────────────────────────────────────────────────────────
 KRAKEN_FEE = 0.0016
 MIN_STEP_FEE_MULTIPLE = 2.5
-MAX_LOSS_PCT = 0.05
 COMPOUND_EVERY_TRADES = 3
 MAX_INVESTMENT_MULT = 3.0          # Compounding cap: max 3× initial investment
 
@@ -339,7 +338,7 @@ class GridStrategy(Strategy):
                 qty=o["qty"],
                 client_id=cid,
                 sl_price=o.get("sl_price"),
-                meta={"strategy": "grid", **o},
+                meta={"strategy": "grid", "leverage": self._lev(), **o},
             ))
         return orders
 
@@ -383,6 +382,8 @@ class GridStrategy(Strategy):
             else:
                 step_pct = (sell_price - buy_price) / buy_price
                 sl_pct = max(step_pct * self.p.per_pos_sl_step_mult, self.p.per_pos_sl_min_pct)
+                # Hard-cap: no per-position SL can be wider than per_pos_sl_max_pct (4%)
+                sl_pct = min(sl_pct, self.p.per_pos_sl_max_pct)
                 sl_price = buy_price * (1 - sl_pct)
 
             sell_cid = str(uuid.uuid4())

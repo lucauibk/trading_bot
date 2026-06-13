@@ -15,13 +15,15 @@ class GridParams:
     # ── Stop-loss ──────────────────────────────────────────────────────
     # "per_position": SL a fixed pct below each buy (legacy)
     # "floor":        SL below the grid's lower bound — nothing inside the
-    #                 grid stops out, only a range breakdown does
-    sl_mode: str = "per_position"
-    floor_sl_atr_mult: float = 1.0       # floor = grid_lower − mult × ATR
-    per_pos_sl_step_mult: float = 1.5    # legacy: SL = step_pct × mult below buy
-    per_pos_sl_min_pct: float = 0.008    # legacy: SL floor 0.8% below buy
-    momentum_hold_score: float = 0.35    # delay SL while score above this …
-    momentum_hold_max: int = 2           # … at most this many ticks
+    #                 grid stops out, only a range breakdown does.
+    #                 Cascade-safe: at most one flush per grid rebuild.
+    sl_mode: str = "floor"                 # changed from "per_position" to prevent cascades
+    floor_sl_atr_mult: float = 1.0         # floor = grid_lower − mult × ATR
+    per_pos_sl_step_mult: float = 1.5      # per_position mode: SL = step_pct × mult below buy
+    per_pos_sl_min_pct: float = 0.008      # per_position mode: SL floor 0.8% below buy
+    per_pos_sl_max_pct: float = 0.04       # per_position mode: SL hard-cap 4% below buy
+    momentum_hold_score: float = 0.35      # delay SL while score above this …
+    momentum_hold_max: int = 2             # … at most this many ticks
 
     # ── Grid geometry ──────────────────────────────────────────────────
     levels_by_regime: Tuple[Tuple[str, int], ...] = (
@@ -29,7 +31,7 @@ class GridParams:
     )
     range_atr_mult_trending: float = 2.0
     range_atr_mult_volatile: float = 1.5
-    min_step_pct: float = 0.0            # 0 = off; else cap levels so step ≥ this
+    min_step_pct: float = 0.0              # 0 = off; else cap levels so step ≥ this
 
     # ── Trend filter (ML-independent) ──────────────────────────────────
     # Default ON: sweep winner 2026-06-12 (results/sweep_20260612_1242) —
@@ -39,7 +41,7 @@ class GridParams:
     trend_adx_min: float = 25.0
 
     # ── Leverage ───────────────────────────────────────────────────────
-    leverage: float = 0.0                # 0 = read live from dashboard DB
+    leverage: float = 0.0                  # 0 = read live from dashboard DB
 
     # ── Directional trades ─────────────────────────────────────────────
     directional_enabled: bool = True

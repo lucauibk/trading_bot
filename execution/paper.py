@@ -1,11 +1,21 @@
 """
 PaperBroker – realistic paper trading simulation.
 
-Improvements over the old PaperGridBot fill logic:
-- Slippage model: max(spread/2, 3bps) applied to fill price
-- Sell-level CANNOT fill in the same tick as the buy that created it
-- Orders are tracked by client_id (uuid), not price
-- Fee applied at fill time using KRAKEN_FEE
+Balance accounting
+------------------
+Each symbol gets an isolated budget (initial_balance / n_symbols), so no coin
+can starve the others.  Orders sized with leverage use *margin* accounting:
+
+  buy  → deduct  fill_price × qty / leverage  +  fee
+  sell → credit  bought_at  × qty / leverage  +  (fill_price − bought_at) × qty  −  fee
+         = return of margin + leveraged P&L
+
+Pre-seeded sell orders (placed during grid setup without a real buy fill) never
+had margin deposited, so they credit only the profit leg:
+  pre_seeded sell → credit  (fill_price − bought_at) × qty  −  fee
+
+Fallback: if leverage/bought_at are not in order.meta the broker falls back to
+the simple full-notional model (backward-compatible with tests that don't set meta).
 """
 
 import logging
@@ -18,17 +28,51 @@ from execution.broker import Broker, BrokerOrder
 
 logger = logging.getLogger(__name__)
 
-KRAKEN_FEE = 0.0016   # 0.16% maker fee
-SLIPPAGE_BPS = 3      # 3 basis points slippage
+KRAKEN_FEE   = 0.0016   # 0.16% maker fee
+SLIPPAGE_BPS = 3        # 3 basis points slippage
 
 
 class PaperBroker(Broker):
 
-    def __init__(self, initial_balance: float = 1000.0):
+    def __init__(
+        self,
+        initial_balance: float = 1000.0,
+        symbols: Optional[List[str]] = None,
+    ):
+        # Per-symbol balance isolation: each coin has its own cash bucket.
+        # This prevents the first symbol in the list from consuming the whole pool.
+        if symbols:
+            per_coin = initial_balance / len(symbols)
+            self._balances: Dict[str, float] = {s: per_coin for s in symbols}
+        else:
+            self._balances = {}
+
+        # Fallback single-pool (used when symbol not in _balances)
         self._balance: float = initial_balance
-        self._orders: Dict[str, BrokerOrder] = {}
-        self._fill_callbacks: list = []
-        self._tick: int = 0  # incremented each time update_price is called
+
+        self._orders:          Dict[str, BrokerOrder] = {}
+        self._fill_callbacks:  list                   = []
+        self._tick:            int                    = 0
+
+    # ── Internal balance helpers ──────────────────────────────────────────
+
+    def _sym_balance(self, symbol: str) -> float:
+        """Free cash available for *symbol*."""
+        return self._balances.get(symbol, self._balance)
+
+    def _deduct(self, symbol: str, amount: float) -> None:
+        if symbol in self._balances:
+            self._balances[symbol] -= amount
+        else:
+            self._balance -= amount
+
+    def _credit(self, symbol: str, amount: float) -> None:
+        if symbol in self._balances:
+            self._balances[symbol] += amount
+        else:
+            self._balance += amount
+
+    # ── Broker interface ──────────────────────────────────────────────────
 
     def place_limit(
         self,
@@ -40,9 +84,11 @@ class PaperBroker(Broker):
         client_id: str = "",
         sl_price: Optional[float] = None,
         tp_price: Optional[float] = None,
+        meta: Optional[dict] = None,
     ) -> BrokerOrder:
         if not client_id:
             client_id = str(uuid.uuid4())
+        extra = meta or {}
         order = BrokerOrder(
             client_id=client_id,
             exchange_order_id=client_id,
@@ -52,10 +98,11 @@ class PaperBroker(Broker):
             qty=qty,
             status="open",
             ts_placed=time.time(),
-            meta={"sl": sl_price, "tp": tp_price, "placed_tick": self._tick},
+            meta={"sl": sl_price, "tp": tp_price, "placed_tick": self._tick, **extra},
         )
         self._orders[client_id] = order
-        logger.debug("[PAPER] placed %s %s %s qty=%.6f @ %.4f", symbol, side, client_id[:8], qty, price)
+        logger.debug("[PAPER] placed %s %s %s qty=%.6f @ %.4f",
+                     symbol, side, client_id[:8], qty, price)
         return order
 
     def cancel(self, client_id: str) -> bool:
@@ -94,21 +141,40 @@ class PaperBroker(Broker):
                 triggered = True
 
             if triggered:
-                slippage = price * SLIPPAGE_BPS / 10_000
+                slippage  = price * SLIPPAGE_BPS / 10_000
                 fill_price = (order.price + slippage) if order.side == "buy" else (order.price - slippage)
-                fee = fill_price * order.qty * KRAKEN_FEE
+                fee        = fill_price * order.qty * KRAKEN_FEE
 
                 if order.side == "buy":
-                    cost = fill_price * order.qty + fee
-                    if cost > self._balance:
-                        logger.warning("[PAPER] insufficient balance (%.2f < %.2f) for %s buy",
-                                       self._balance, cost, symbol)
+                    leverage = float(order.meta.get("leverage", 1.0))
+                    # Margin deposit = notional / leverage (e.g. lev=3 → 1/3 of notional)
+                    cost = fill_price * order.qty / leverage + fee
+                    sym_bal = self._sym_balance(symbol)
+                    if cost > sym_bal:
+                        logger.warning(
+                            "[PAPER] insufficient balance %.2f < %.2f for %s buy",
+                            sym_bal, cost, symbol,
+                        )
                         continue
-                    self._balance -= cost
-                else:
-                    self._balance += fill_price * order.qty - fee
+                    self._deduct(symbol, cost)
 
-                order.status = "filled"
+                else:  # sell
+                    leverage   = float(order.meta.get("leverage", 1.0))
+                    pre_seeded = bool(order.meta.get("pre_seeded", False))
+                    bought_at  = float(order.meta.get("bought_at", fill_price))
+
+                    if pre_seeded:
+                        # No margin was deposited for pre-seeded sells → credit profit only
+                        credit = (fill_price - bought_at) * order.qty - fee
+                    else:
+                        # Return margin + leveraged P&L
+                        margin_return = bought_at * order.qty / leverage
+                        pnl           = (fill_price - bought_at) * order.qty
+                        credit        = margin_return + pnl - fee
+
+                    self._credit(symbol, credit)
+
+                order.status     = "filled"
                 order.filled_qty = order.qty
 
                 fill = Fill(
@@ -132,9 +198,13 @@ class PaperBroker(Broker):
         return []
 
     def get_open_orders(self, symbol: str) -> List[BrokerOrder]:
-        return [o for o in self._orders.values() if o.symbol == symbol and o.status == "open"]
+        return [o for o in self._orders.values()
+                if o.symbol == symbol and o.status == "open"]
 
     def get_balance(self, currency: str = "USD") -> float:
+        """Total cash across all symbol buckets."""
+        if self._balances:
+            return sum(self._balances.values())
         return self._balance
 
     def round_qty(self, symbol: str, qty: float) -> float:

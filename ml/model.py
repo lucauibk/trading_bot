@@ -91,8 +91,17 @@ class TradingModel:
             self._clf = clf
             self._n_samples = len(X)
             self._last_oos_f1 = oos_f1
-            from .features import FEATURE_NAMES
-            self._feature_names = list(FEATURE_NAMES)
+            # Store the actual feature names used (may be 16 or 34 depending on caller)
+            self._feature_names = [f"f{i}" for i in range(X.shape[1])]
+            try:
+                from .features.combined import ALL_FEATURE_NAMES
+                from .features import FEATURE_NAMES
+                if X.shape[1] == len(ALL_FEATURE_NAMES):
+                    self._feature_names = list(ALL_FEATURE_NAMES)
+                elif X.shape[1] == len(FEATURE_NAMES):
+                    self._feature_names = list(FEATURE_NAMES)
+            except Exception:
+                pass
         self._save()
 
         classes, counts = np.unique(y, return_counts=True)
@@ -108,8 +117,18 @@ class TradingModel:
             if not self.is_ready():
                 return 1, 0.0
             import pandas as pd
-            from .features import FEATURE_NAMES
-            feature_names = self._feature_names if self._feature_names else list(FEATURE_NAMES)
+
+            # Feature-count mismatch: model was trained with a different number of features.
+            # Fall back to hold/0 and let the caller retrain rather than crash or produce garbage.
+            expected_n = len(self._feature_names)
+            if expected_n > 0 and x.shape[0] != expected_n:
+                logger.warning(
+                    "Feature count mismatch for %s: model=%d, input=%d – returning hold",
+                    self.symbol, expected_n, x.shape[0],
+                )
+                return 1, 0.0
+
+            feature_names = self._feature_names if self._feature_names else [f"f{i}" for i in range(x.shape[0])]
             x2 = pd.DataFrame(x.reshape(1, -1), columns=feature_names)
             try:
                 proba = self._clf.predict_proba(x2)[0]
@@ -124,12 +143,11 @@ class TradingModel:
         return self._clf is not None and self._n_samples >= self.MIN_SAMPLES
 
     def _save(self):
-        from .features import FEATURE_NAMES
         joblib.dump(self._clf, self._model_path)
         self._meta_path.write_text(json.dumps({
-            "n_samples": self._n_samples,
-            "oos_f1": self._last_oos_f1,
-            "feature_names": self._feature_names or list(FEATURE_NAMES),
+            "n_samples":     self._n_samples,
+            "oos_f1":        self._last_oos_f1,
+            "feature_names": self._feature_names,
         }))
 
     def _load(self):

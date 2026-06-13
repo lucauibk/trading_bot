@@ -7,6 +7,7 @@ import ta as ta_lib
 
 from .data_store import MLDataStore
 from .features import extract_features
+from .features.combined import extract_all as extract_all_features, ALL_FEATURE_NAMES
 from .llm_analyst import analyse as llm_analyse, blend_scores
 from .model import LABEL_TO_STR, TradingModel
 from .trainer import ModelTrainer, bootstrap_from_history
@@ -61,7 +62,23 @@ class MLPredictor:
         """
         try:
             df    = self._fetch_ohlcv(symbol, "1h", 120)
-            feats = extract_features(df)
+            # Build 34-feature vector: technical(16) + perp(4) + market(5) + htf(4) + seasonality(5)
+            # Perp/market data pulled from context cache; all fall back gracefully to 0 if missing.
+            try:
+                from market.perp import get_funding
+                from market.btc_context import get_btc_context
+                import threading
+                funding    = get_funding(symbol)
+                btc_ctx    = get_btc_context()
+                # Approximate BTC correlation from the context (not available per-symbol in cache,
+                # use a conservative default; the model was trained with this as well)
+                btc_corr   = 0.7
+                dt         = df.index[-1].to_pydatetime() if hasattr(df.index[-1], "to_pydatetime") else None
+                feats = extract_all_features(df, funding=funding, btc=btc_ctx,
+                                             btc_corr=btc_corr, dt=dt)
+            except Exception as e:
+                logger.debug("34-feature extraction failed (%s), falling back to 16", e)
+                feats = extract_features(df)
             price = float(df["close"].iloc[-1])
             model = self._models.get(symbol)
 

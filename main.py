@@ -94,7 +94,7 @@ def main():
 
     if paper:
         from execution.paper import PaperBroker
-        broker = PaperBroker(initial_balance=initial_investment)
+        broker = PaperBroker(initial_balance=initial_investment, symbols=symbols)
         reconciler = None
     else:
         from execution.kraken import KrakenBroker

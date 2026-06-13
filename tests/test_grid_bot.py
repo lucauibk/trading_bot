@@ -335,9 +335,11 @@ class TestGridParams:
     def test_defaults_match_legacy_behaviour(self):
         from strategies.grid_params import GridParams
         p = GridParams()
-        assert p.sl_mode == "per_position"
+        # sl_mode default is "floor" (cascade-safe); per_position still available
+        assert p.sl_mode == "floor"
         assert p.per_pos_sl_step_mult == 1.5
         assert p.per_pos_sl_min_pct == 0.008
+        assert p.per_pos_sl_max_pct == 0.04   # hard-cap: no SL wider than 4%
         assert p.momentum_hold_score == 0.35
         assert p.momentum_hold_max == 2
         assert p.regime_levels == {"ranging": 14, "trending": 6, "volatile": 20}

@@ -55,6 +55,8 @@ class Engine:
         # Track which orders are currently open per symbol
         self._active_orders: Dict[str, Dict[str, object]] = {s: {} for s in symbols}
         self._waiting_for_fills = False  # set True by wait_fills stop mode
+        # Last known prices (updated every tick) — used for mark-to-market equity
+        self._last_prices: Dict[str, float] = {}
 
     def run(self):
         logger.info("Engine starting | symbols=%s", self.symbols)
@@ -121,6 +123,9 @@ class Engine:
                 time.sleep(0.4)
             except Exception as e:
                 logger.warning("Ticker failed %s: %s", sym, e)
+
+        # Cache for mark-to-market equity calculation
+        self._last_prices.update(prices)
 
         for sym in self.symbols:
             price = prices.get(sym)
@@ -230,6 +235,7 @@ class Engine:
                         post_only=order.post_only,
                         client_id=cid,
                         sl_price=order.sl_price,
+                        meta=order.meta,
                     )
                     active[cid] = broker_order
                     if self.reconciler:
@@ -363,10 +369,34 @@ class Engine:
             pass
 
     def _log_equity(self):
-        """Log equity: broker balance + value of open positions at last tick price."""
+        """Log equity: cash balance + mark-to-market value of open positions.
+
+        Open positions = sell orders in strategy state that have a real buy
+        behind them (bought_at set, not pre_seeded). Their current value is
+        qty × last_tick_price. This gives a smooth equity curve instead of
+        the sawtooth caused by logging cash-only (which dips on every buy
+        and spikes on every sell).
+        """
         try:
             balance = self.broker.get_balance("USD")
-            total = balance
+            mtm = 0.0
+            for sym in self.symbols:
+                price = self._last_prices.get(sym, 0.0)
+                if price <= 0:
+                    continue
+                state = getattr(self.strategy, "get_state", lambda s: None)(sym)
+                if state is None:
+                    continue
+                for o in state.orders.values():
+                    if (
+                        not o.get("filled")
+                        and o.get("side") == "sell"
+                        and "bought_at" in o
+                        and not o.get("pre_seeded")
+                    ):
+                        mtm += o.get("qty", 0.0) * price
+
+            total = balance + mtm
             self.ctx.set_equity(total)
             from dashboard.db import log_equity, update_capital
             log_equity(total)

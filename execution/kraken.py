@@ -87,6 +87,7 @@ class KrakenBroker(Broker):
         client_id: str = "",
         sl_price: Optional[float] = None,
         tp_price: Optional[float] = None,
+        meta: Optional[dict] = None,   # forwarded from Order.meta; not used on live exchange
     ) -> BrokerOrder:
         if not client_id:
             client_id = str(uuid.uuid4())

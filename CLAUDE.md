@@ -3,13 +3,14 @@
 ## Projektübersicht
 
 Multi-Coin Grid Trading Bot für Kraken (Paper + Live). Kombiniert dynamisches Grid-Trading
-mit ML-Vorhersagen (LightGBM + Claude Haiku), adaptiver Positionsgröße und Directional Trades.
+mit ML-Vorhersagen (LightGBM 34 Features + Claude Haiku), adaptiver Positionsgröße und
+Directional Trades.
 
 **Ziel:** Maximaler Tagesgewinn bei minimalem Loss durch:
 - ATR/Bollinger-basierte Grid-Ranges (PricePredictor)
-- LightGBM + Claude Haiku Blended-Richtungsvorhersage
-- Directional Trades bei starkem UP-Signal (15% des Investments, 3× Leverage)
-- Per-Position-Stop-Loss (4% unter Buy-Preis)
+- LightGBM (34 Features) + Claude Haiku Blended-Richtungsvorhersage
+- Directional Trades bei starkem UP-Signal (20% des Investments, Leverage aus DB)
+- Floor-Stop-Loss (SL unter Gridboden) → verhindert Kaskaden-Dumps
 - Cross-Coin Daily-Drawdown-Bremse (-3%)
 - Compounding mit Investment-Cap (3× Initial)
 
@@ -47,7 +48,7 @@ Browser → http://localhost:5001
   │       ↓
   │   dashboard/app.py  schreibt in data/trades.db
   │       ↓
-  │   grid_bot.py  liest DB jede Loop-Iteration (CHECK_INTERVAL = 15s)
+  │   core/engine.py  liest DB jede Loop-Iteration (CHECK_INTERVAL = 15s)
   │
   └── SSE-Stream /stream  (Live-Updates alle 15s)
 ```
@@ -59,20 +60,21 @@ Browser → http://localhost:5001
 - Dashboard liest: alle diese Tabellen für Anzeige
 
 **Prozess-Verwaltung:**
-- Dashboard startet Bot via `subprocess.Popen` → PID in `.bot.pid`
+- Dashboard startet Bot via `subprocess.Popen` → PID in `.bot.pid`, Lock in `.bot.lock`
+- Singleton-Guard via `fcntl.flock` (race-free OS-Lock) in `core/lifecycle.py`
 - Stop via SIGTERM an PID aus `.bot.pid`
 - Graceful Stop: Dashboard setzt `bot_status.stop_mode` → Bot reagiert selbst
 
 ---
 
-## Graceful Shutdown (NEU)
+## Graceful Shutdown
 
 "⏹ Stoppen"-Button im Dashboard öffnet Modal mit drei Optionen:
 
 | Option | Was passiert |
 |--------|-------------|
-| 💰 Sofort alle Positionen verkaufen | `stop_mode='sell_all'` → Bot ruft `_sell_all_on_exit()` + `emergency_sell()` auf, dann Exit |
-| ⏳ Auf Grid-Fills warten | `stop_mode='wait_fills'` → `with_position=False` für alle Bots, läuft weiter bis alle Sells gefüllt, dann Auto-Exit |
+| 💰 Sofort alle Positionen verkaufen | `stop_mode='sell_all'` → Engine ruft `_emergency_sell_all()` auf, dann Exit |
+| ⏳ Auf Grid-Fills warten | `stop_mode='wait_fills'` → `with_position=False` für alle Coins, läuft weiter bis alle Sells gefüllt, dann Auto-Exit |
 | Abbrechen | Bot läuft weiter |
 
 **Endpoint:** `POST /api/bot/stop-graceful` mit `{"mode": "sell_all"|"wait_fills"}`
@@ -84,19 +86,47 @@ Browser → http://localhost:5001
 
 ```
 trading-bot/
-├── grid_bot.py           # Hauptlogik: PaperGridBot + LiveGridBot + run()
-├── main.py               # Einstiegspunkt: --strategy grid|ema|rsi --mode paper|live
-├── config.py             # ENV-Variablen (BINANCE_* = Kraken-Fallback), PAPER_TRADING-Flag
+├── main.py               # Einstiegspunkt: --mode paper|live
+├── config.py             # ENV-Variablen (BINANCE_* = Kraken-Fallback)
 ├── data_fetcher.py       # OHLCV + Ticker via ccxt (Kraken)
-├── grid_optimizer.py     # Backtest-Sweep über Levels × Range-Kombinationen
-├── grid_backtester.py    # Einzelner Grid-Backtest
 ├── notifier.py           # Telegram-Benachrichtigungen
 ├── start.sh / stop.sh    # Prozess-Management-Scripts
 │
+├── core/                 # Engine-Kern
+│   ├── engine.py         # Event-Loop: ticker → on_tick → desired_orders → broker
+│   ├── context.py        # MarketContext: BTC-Regime, Funding, Equity, Positionen
+│   ├── lifecycle.py      # Singleton-Lock (fcntl.flock), ShutdownFlag
+│   └── strategy.py       # Strategy ABC: Order, Fill, Hooks
+│
+├── strategies/           # Trading-Strategien
+│   ├── grid.py           # GridStrategy: Grid-Logik, SL/TP, Directional Trades
+│   └── grid_params.py    # GridParams Dataclass (alle Tuning-Parameter)
+│
+├── execution/            # Broker-Abstraktion
+│   ├── broker.py         # Broker ABC
+│   ├── paper.py          # PaperBroker: per-Symbol-Budget, Margin-Accounting
+│   ├── kraken.py         # KrakenBroker: ccxt, PostOnly, Retry
+│   └── reconciler.py     # Fill-Reconciliation für Live-Modus
+│
+├── risk/                 # Risiko-Management
+│   ├── manager.py        # RiskManager: Daily-Drawdown, Position Caps
+│   ├── sizing.py         # Position-Sizing
+│   └── correlation.py    # Korrelations-Tracker (BTC-Bucket)
+│
+├── market/               # Markt-Kontext
+│   ├── btc_context.py    # BTC-Trend, Returns (gecacht)
+│   └── perp.py           # Funding-Rate Cache
+│
 ├── ml/                   # KI-Richtungsvorhersage
 │   ├── model.py          # TradingModel: LightGBM + CalibratedClassifier + Walk-Forward
-│   ├── trainer.py        # Triple-Barrier-Labels, Bootstrap, Retrain
-│   ├── features.py       # 16 Features (EMA, RSI, Momentum, BB, ATR, Candles)
+│   ├── trainer.py        # Triple-Barrier-Labels, Bootstrap, Retrain (mit echtem Rollback)
+│   ├── features/         # 34-Feature-Vektoren
+│   │   ├── technical.py  # 16 technische Features (EMA, RSI, Momentum, BB, ATR, …)
+│   │   ├── htf.py        # 4 Higher-Timeframe-Features (4h/1d Trend, RSI)
+│   │   ├── market.py     # 5 BTC-Kontext-Features (Returns, Korrelation, Dominanz)
+│   │   ├── perp.py       # 4 Perp-Features (Funding-Rate, OI)
+│   │   ├── seasonality.py # 5 Saisonalitäts-Features (Stunde, Wochentag)
+│   │   └── combined.py   # extract_all() → 34-Feature-Vektor
 │   ├── predictor.py      # MLPredictor: predict() + async Retrain + LLM-Blending
 │   ├── llm_analyst.py    # Claude Haiku: Marktanalyse + Score-Blending
 │   └── data_store.py     # SQLite-Persistenz für ML-Samples
@@ -104,22 +134,22 @@ trading-bot/
 ├── price_predictor/      # Regelbasierter Range-Predictor (ATR/Bollinger)
 │   ├── predictor.py      # PricePredictor: predict() → low/high/regime/confidence
 │   ├── indicators.py     # ATR(14), Bollinger(20,2σ), RSI(14), VWAP, ADX(14)
-│   ├── grid_suggester.py # Grid-Levels aus Range berechnen
-│   └── tests/            # pytest Tests für Indikatoren + Predictor
+│   └── grid_suggester.py # Grid-Levels aus Range berechnen
 │
-├── backtest/             # Strategie-Backtester (EMA/RSI)
+├── backtest/             # OOS-Backtester (für Sweep)
+│   ├── engine.py         # Backtest-Engine
+│   ├── data.py           # Historische Daten
+│   └── metrics.py        # Calmar, Drawdown, Win-Rate
+│
 ├── dashboard/            # Flask-Dashboard Port 5001
 │   ├── app.py            # API-Endpoints + SSE-Stream + Bot-Prozess-Management
 │   ├── db.py             # SQLite-Schema + Helpers (log_trade, set_stop_mode, etc.)
 │   └── templates/        # index.html: Grid-Visualisierung, Charts, Stop-Modal
 │
-├── src/                  # EMA/RSI-Strategie-Bots (klassisch)
-│   ├── strategy/         # base_strategy, ema_crossover, rsi_mean_rev
-│   ├── risk/             # RiskManager: Daily-Drawdown, Position Sizing
-│   └── execution/        # PaperBroker, LiveBroker (ccxt)
-│
 ├── scripts/
-│   └── optimize.py       # Trading-Optimizer CLI
+│   ├── optimize.py       # Trading-Optimizer CLI (--analyze-trades, --suggest-params, …)
+│   ├── sweep.py          # OOS Parameter-Sweep (Calmar-optimiert)
+│   └── nightly_tune.py   # Nightly Auto-Tune: Branch + Issue + PR (täglich 05:00)
 │
 ├── data/                 # SQLite-DBs (nicht in Git)
 │   ├── trades.db         # Trades + grid_state + bot_status + predictions + equity
@@ -127,9 +157,10 @@ trading-bot/
 │   └── ohlcv_cache.db    # OHLCV-Cache
 │
 ├── config/
-│   ├── config.yaml       # Symbol-Liste (SOL, LINK, INJ, AVAX, NEAR), Risk-Parameter
-│   └── strategy_params.yaml  # ATR-Perioden, Risk-Parameter
+│   ├── config.yaml       # Symbol-Liste, Risk-Parameter, Initial-Capital
+│   └── grid_params.json  # Aktuelle Sweep-Winner-Parameter (auto-generiert)
 │
+├── results/              # Sweep-Ergebnisse (auto-generiert, nicht in Git)
 ├── logs/                 # Logfiles (trading_bot.log, dashboard.log)
 ├── .env                  # API-Keys (niemals einchecken) – BINANCE_* = Kraken-Fallback
 └── requirements.txt
@@ -137,87 +168,106 @@ trading-bot/
 
 ---
 
-## Schlüssel-Konstanten in grid_bot.py
+## Schlüssel-Konstanten (echte Werte, Stand simplify-bot)
+
+### core/engine.py
 
 | Konstante | Wert | Bedeutung |
 |-----------|------|-----------|
 | `CHECK_INTERVAL` | 15 | Sekunden zwischen Loop-Iterationen |
-| `KRAKEN_FEE` | 0.0016 | Maker-Fee 0.16% — immer diese verwenden |
-| `ATR_CANDLES` | 24 | ATR über 24h berechnen |
-| `MAX_LOSS_PCT` | 0.05 | 5% vom Investment = Notbremse pro Coin |
-| `PER_POS_SL_PCT` | 0.04 | 4% unter Buy-Preis = Per-Position-SL |
-| `MAX_INVESTMENT_MULT` | 3.0 | Compounding-Cap: max. 3× Initial-Investment |
-| `COMPOUND_EVERY_TRADES` | 5 | Gewinn-Reinvestition alle 5 Trades |
-| `DEFAULT_LEVERAGE` | 1.0 | Startwert; änderbar per Dashboard |
-| `PREDICTION_RECHECK` | 20 | Alle 20 Zyklen (5 Min) Vorhersage neu prüfen |
-| `GRID_REBUILD_CYCLES` | 240 | Stündlicher Zwangs-Rebuild des Grids |
-| `REGIME_CONFIGS` | dict | Level-Anzahl pro Regime (auto-tuned nach Win-Rate) |
+| `PREDICTION_RECHECK` | 5 | Alle 5 Ticks (~75s) Prediction neu prüfen |
+| `GRID_REBUILD_CYCLES` | 60 | Alle 60 Ticks (~15 Min) Grid neu aufbauen |
+| `EMERGENCY_STOP_PCT` | 0.12 | 12% Realized-Loss pro Coin → Symbol pausieren |
 
-### Directional-Trade-Konstanten
+### strategies/grid.py + grid_params.py (GridParams Defaults)
 
-| Konstante | Wert | Bedeutung |
+| Parameter | Wert | Bedeutung |
 |-----------|------|-----------|
-| `DIRECTIONAL_SCORE_MIN` | 0.08 | Score-Schwelle für neuen Einstieg |
-| `DIRECTIONAL_PCT` | 0.15 | 15% des Investments pro Trade |
-| `DIRECTIONAL_TP_ATR` | 2.5 | Take-Profit: Einstieg + 2.5 × ATR |
-| `DIRECTIONAL_SL_ATR` | 1.5 | Stop-Loss: Einstieg − 1.5 × ATR |
-| `DIRECTIONAL_DOWN_TRAIL_PCT` | 0.005 | Bei ML:DOWN + Position im Plus: erst nach 0.5% Rückgang verkaufen |
-| `DIRECTIONAL_RECHECK_SCORE_MIN` | 0.25 | Nach SL: frische Live-Prediction braucht Score > 0.25 |
+| `sl_mode` | `"floor"` | SL unter Gridboden (kaskadensicher) |
+| `floor_sl_atr_mult` | 1.0 | Floor = grid_lower − 1.0 × ATR |
+| `per_pos_sl_max_pct` | 0.04 | Hard-Cap: kein Per-Position-SL > 4% |
+| `levels_by_regime` | ranging:14, trending:6, volatile:20 | Levels pro Regime |
+| `trend_filter_enabled` | True | EMA/ADX-Trend-Filter (Buys pausieren bei Downtrend) |
+| `COMPOUND_EVERY_TRADES` | 3 | Gewinn-Reinvestition alle 3 Trades |
+| `MAX_INVESTMENT_MULT` | 3.0 | Compounding-Cap: max. 3× Initial-Investment |
+| `KRAKEN_FEE` | 0.0016 | Maker-Fee 0.16% — immer diese verwenden |
+
+### Directional-Trade-Parameter (GridParams)
+
+| Parameter | Wert | Bedeutung |
+|-----------|------|-----------|
+| `directional_score_min` | 0.12 | Score-Schwelle für neuen Einstieg |
+| `directional_pct` | 0.20 | 20% des Investments pro Directional |
+| `directional_tp_atr` | 3.0 | Take-Profit: Einstieg + 3.0 × ATR |
+| `directional_sl_atr` | 1.5 | Stop-Loss: Einstieg − 1.5 × ATR |
+| `DIRECTIONAL_DOWN_TRAIL_PCT` | 0.005 | Trail-Lock: erst nach 0.5% Rückgang verkaufen |
+| `DIRECTIONAL_RECHECK_SCORE_MIN` | 0.25 | Nach SL: Score > 0.25 für Re-Entry |
 
 ---
 
-## Directional-Trade-Logik (wichtige Sonderfälle)
+## Stop-Loss-Design
 
-**ML:DOWN-Verhalten bei offener Directional-Position:**
-- Position im **Plus**: Trail-Lock bei Signal-Zeitpunkt-Preis → Verkauf erst wenn Preis 0.5% fällt
-- Position im **Minus**: ML:DOWN ignorieren → SL-Level übernimmt den Exit (Kurs kann noch wenden)
-- Signal dreht zurück auf UP: Trail-Lock wird aufgehoben, Position bleibt offen
+**Standard: `sl_mode = "floor"` (kaskadensicher)**
+- Ein einziger SL-Level unter dem Gridboden (`grid_lower - 1×ATR`)
+- Kein einzelnes Grid-Level kann alleine stoppen → kein Cascade-Dump
+- Bei Grid-Rebuild: Floor-SL wird nie gesenkt (Ratchet in `grid.py:748-752`)
 
-**Nach Directional-SL (wichtig gegen Instant-Re-Entry):**
-- `_directional_needs_recheck = True` wird gesetzt
-- Nächster Einstiegsversuch: frische Live-Prediction (kein Cache) + strikter Score > 0.25
-- Verhindert das "INJ-Szenario": SL getroffen → sofort neuer Kauf in fallenden Coin
-
-**Score-Konsistenz:**
-- `predict_direction()` erzwingt: Score-Vorzeichen muss zur Direction passen
-- Fallback Rule-Based aktualisiert `_last_scores` (war Bug: altes positives Score blieb bei DOWN)
+**Fallback `sl_mode = "per_position"` (für Backtests)**
+- SL pro Position = `step_pct × 1.5`, mind. 0.8%, **max. 4%** (Hard-Cap)
+- Hard-Cap verhindert -7%/-9%-Exits bei weiten Grids
 
 ---
 
-## ML-Vorhersage-Pipeline
+## Multi-Coin & Balance-Accounting
+
+**PaperBroker (`execution/paper.py`) mit per-Symbol-Budgets:**
+- `initial_balance / n_symbols` pro Coin-Bucket → SOL kann nicht das ETH-Budget leeren
+- Margin-Accounting: Buy deducted = `notional / leverage + fee`
+- Sell credited = `margin_return + leveraged_PnL - fee`
+- Pre-seeded Sells (oben im Grid ohne echten Buy): nur Profit-Anteil gutgeschrieben
+
+**Für Live-Modus (KrakenBroker):** `meta` aus Order.meta wird weitergeleitet (für Logging),
+Margin-Accounting übernimmt die echte Exchange.
+
+---
+
+## ML-Vorhersage-Pipeline (34 Features)
 
 ```
-predict_direction(symbol)
+predict(symbol)
   │
-  ├── LightGBM (16 Features, Walk-Forward, CalibratedClassifier)
+  ├── extract_all(df_1h, funding, btc, btc_corr, dt)
+  │     → 34-Feature-Vektor:
+  │       technical(16) + htf(4) + market(5) + perp(4) + seasonality(5)
+  │
+  ├── LightGBM (CalibratedClassifier, Walk-Forward 5-Folds)
   │     └── lgbm_score + lgbm_conf
   │
-  ├── Claude Haiku (llm_analyst.py)
+  ├── Claude Haiku (llm_analyst.py, gecacht ~1h)
   │     └── llm_score + llm_conf + reason
   │
-  ├── blend_scores(lgbm, llm) → blended_score, blended_conf
+  ├── blend_scores: 0.55 × lgbm + 0.45 × llm
   │
   ├── if blended_conf >= MIN_CONFIDENCE (0.45):
   │     score > +0.15 → "up", score < -0.15 → "down", sonst "neutral"
   │
-  └── else: Fallback _rule_based() → aktualisiert _last_scores mit ±0.5
+  └── else: Fallback _rule_based() → score ±0.5
 ```
 
-**Retrain:** Async via Threading, nur speichern wenn OOS-F1 ≥ 0.30
-**ML-Refresh:** Täglich (24h), 720 OHLCV-Candles (1h)
-**LLM-Cache:** `data/llm_cache.db` — verhindert doppelte API-Calls
+**Retrain:** Async via ThreadPoolExecutor, echter Rollback wenn F1 − 0.05 schlechter
+**OOS-Gate:** Modell nur gespeichert wenn Walk-Forward-F1 ≥ `MIN_OOS_F1 = 0.30`
+**Feature-Mismatch:** `predict()` gibt `(hold, 0.0)` zurück wenn Feature-Anzahl falsch → Bootstrap
+**Perp-Features:** Im Training als 0 (kein historisches Funding), Live via `market/perp.py`
 
 ---
 
-## Regime-Logik (PricePredictor)
+## Regime-Logik (PricePredictor + GridParams)
 
-| Regime | Bedingung | Grid-Range | Levels (default) |
+| Regime | Bedingung | Grid-Range | Levels |
 |--------|-----------|-----------|--------|
 | trending | ADX > 25 | ATR × 2.0 | 6 |
-| volatile | ATR% > 3% | ATR × 1.5 | 10 |
-| ranging | sonst | Bollinger Bands | 8 |
-
-REGIME_CONFIGS wird automatisch nach echten Win-Rates angepasst (Auto-Tune).
+| volatile | ATR% > 3% | ATR × 1.5 | 20 |
+| ranging | sonst | Bollinger Bands | 14 |
 
 ---
 
@@ -233,18 +283,27 @@ REGIME_CONFIGS wird automatisch nach echten Win-Rates angepasst (Auto-Tune).
 | `grid_sessions` | Pro Session: profit, trades, max_dd, range_pct, levels |
 | `predictions` | ML/PricePredictor-Vorhersagen mit realized outcome |
 | `optimizer_runs` | Backtest-Sweep-Ergebnisse |
-| `equity` | Kapital-Kurve (alle 15s) |
+| `equity` | Kapital-Kurve (alle 15s, Mark-to-Market) |
 | `coin_settings` | Dashboard-Override: max_investment, enabled pro Symbol |
 | `bot_status` | Einzeilig: running, mode, leverage, **stop_mode** (Graceful-Shutdown-Flag) |
 
 **Wichtig:** `bot_status.stop_mode` ist das Kommunikations-Flag für Graceful Shutdown.
-Nie manuell auf einen Wert setzen lassen – wird vom Bot nach Lesen automatisch auf NULL zurückgesetzt.
+Wird vom Bot nach Lesen automatisch auf NULL zurückgesetzt.
 
-### `data/ml_training.db`
-| `samples` | ML-Training-Samples: features (JSON), entry_price, label, predicted |
+---
 
-### `data/ohlcv_cache.db`
-| `ohlcv` | OHLCV-Cache: symbol, timeframe, timestamp, OHLCV-Werte |
+## Nightly Auto-Tune (05:00 täglich)
+
+`scripts/nightly_tune.py` läuft als Cloud-Routine:
+1. Branch `auto-tune/YYYY-MM-DD` von main
+2. Trade-Analyse (7 Tage) + Pattern Mining
+3. OOS-Sweep je Symbol (180 Tage, 120 Train)
+4. Wenn Sweep-Winner besser: `config/grid_params.json` committen
+5. GitHub-Issue mit Findings
+6. Draft-PR nach main (User reviewed + merged manuell am nächsten Tag)
+7. Telegram-Benachrichtigung
+
+**Sanity:** Niemals main direkt, niemals Live-Bot neu starten.
 
 ---
 
@@ -266,14 +325,15 @@ Nie manuell auf einen Wert setzen lassen – wird vom Bot nach Lesen automatisch
 ## Konventionen (PFLICHT)
 
 - **Fees:** Immer `KRAKEN_FEE = 0.0016` nutzen, nie hardcoded.
-- **RiskManager:** Jede neue Strategie muss `src/risk/risk_manager.py` einbinden.
+- **RiskManager:** Jede neue Strategie muss `risk/manager.py` einbinden.
 - **ATR:** Immer Fallback auf ATR wenn PricePredictor fehlschlägt.
 - **Kein Hardcoding:** Exchange, Symbol und Fees immer als Konstanten.
-- **ML-Retrain:** Nie im predict()-Hot-Path blockierend — Threading nutzen.
+- **ML-Retrain:** Nie im predict()-Hot-Path blockierend — ThreadPoolExecutor nutzen.
 - **Walk-Forward:** Modelle nur speichern wenn OOS-F1 ≥ `MIN_OOS_F1 = 0.30`.
 - **db.log_trade():** `context`-Dict mitliefern für Pattern-Mining.
-- **Score-Vorzeichen:** Direction und Score müssen übereinstimmen (enforce in `predict_direction`).
 - **stop_mode:** Nach Lesen immer auf NULL zurücksetzen — sonst blockiert Bot-Neustart.
+- **Singleton:** `core/lifecycle.acquire_singleton()` am Start — verhindert Doppelstarts.
+- **Feature-Count:** Modell-Predict prüft Feature-Anzahl → bei Mismatch Bootstrap-Retrain.
 
 ---
 
@@ -289,4 +349,7 @@ python3 scripts/optimize.py --calibration-report
 python3 scripts/optimize.py --suggest-params
 python3 scripts/optimize.py --pattern-mine
 python3 scripts/optimize.py --run-sweep --symbol SOL/USD
+
+# Nightly Tune manuell testen
+python3 scripts/nightly_tune.py
 ```

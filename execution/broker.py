@@ -38,8 +38,14 @@ class Broker(ABC):
         client_id: str = "",
         sl_price: Optional[float] = None,
         tp_price: Optional[float] = None,
+        meta: Optional[dict] = None,
     ) -> BrokerOrder:
-        """Place a limit order. Returns the broker order with exchange_order_id set."""
+        """Place a limit order. Returns the broker order with exchange_order_id set.
+
+        meta: optional strategy-level payload forwarded from Order.meta.
+              Brokers may use it for leverage-aware margin accounting or
+              pre_seeded detection. Live brokers may safely ignore it.
+        """
 
     @abstractmethod
     def cancel(self, client_id: str) -> bool:
