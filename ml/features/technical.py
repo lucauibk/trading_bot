@@ -1,3 +1,8 @@
+"""
+Technical features – same as the original ml/features.py (16 features).
+Kept for backward compatibility with existing trained models.
+"""
+
 import numpy as np
 import pandas as pd
 import ta as ta_lib
@@ -13,11 +18,8 @@ FEATURE_NAMES = [
     "body_pct", "upper_shadow_pct", "lower_shadow_pct", "is_green",
 ]
 
-N_FEATURES = len(FEATURE_NAMES)
 
-
-def extract_features(df: pd.DataFrame) -> np.ndarray:
-    """Extract 16-dimensional feature vector from OHLCV DataFrame (min 60 rows)."""
+def extract(df: pd.DataFrame) -> np.ndarray:
     close  = df["close"]
     high   = df["high"]
     low    = df["low"]
@@ -27,7 +29,6 @@ def extract_features(df: pd.DataFrame) -> np.ndarray:
 
     ema9  = float(ta_lib.trend.ema_indicator(close, window=9).iloc[-1])
     ema21 = float(ta_lib.trend.ema_indicator(close, window=21).iloc[-1])
-
     rsi   = float(ta_lib.momentum.rsi(close, window=14).iloc[-1])
     mom_1 = float(close.pct_change(1).iloc[-1])
     mom_4 = float(close.pct_change(4).iloc[-1])

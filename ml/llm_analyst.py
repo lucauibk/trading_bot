@@ -97,7 +97,7 @@ Current price: {price:.4f} USD
 Regime: {regime}
 
 Technical indicators:
-- RSI(7): {rsi:.1f}  (oversold <30, overbought >70)
+- RSI(14): {rsi:.1f}  (oversold <35, overbought >65)
 - EMA9 vs EMA21: {ema_trend} ({ema9:.4f} vs {ema21:.4f})
 - ATR%: {atr_pct:.2f}%
 - Bollinger Band position: {bb_pos:.2f}  (0=lower band, 1=upper band)

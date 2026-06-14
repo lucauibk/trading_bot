@@ -108,9 +108,6 @@ def setup_branch() -> bool:
         stashed = "No local changes" not in (stash.stdout or "")
         _git("branch", "-D", BRANCH, capture=True, check=False)
         _git("switch", "-c", BRANCH, "origin/main")
-        # Restore working-tree changes on original branch afterwards would need
-        # a pop on cleanup — for the auto-tune script we just need the stash gone
-        # from the new branch; pop immediately so we don't leave state behind.
         if stashed:
             _run(["git", "stash", "pop"], capture=True, check=False)
         log.info("Branch created: %s", BRANCH)

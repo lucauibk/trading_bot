@@ -1,7 +1,8 @@
 import json
 import logging
+import threading
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import joblib
 import numpy as np
@@ -29,6 +30,8 @@ class TradingModel:
         self._clf: Optional[CalibratedClassifierCV] = None
         self._n_samples = 0
         self._last_oos_f1 = 0.0
+        self._feature_names: List[str] = []
+        self._lock = threading.Lock()
         self._load()
 
     def train(self, X: np.ndarray, y: np.ndarray):
@@ -63,9 +66,9 @@ class TradingModel:
         else:
             oos_f1 = 0.0
 
-        if oos_f1 < MIN_OOS_F1 and self._clf is not None:
+        if oos_f1 < MIN_OOS_F1:
             logger.warning(
-                "OOS F1 %.3f < %.2f für %s – behalte altes Modell", oos_f1, MIN_OOS_F1, self.symbol
+                "OOS F1 %.3f < %.2f für %s – Modell verworfen", oos_f1, MIN_OOS_F1, self.symbol
             )
             return
 
@@ -84,9 +87,21 @@ class TradingModel:
         clf = CalibratedClassifierCV(base_final, method="isotonic", cv=cv)
         clf.fit(X, y)
 
-        self._clf = clf
-        self._n_samples = len(X)
-        self._last_oos_f1 = oos_f1
+        with self._lock:
+            self._clf = clf
+            self._n_samples = len(X)
+            self._last_oos_f1 = oos_f1
+            # Store the actual feature names used (may be 16 or 34 depending on caller)
+            self._feature_names = [f"f{i}" for i in range(X.shape[1])]
+            try:
+                from .features.combined import ALL_FEATURE_NAMES
+                from .features import FEATURE_NAMES
+                if X.shape[1] == len(ALL_FEATURE_NAMES):
+                    self._feature_names = list(ALL_FEATURE_NAMES)
+                elif X.shape[1] == len(FEATURE_NAMES):
+                    self._feature_names = list(FEATURE_NAMES)
+            except Exception:
+                pass
         self._save()
 
         classes, counts = np.unique(y, return_counts=True)
@@ -98,15 +113,31 @@ class TradingModel:
 
     def predict(self, x: np.ndarray) -> Tuple[int, float]:
         """Returns (label_int, calibrated_confidence). label: 0=sell, 1=hold, 2=buy"""
-        if not self.is_ready():
-            return 1, 0.0
-        import pandas as pd
-        from .features import FEATURE_NAMES
-        x2 = pd.DataFrame(x.reshape(1, -1), columns=FEATURE_NAMES)
-        proba = self._clf.predict_proba(x2)[0]
-        label = int(proba.argmax())
-        confidence = float(proba.max())
-        return label, confidence
+        with self._lock:
+            if not self.is_ready():
+                return 1, 0.0
+            import pandas as pd
+
+            # Feature-count mismatch: model was trained with a different number of features.
+            # Fall back to hold/0 and let the caller retrain rather than crash or produce garbage.
+            expected_n = len(self._feature_names)
+            if expected_n > 0 and x.shape[0] != expected_n:
+                logger.warning(
+                    "Feature count mismatch for %s: model=%d, input=%d – returning hold",
+                    self.symbol, expected_n, x.shape[0],
+                )
+                return 1, 0.0
+
+            feature_names = self._feature_names if self._feature_names else [f"f{i}" for i in range(x.shape[0])]
+            x2 = pd.DataFrame(x.reshape(1, -1), columns=feature_names)
+            try:
+                proba = self._clf.predict_proba(x2)[0]
+            except Exception as e:
+                logger.warning("predict_proba failed for %s: %s", self.symbol, e)
+                return 1, 0.0
+            label = int(proba.argmax())
+            confidence = float(proba.max())
+            return label, confidence
 
     def is_ready(self) -> bool:
         return self._clf is not None and self._n_samples >= self.MIN_SAMPLES
@@ -114,8 +145,9 @@ class TradingModel:
     def _save(self):
         joblib.dump(self._clf, self._model_path)
         self._meta_path.write_text(json.dumps({
-            "n_samples": self._n_samples,
-            "oos_f1": self._last_oos_f1,
+            "n_samples":     self._n_samples,
+            "oos_f1":        self._last_oos_f1,
+            "feature_names": self._feature_names,
         }))
 
     def _load(self):
@@ -127,6 +159,7 @@ class TradingModel:
                 meta = json.loads(self._meta_path.read_text())
                 self._n_samples  = meta.get("n_samples", self.MIN_SAMPLES)
                 self._last_oos_f1 = meta.get("oos_f1", 0.0)
+                self._feature_names = meta.get("feature_names", [])
             else:
                 self._n_samples = self.MIN_SAMPLES
             logger.info(

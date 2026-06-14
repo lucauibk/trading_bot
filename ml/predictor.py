@@ -1,12 +1,13 @@
 import logging
-import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, List, Optional
 
 import ta as ta_lib
 
 from .data_store import MLDataStore
 from .features import extract_features
+from .features.combined import extract_all as extract_all_features, ALL_FEATURE_NAMES
 from .llm_analyst import analyse as llm_analyse, blend_scores
 from .model import LABEL_TO_STR, TradingModel
 from .trainer import ModelTrainer, bootstrap_from_history
@@ -28,7 +29,9 @@ class MLPredictor:
         self._store        = MLDataStore()
         self._models:  Dict[str, TradingModel]  = {}
         self._trainer: Optional[ModelTrainer]   = None
-        self._last_scores: Dict[str, float]     = {}  # symbol → blended score (-1..+1)
+        self._last_scores: Dict[str, float]     = {}
+        # Single-worker executor prevents multiple concurrent retrains competing on _clf
+        self._retrain_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ml-retrain")
 
     def get_score(self, symbol: str) -> float:
         """Letzter normierter Blended-Score (-1.0=down … +1.0=up) für adaptive Sizing."""
@@ -59,7 +62,23 @@ class MLPredictor:
         """
         try:
             df    = self._fetch_ohlcv(symbol, "1h", 120)
-            feats = extract_features(df)
+            # Build 34-feature vector: technical(16) + perp(4) + market(5) + htf(4) + seasonality(5)
+            # Perp/market data pulled from context cache; all fall back gracefully to 0 if missing.
+            try:
+                from market.perp import get_funding
+                from market.btc_context import get_btc_context
+                import threading
+                funding    = get_funding(symbol)
+                btc_ctx    = get_btc_context()
+                # Approximate BTC correlation from the context (not available per-symbol in cache,
+                # use a conservative default; the model was trained with this as well)
+                btc_corr   = 0.7
+                dt         = df.index[-1].to_pydatetime() if hasattr(df.index[-1], "to_pydatetime") else None
+                feats = extract_all_features(df, funding=funding, btc=btc_ctx,
+                                             btc_corr=btc_corr, dt=dt)
+            except Exception as e:
+                logger.debug("34-feature extraction failed (%s), falling back to 16", e)
+                feats = extract_features(df)
             price = float(df["close"].iloc[-1])
             model = self._models.get(symbol)
 
@@ -73,11 +92,9 @@ class MLPredictor:
                 ts = int(time.time())
                 if self._trainer:
                     self._trainer.record(symbol, ts, feats, price, label_int)
-                    threading.Thread(
-                        target=self._trainer.label_and_maybe_retrain,
-                        args=(symbol, df),
-                        daemon=True,
-                    ).start()
+                    self._retrain_executor.submit(
+                        self._trainer.label_and_maybe_retrain, symbol, df
+                    )
 
             # LLM-Analyse (gecacht, ~1×/Stunde pro Coin)
             llm_indicators = self._build_llm_indicators(df, symbol)
@@ -86,7 +103,7 @@ class MLPredictor:
             # Blending: LightGBM + Claude Haiku
             blended_score, blended_conf = blend_scores(lgbm_score, lgbm_conf, llm_result)
 
-            if blended_conf >= MIN_CONFIDENCE or (llm_result and llm_result["confidence"] >= 0.60):
+            if blended_conf >= MIN_CONFIDENCE:
                 if blended_score > 0.15:
                     direction = "up"
                 elif blended_score < -0.15:
@@ -110,8 +127,9 @@ class MLPredictor:
 
             result = self._rule_based(df)
             logger.info("Fallback %-12s → %s", symbol, result.upper())
-            # Score auch beim Fallback aktualisieren, damit _direction_score konsistent bleibt
-            self._last_scores[symbol] = 0.5 if result == "up" else (-0.5 if result == "down" else 0.0)
+            # ±0.5 so rule-based can trigger momentum-hold (threshold 0.35)
+            _fallback_score = {"up": 0.5, "down": -0.5, "neutral": 0.0}
+            self._last_scores[symbol] = _fallback_score.get(result, 0.0)
             return result
 
         except Exception as e:
@@ -126,12 +144,14 @@ class MLPredictor:
             low    = df["low"]
             ema9   = float(ta_lib.trend.ema_indicator(close, window=9).iloc[-1])
             ema21  = float(ta_lib.trend.ema_indicator(close, window=21).iloc[-1])
-            rsi    = float(ta_lib.momentum.rsi(close, window=7).iloc[-1])
+            rsi    = float(ta_lib.momentum.rsi(close, window=14).iloc[-1])
             atr    = ta_lib.volatility.average_true_range(high, low, close, window=14)
             atr_pct = float(atr.iloc[-1] / close.iloc[-1] * 100)
             bb_h   = ta_lib.volatility.bollinger_hband(close).iloc[-1]
             bb_l   = ta_lib.volatility.bollinger_lband(close).iloc[-1]
             bb_pos = float((close.iloc[-1] - bb_l) / (bb_h - bb_l)) if bb_h != bb_l else 0.5
+            adx_val = float(ta_lib.trend.adx(high, low, close, window=14).iloc[-1])
+            regime = "trending" if adx_val > 25 else ("volatile" if atr_pct > 3.0 else "ranging")
 
             candles = []
             for i in range(-5, 0):
@@ -148,7 +168,7 @@ class MLPredictor:
                 "price": float(close.iloc[-1]),
                 "rsi": rsi, "ema9": ema9, "ema21": ema21,
                 "atr_pct": atr_pct, "bb_position": bb_pos,
-                "regime": "ranging",
+                "regime": regime,
                 "last_candles": candles,
             }
         except Exception:

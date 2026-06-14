@@ -313,57 +313,350 @@ def cmd_pattern_mine(days: int):
     _divider()
 
 
+# ── --ready-for-live ─────────────────────────────────────────────────────────
+
+_GO     = "  [GO]     "
+_CAUTION= "  [CAUTION]"
+_NOGO   = "  [NO-GO]  "
+
+MIN_TRADES        = 50    # Mindest-Trade-Anzahl
+MIN_PAPER_DAYS    = 7     # Mindest-Paper-Trading-Dauer
+MIN_WIN_RATE      = 0.50  # 50% Win-Rate
+MAX_DRAWDOWN      = 0.15  # 15% Max-Drawdown
+MAX_BRIER         = 0.22  # Brier-Score-Grenze
+MIN_ML_SAMPLES    = 20    # Mindest-kalibrierte Predictions
+MAX_ERROR_RATE    = 0.02  # Max 2% ERROR-Zeilen im Log
+MAX_CRASH_ERRORS  = 3     # Kritische Fehler/Tracebacks maximal
+
+
+def _parse_logs_for_errors(log_path, days: int = 7) -> dict:
+    """Liest Log-File und zählt ERRORs/Tracebacks der letzten N Tage."""
+    result = {"total_lines": 0, "error_lines": 0, "critical_lines": 0,
+              "traceback_count": 0, "crash_markers": [], "log_days": 0,
+              "first_ts": None, "last_ts": None}
+
+    if not log_path.exists():
+        return result
+
+    cutoff = datetime.now() - timedelta(days=days)
+    in_traceback = False
+    traceback_buf = []
+    import re
+    ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+
+    with open(log_path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = ts_re.match(line)
+            if m:
+                try:
+                    ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                if result["first_ts"] is None:
+                    result["first_ts"] = ts
+                result["last_ts"] = ts
+                if ts < cutoff:
+                    in_traceback = False
+                    continue
+                result["total_lines"] += 1
+                if "[ERROR]" in line or "[CRITICAL]" in line:
+                    result["error_lines"] += 1
+                    if "[CRITICAL]" in line:
+                        result["critical_lines"] += 1
+                if "Traceback" in line:
+                    in_traceback = True
+                    traceback_buf = [line.rstrip()]
+                elif in_traceback:
+                    if line.startswith(" ") or line.startswith("\t"):
+                        traceback_buf.append(line.rstrip())
+                    else:
+                        result["traceback_count"] += 1
+                        result["crash_markers"].append(" | ".join(traceback_buf[-2:]))
+                        in_traceback = False
+                        traceback_buf = []
+            else:
+                if in_traceback and (line.startswith(" ") or line.startswith("\t")):
+                    traceback_buf.append(line.rstrip())
+
+    if result["first_ts"] and result["last_ts"]:
+        result["log_days"] = (result["last_ts"] - result["first_ts"]).total_seconds() / 86400
+    return result
+
+
+def cmd_ready_for_live(days: int):
+    _divider("READY FOR LIVE – Bereitschafts-Check")
+    print(f"  Analyse-Zeitraum: letzte {days} Tage | Grenzwerte: "
+          f"WR≥{MIN_WIN_RATE*100:.0f}% | MaxDD≤{MAX_DRAWDOWN*100:.0f}% | "
+          f"Brier≤{MAX_BRIER} | Trades≥{MIN_TRADES}")
+    print()
+
+    checks = []   # (status, label, detail, fix)
+    warnings = []
+
+    # ── 1. Trade-Daten laden ──────────────────────────────────────────────────
+    con = _conn()
+    df = _trades_df(symbol=None, days=days, con=con)
+
+    # ── 2. Mindest-Trade-Anzahl ───────────────────────────────────────────────
+    n_trades = len(df)
+    if n_trades >= MIN_TRADES:
+        checks.append((_GO, "Sample-Size",
+                        f"{n_trades} Trades (≥{MIN_TRADES} benötigt)", None))
+    elif n_trades >= MIN_TRADES // 2:
+        checks.append((_CAUTION, "Sample-Size",
+                        f"Nur {n_trades} Trades (≥{MIN_TRADES} benötigt)",
+                        f"Weiter Paper-traden bis {MIN_TRADES}+ Trades erreicht"))
+    else:
+        checks.append((_NOGO, "Sample-Size",
+                        f"Nur {n_trades} Trades – zu wenig für Aussage (≥{MIN_TRADES} benötigt)",
+                        f"Mindestens {MIN_TRADES - n_trades} weitere Trades sammeln"))
+
+    if df.empty:
+        print("  [KEINE DATEN] Keine Trades in DB – Live-Betrieb nicht möglich.")
+        con.close()
+        return
+
+    # ── 3. Paper-Trading-Dauer ────────────────────────────────────────────────
+    first_trade = pd.to_datetime(df["timestamp"]).min()
+    last_trade  = pd.to_datetime(df["timestamp"]).max()
+    paper_days  = (last_trade - first_trade).total_seconds() / 86400
+    if paper_days >= MIN_PAPER_DAYS:
+        checks.append((_GO, "Paper-Dauer",
+                        f"{paper_days:.1f} Tage Paper-Trading (≥{MIN_PAPER_DAYS} benötigt)", None))
+    else:
+        checks.append((_NOGO, "Paper-Dauer",
+                        f"Nur {paper_days:.1f} Tage Paper-Trading",
+                        f"Noch {MIN_PAPER_DAYS - paper_days:.0f} weitere Tage abwarten"))
+
+    # ── 4. Win-Rate & PnL ────────────────────────────────────────────────────
+    win_rate = (df["pnl"] > 0).mean()
+    total_pnl = df["pnl"].sum()
+    avg_pnl   = df["pnl"].mean()
+    if win_rate >= MIN_WIN_RATE and total_pnl > 0:
+        checks.append((_GO, "Win-Rate / PnL",
+                        f"WR={win_rate*100:.1f}% | Total={total_pnl:+.2f} USDT | Avg={avg_pnl:+.4f} USDT", None))
+    elif win_rate >= MIN_WIN_RATE - 0.05 or total_pnl > 0:
+        detail = f"WR={win_rate*100:.1f}% | Total={total_pnl:+.2f} USDT | Avg={avg_pnl:+.4f} USDT"
+        fix = []
+        if win_rate < MIN_WIN_RATE:
+            fix.append(f"Win-Rate noch {(MIN_WIN_RATE - win_rate)*100:.1f}% unter Ziel")
+        if total_pnl <= 0:
+            fix.append("Gesamt-PnL negativ")
+        checks.append((_CAUTION, "Win-Rate / PnL", detail, " | ".join(fix)))
+    else:
+        checks.append((_NOGO, "Win-Rate / PnL",
+                        f"WR={win_rate*100:.1f}% (Ziel ≥{MIN_WIN_RATE*100:.0f}%) | "
+                        f"Total={total_pnl:+.2f} USDT",
+                        "Strategie-Parameter prüfen (/optimizer Win-Rate-Modus)"))
+
+    # ── 5. Trend letzte 7 Tage ───────────────────────────────────────────────
+    recent_cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    df_recent = df[pd.to_datetime(df["timestamp"], utc=True) >= recent_cutoff]
+    if not df_recent.empty:
+        recent_pnl = df_recent["pnl"].sum()
+        recent_wr  = (df_recent["pnl"] > 0).mean()
+        if recent_pnl > 0 and recent_wr >= MIN_WIN_RATE:
+            checks.append((_GO, "Trend (7d)",
+                            f"Letzte 7d: +{recent_pnl:.2f} USDT | WR={recent_wr*100:.1f}%", None))
+        elif recent_pnl > 0 or recent_wr >= MIN_WIN_RATE - 0.05:
+            checks.append((_CAUTION, "Trend (7d)",
+                            f"Letzte 7d: {recent_pnl:+.2f} USDT | WR={recent_wr*100:.1f}%",
+                            "Performance noch nicht stabil"))
+        else:
+            checks.append((_NOGO, "Trend (7d)",
+                            f"Letzte 7d: {recent_pnl:+.2f} USDT | WR={recent_wr*100:.1f}%",
+                            "Aktuell negativ – Bot gerade nicht profitabel"))
+    else:
+        warnings.append("Keine Trades in den letzten 7 Tagen – Trend-Check nicht möglich")
+
+    # ── 6. Max Drawdown aus equity-Tabelle ───────────────────────────────────
+    try:
+        eq_df = pd.read_sql(
+            "SELECT timestamp, equity FROM equity ORDER BY timestamp",
+            con, parse_dates=["timestamp"]
+        )
+        if not eq_df.empty and len(eq_df) > 5:
+            peak = eq_df["equity"].expanding().max()
+            drawdown = ((eq_df["equity"] - peak) / peak).min()
+            abs_dd   = abs(float(drawdown))
+            if abs_dd <= MAX_DRAWDOWN:
+                checks.append((_GO, "Max Drawdown",
+                                f"Max DD = {abs_dd*100:.1f}% (Limit: {MAX_DRAWDOWN*100:.0f}%)", None))
+            elif abs_dd <= MAX_DRAWDOWN * 1.5:
+                checks.append((_CAUTION, "Max Drawdown",
+                                f"Max DD = {abs_dd*100:.1f}% (Limit: {MAX_DRAWDOWN*100:.0f}%)",
+                                "Drawdown nahe Grenze – Risiko-Parameter prüfen"))
+            else:
+                checks.append((_NOGO, "Max Drawdown",
+                                f"Max DD = {abs_dd*100:.1f}% – zu hoch (Limit: {MAX_DRAWDOWN*100:.0f}%)",
+                                "PER_POS_SL_PCT / MAX_LOSS_PCT senken; /optimizer Lose-Rate prüfen"))
+        else:
+            warnings.append("Equity-Tabelle leer oder zu wenig Punkte – Drawdown nicht berechenbar")
+    except Exception:
+        warnings.append("Equity-Tabelle nicht auswertbar")
+
+    # ── 7. Regime-Abdeckung ───────────────────────────────────────────────────
+    if "regime" in df.columns and df["regime"].notna().any():
+        regimes_seen = df["regime"].dropna().unique().tolist()
+        n_regimes    = len(regimes_seen)
+        if n_regimes >= 2:
+            checks.append((_GO, "Regime-Abdeckung",
+                            f"{n_regimes} Regimes getestet: {', '.join(regimes_seen)}", None))
+        else:
+            checks.append((_CAUTION, "Regime-Abdeckung",
+                            f"Nur Regime '{regimes_seen[0]}' gesehen – Bot nicht in allen Marktphasen getestet",
+                            "Warten bis trending + volatile + ranging alle aufgetreten sind"))
+    else:
+        warnings.append("Kein regime-Kontext in Trades – trade_context-Logging prüfen")
+
+    # ── 8. ML-Kalibrierung ───────────────────────────────────────────────────
+    try:
+        ml_df = pd.read_sql(
+            "SELECT confidence, hit FROM predictions WHERE hit IS NOT NULL",
+            con
+        )
+        if len(ml_df) >= MIN_ML_SAMPLES:
+            brier = float(np.mean((ml_df["confidence"].astype(float) - ml_df["hit"].astype(float)) ** 2))
+            if brier <= MAX_BRIER:
+                checks.append((_GO, "ML-Kalibrierung",
+                                f"Brier-Score={brier:.4f} (≤{MAX_BRIER} = gut) | "
+                                f"{len(ml_df)} kalibrierte Predictions", None))
+            elif brier <= MAX_BRIER * 1.3:
+                checks.append((_CAUTION, "ML-Kalibrierung",
+                                f"Brier-Score={brier:.4f} – leicht erhöht",
+                                "MIN_CONFIDENCE anheben (--calibration-report zeigt optimalen Wert)"))
+            else:
+                checks.append((_NOGO, "ML-Kalibrierung",
+                                f"Brier-Score={brier:.4f} – schlecht (nahe Zufallsrate 0.25)",
+                                "ML-Modell hat schlechte Kalibrierung – Retrain abwarten oder "
+                                "MIN_CONFIDENCE stark anheben"))
+        else:
+            n_missing = MIN_ML_SAMPLES - len(ml_df)
+            checks.append((_CAUTION, "ML-Kalibrierung",
+                            f"Nur {len(ml_df)} kalibrierte Predictions (≥{MIN_ML_SAMPLES} benötigt)",
+                            f"Noch {n_missing} weitere Predictions abwarten (kalibrieren nach 6h)"))
+    except Exception:
+        warnings.append("predictions-Tabelle nicht auswertbar")
+
+    # ── 9. Log-Stabilität ────────────────────────────────────────────────────
+    log_path = ROOT / "logs" / "trading_bot.log"
+    log_stats = _parse_logs_for_errors(log_path, days=min(days, 7))
+
+    if log_stats["total_lines"] > 0:
+        error_rate = log_stats["error_lines"] / log_stats["total_lines"]
+        crashes    = log_stats["traceback_count"]
+        criticals  = log_stats["critical_lines"]
+
+        detail = (f"ERROR-Rate={error_rate*100:.2f}% ({log_stats['error_lines']} von "
+                  f"{log_stats['total_lines']} Zeilen) | "
+                  f"Tracebacks={crashes} | CRITICAL={criticals}")
+
+        if error_rate <= MAX_ERROR_RATE and crashes <= MAX_CRASH_ERRORS and criticals == 0:
+            checks.append((_GO, "Log-Stabilität", detail, None))
+        elif error_rate <= MAX_ERROR_RATE * 3 and crashes <= MAX_CRASH_ERRORS * 2:
+            fix_parts = []
+            if crashes > 0:
+                fix_parts.append(f"{crashes} Traceback(s) in den letzten {min(days,7)}d untersuchen")
+            if error_rate > MAX_ERROR_RATE:
+                fix_parts.append("ERROR-Rate leicht erhöht")
+            checks.append((_CAUTION, "Log-Stabilität", detail, " | ".join(fix_parts)))
+        else:
+            fix_parts = []
+            if crashes > MAX_CRASH_ERRORS:
+                fix_parts.append(f"{crashes} Crashes – Bot crasht regelmäßig")
+            if error_rate > MAX_ERROR_RATE * 3:
+                fix_parts.append(f"ERROR-Rate {error_rate*100:.1f}% zu hoch")
+            if criticals > 0:
+                fix_parts.append(f"{criticals} CRITICAL-Fehler")
+            checks.append((_NOGO, "Log-Stabilität", detail, " | ".join(fix_parts)))
+
+        if log_stats["crash_markers"]:
+            warnings.append("Letzte Traceback-Snippets:")
+            for m in log_stats["crash_markers"][:3]:
+                warnings.append(f"  → {m[:100]}")
+    else:
+        warnings.append(f"Log-File {log_path} nicht auswertbar (leer oder nicht vorhanden)")
+
+    con.close()
+
+    # ── 10. Ausgabe ───────────────────────────────────────────────────────────
+    print(f"  {'Check':<20} {'Status':<12} Details")
+    print("  " + "-" * 78)
+    go_count     = 0
+    caution_count = 0
+    nogo_count   = 0
+    action_items = []
+
+    for status, label, detail, fix in checks:
+        print(f"{status} {label:<20} {detail}")
+        if status == _GO:
+            go_count += 1
+        elif status == _CAUTION:
+            caution_count += 1
+            if fix:
+                action_items.append(f"  ⚠  {label}: {fix}")
+        else:
+            nogo_count += 1
+            if fix:
+                action_items.append(f"  ✗  {label}: {fix}")
+
+    if warnings:
+        print()
+        print("  Hinweise:")
+        for w in warnings:
+            print(f"  ⓘ  {w}")
+
+    print()
+    _divider("GESAMTURTEIL")
+    total_checks = len(checks)
+    if nogo_count == 0 and caution_count <= 1:
+        print(f"  ██ GO – Bot ist bereit für Live-Betrieb ██")
+        print(f"  {go_count}/{total_checks} Checks bestanden, {caution_count} Hinweise")
+    elif nogo_count == 0:
+        print(f"  ▓▓ FAST BEREIT – Kleine Punkte beheben, dann Live ▓▓")
+        print(f"  {go_count}/{total_checks} Checks bestanden, {caution_count} Hinweise, 0 Blocker")
+    elif nogo_count <= 1 and caution_count <= 2:
+        print(f"  ▒▒ MAINTENANCE NÖTIG – {nogo_count} Blocker beheben ▒▒")
+        print(f"  {go_count}/{total_checks} Checks bestanden, {caution_count} Hinweise, {nogo_count} Blocker")
+    else:
+        print(f"  ░░ NICHT BEREIT – Weiter Paper-traden ░░")
+        print(f"  {go_count}/{total_checks} Checks bestanden, {nogo_count} Blocker")
+
+    if action_items:
+        print()
+        print("  Maßnahmen:")
+        for item in action_items:
+            print(item)
+
+    _divider()
+
+
 # ── --run-sweep ───────────────────────────────────────────────────────────────
 
 def cmd_run_sweep(symbol: str):
-    _divider(f"Grid-Parameter-Sweep | {symbol}")
+    _divider(f"Grid-Backtest | {symbol}")
     sys.path.insert(0, str(ROOT))
 
     try:
-        import grid_optimizer as go
-    except Exception as e:
-        print(f"[FEHLER] grid_optimizer.py nicht importierbar: {e}")
-        return
-
-    try:
         from data_fetcher import fetch_ohlcv
-        df = fetch_ohlcv(symbol, "1h", 500)
+        df = fetch_ohlcv(symbol, "1h", 720)
     except Exception as e:
         print(f"[FEHLER] Daten für {symbol} nicht verfügbar: {e}")
         return
 
     try:
-        from dashboard.db import log_optimizer_run
+        from strategies.grid import GridStrategy
+        from backtest.engine import run_backtest
+        strategy = GridStrategy([{"symbol": symbol, "investment": 200.0, "levels": 8}])
+        results = run_backtest(strategy, df, symbol, initial_balance=200.0)
+        results.pop("equity_curve", None)
+        results.pop("pnls", None)
+        print()
+        for k, v in results.items():
+            print(f"  {k:<25} {v}")
     except Exception as e:
-        print(f"[FEHLER] DB nicht verfügbar: {e}")
-        log_optimizer_run = None
+        print(f"[FEHLER] Backtest fehlgeschlagen: {e}")
 
-    print(f"Sweep über {len(go.LEVELS_OPTIONS)} × {len(go.RANGE_OPTIONS)} Kombinationen…")
-    results = go.run_sweep(symbol, df)
-
-    saved = 0
-    for r in results:
-        print(
-            f"  Levels={r['levels']:>2} Range={r['range_pct']*100:.1f}% "
-            f"Regime={r.get('regime','all'):<10} "
-            f"Score={r['score']:.4f} Daily={r['daily_pct']*100:.2f}% MaxDD={r['max_dd']*100:.2f}%"
-        )
-        if log_optimizer_run:
-            try:
-                log_optimizer_run(
-                    symbol=symbol,
-                    regime=r.get("regime", ""),
-                    params={"levels": r["levels"], "range_pct": r["range_pct"]},
-                    score=r["score"],
-                    daily_pct=r["daily_pct"],
-                    max_dd=r["max_dd"],
-                    sample_size=r.get("sample_size", len(df)),
-                )
-                saved += 1
-            except Exception as ex:
-                print(f"  [WARN] DB-Speicher fehlgeschlagen: {ex}")
-
-    print(f"\n{len(results)} Sweep-Ergebnisse, {saved} in DB gespeichert.")
     _divider()
 
 
@@ -376,6 +669,8 @@ def main():
     parser.add_argument("--suggest-params",    action="store_true")
     parser.add_argument("--pattern-mine",      action="store_true")
     parser.add_argument("--run-sweep",         action="store_true")
+    parser.add_argument("--ready-for-live",    action="store_true",
+                        help="Live-Bereitschaftscheck: Trade-Performance, ML-Kalibrierung, Log-Stabilität")
     parser.add_argument("--symbol",  type=str, default=None, help="z.B. SOL/USD")
     parser.add_argument("--days",    type=int, default=30,   help="Analyse-Zeitraum in Tagen")
     args = parser.parse_args()
@@ -388,6 +683,8 @@ def main():
         cmd_suggest_params(args.symbol)
     elif args.pattern_mine:
         cmd_pattern_mine(args.days)
+    elif args.ready_for_live:
+        cmd_ready_for_live(args.days)
     elif args.run_sweep:
         if not args.symbol:
             print("[FEHLER] --run-sweep benötigt --symbol, z.B. --symbol SOL/USD")

@@ -40,24 +40,21 @@ def api_start():
     if _bot_process and _bot_process.poll() is None:
         return jsonify({"ok": False, "msg": "Bot läuft bereits"})
 
-    data     = request.get_json() or {}
-    strategy = data.get("strategy", "grid")
-    mode     = data.get("mode", "paper")
+    data = request.get_json() or {}
+    mode = data.get("mode", "paper")
 
     if mode == "live":
-        # Live-Modus: Bestätigung über Dashboard statt Terminal
         if not data.get("confirmed"):
             return jsonify({"ok": False, "confirm": True,
                             "msg": "Live Trading bestätigen?"})
 
-    cmd = [sys.executable, "main.py", "--mode", mode,
-           "--strategy", strategy, "--no-confirm"]
+    cmd = [sys.executable, "main.py", "--mode", mode, "--no-confirm"]
     _bot_process = subprocess.Popen(cmd, cwd=str(_ROOT))
     (_ROOT / ".bot.pid").write_text(str(_bot_process.pid))
 
-    set_status(running=True, mode=mode, strategy=strategy)
+    set_status(running=True, mode=mode, strategy="grid")
     return jsonify({"ok": True,
-                    "msg": f"Bot gestartet ({strategy.upper()}, {mode.upper()})"})
+                    "msg": f"Bot gestartet ({mode.upper()})"})
 
 
 def _stop_bot_process():
