@@ -103,9 +103,14 @@ def setup_branch() -> bool:
     log.info("Setting up branch %s", BRANCH)
     try:
         _git("fetch", "origin", capture=True)
-        # Delete local branch if it already exists (previous failed run)
+        # Stash any uncommitted changes so the branch switch succeeds
+        stash = _run(["git", "stash", "--include-untracked"], capture=True, check=False)
+        stashed = "No local changes" not in (stash.stdout or "")
         _git("branch", "-D", BRANCH, capture=True, check=False)
         _git("switch", "-c", BRANCH, "origin/main")
+        # Pop immediately so we don't leave stash state on the new branch
+        if stashed:
+            _run(["git", "stash", "pop"], capture=True, check=False)
         log.info("Branch created: %s", BRANCH)
         return True
     except Exception as e:
@@ -236,6 +241,13 @@ def create_issue_and_pr(analysis_report: str, sweep_report: str,
         + "\n\n---\n*Auto-generated — do not merge without review.*"
     )
 
+    # Check gh auth before attempting
+    auth_check = _run(["gh", "auth", "status"], capture=True, check=False)
+    if auth_check.returncode != 0:
+        log.error("gh CLI not authenticated – run 'gh auth login' first. Issue/PR skipped.")
+        log.error("gh auth output: %s", auth_check.stderr.strip())
+        return ""
+
     log.info("Creating GitHub issue…")
     try:
         issue_result = _gh(
@@ -246,7 +258,10 @@ def create_issue_and_pr(analysis_report: str, sweep_report: str,
             capture=True, check=False,
         )
         issue_url = issue_result.stdout.strip()
-        log.info("Issue created: %s", issue_url)
+        if not issue_url:
+            log.warning("Issue creation returned no URL. stderr: %s", issue_result.stderr.strip())
+        else:
+            log.info("Issue created: %s", issue_url)
     except Exception as e:
         log.warning("Issue creation failed: %s", e)
         issue_url = ""
@@ -283,7 +298,10 @@ def create_issue_and_pr(analysis_report: str, sweep_report: str,
             capture=True, check=False,
         )
         pr_url = pr_result.stdout.strip()
-        log.info("PR created: %s", pr_url)
+        if not pr_url:
+            log.warning("PR creation returned no URL. stderr: %s", pr_result.stderr.strip())
+        else:
+            log.info("PR created: %s", pr_url)
         return pr_url
     except Exception as e:
         log.warning("PR creation failed: %s", e)
