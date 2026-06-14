@@ -108,7 +108,6 @@ def setup_branch() -> bool:
         stashed = "No local changes" not in (stash.stdout or "")
         _git("branch", "-D", BRANCH, capture=True, check=False)
         _git("switch", "-c", BRANCH, "origin/main")
-        # Pop immediately so we don't leave stash state on the new branch
         if stashed:
             _run(["git", "stash", "pop"], capture=True, check=False)
         log.info("Branch created: %s", BRANCH)
