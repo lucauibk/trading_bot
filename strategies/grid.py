@@ -394,6 +394,7 @@ class GridStrategy(Strategy):
                 "filled": False,
                 "bought_at": buy_price,
                 "sl_price": sl_price,
+                "leverage": lev,
                 "trailing_activated": False,
                 "momentum_holds": 0,
             }

@@ -369,16 +369,20 @@ class Engine:
             pass
 
     def _log_equity(self):
-        """Log equity: cash balance + mark-to-market value of open positions.
+        """Log equity: cash balance + margin-correct MTM of open positions.
 
-        Open positions = sell orders in strategy state that have a real buy
-        behind them (bought_at set, not pre_seeded). Their current value is
-        qty × last_tick_price. This gives a smooth equity curve instead of
-        the sawtooth caused by logging cash-only (which dips on every buy
-        and spikes on every sell).
+        MTM per position = margin_returned + unrealized_pnl
+                         = qty × bought_at / leverage + qty × (price - bought_at)
+        Using full notional (qty × price) inflates equity by (lev-1)/lev × notional
+        per position when leverage > 1, because PaperBroker only deducts margin on buy.
         """
         try:
             balance = self.broker.get_balance("USD")
+            try:
+                from dashboard.db import get_leverage as _get_lev
+                default_lev = float(_get_lev())
+            except Exception:
+                default_lev = 1.0
             mtm = 0.0
             for sym in self.symbols:
                 price = self._last_prices.get(sym, 0.0)
@@ -394,7 +398,12 @@ class Engine:
                         and "bought_at" in o
                         and not o.get("pre_seeded")
                     ):
-                        mtm += o.get("qty", 0.0) * price
+                        qty = o.get("qty", 0.0)
+                        bought_at = o["bought_at"]
+                        lev = o.get("leverage", default_lev) or 1.0
+                        margin = qty * bought_at / lev
+                        unrealized = qty * (price - bought_at)
+                        mtm += margin + unrealized
 
             total = balance + mtm
             self.ctx.set_equity(total)
