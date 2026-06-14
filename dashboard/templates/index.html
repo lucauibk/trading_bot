@@ -4,7 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Trading Bot Dashboard</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: 'Segoe UI', Arial, sans-serif; background: #0f0f1a; color: #e0e0e0; }
@@ -40,6 +39,7 @@
   .btn:hover { opacity: 0.85; }
   .btn-start    { background: #00c896; color: #000; }
   .btn-stop     { background: #ff4d4d; color: #fff; }
+  .btn-restart  { background: #f0a500; color: #000; }
   .btn-shutdown { background: #555; color: #fff; }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .msg { font-size: 13px; color: #888; margin-top: 8px; min-height: 20px; }
@@ -125,8 +125,9 @@
         <option value="paper">Paper Trading</option>
         <option value="live">Live Trading 🔴</option>
       </select>
-      <button class="btn btn-start" id="btn-start" onclick="startBot()">▶ Starten</button>
-      <button class="btn btn-stop"  id="btn-stop"  onclick="stopBot()" disabled>⏹ Stoppen</button>
+      <button class="btn btn-start"    id="btn-start"   onclick="startBot()">▶ Starten</button>
+      <button class="btn btn-stop"     id="btn-stop"    onclick="stopBot()" disabled>⏹ Stoppen</button>
+      <button class="btn btn-restart"  id="btn-restart" onclick="restartBot()" disabled>↺ Restart</button>
       <button class="btn btn-shutdown" onclick="shutdownAll()" title="Bot + Dashboard komplett beenden">⏻ Alles beenden</button>
     </div>
     <div style="margin-top:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
@@ -143,10 +144,12 @@
   </div>
 
 
-  <!-- Equity Curve -->
+  <!-- Offene Positionen -->
   <div class="chart-card">
-    <h2>Equity Curve</h2>
-    <canvas id="equity-chart" height="80"></canvas>
+    <h2>Offene Positionen</h2>
+    <div id="open-positions-container">
+      <p style="color:#555;font-size:13px;padding:8px 0">Keine offenen Positionen.</p>
+    </div>
   </div>
 
   <!-- Grid-Visualisierung -->
@@ -169,28 +172,7 @@
 </main>
 
 <script>
-let equityChart;
 let _pendingStart = null;   // gespeicherte Start-Params beim Live-Confirm
-
-function initChart() {
-  const ctx = document.getElementById('equity-chart').getContext('2d');
-  equityChart = new Chart(ctx, {
-    type: 'line',
-    data: { labels: [], datasets: [{
-      label: 'Kapital (USDT)', data: [],
-      borderColor: '#00c896', backgroundColor: 'rgba(0,200,150,0.1)',
-      tension: 0.3, pointRadius: 0, fill: true
-    }]},
-    options: {
-      responsive: true, animation: false,
-      scales: {
-        x: { ticks: { color: '#888', maxTicksLimit: 8 }, grid: { color: '#1a1a2e' } },
-        y: { ticks: { color: '#888' }, grid: { color: '#1a1a2e' } }
-      },
-      plugins: { legend: { labels: { color: '#e0e0e0' } } }
-    }
-  });
-}
 
 // ── Bot starten ───────────────────────────────────────────────────────────────
 async function startBot() {
@@ -267,15 +249,25 @@ function setMsg(text, isError) {
 }
 
 function updateControls(running) {
-  document.getElementById('btn-start').disabled = running;
-  document.getElementById('btn-stop').disabled  = !running;
+  document.getElementById('btn-start').disabled   = running;
+  document.getElementById('btn-stop').disabled    = !running;
+  document.getElementById('btn-restart').disabled = !running;
+}
+
+async function restartBot() {
+  if (!confirm('Bot neu starten? Offene Positionen bleiben im Grid-State erhalten.')) return;
+  setMsg('Restarting…', false);
+  document.getElementById('btn-restart').disabled = true;
+  const res  = await fetch('/api/bot/restart', { method: 'POST',
+    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+  const data = await res.json();
+  setMsg(data.msg, !data.ok);
 }
 
 // ── Daten aktualisieren ───────────────────────────────────────────────────────
 async function refresh() {
-  const [summary, equity, trades] = await Promise.all([
+  const [summary, trades] = await Promise.all([
     fetch('/api/summary').then(r => r.json()),
-    fetch('/api/equity').then(r => r.json()),
     fetch('/api/trades?limit=30').then(r => r.json()),
   ]);
 
@@ -290,10 +282,6 @@ async function refresh() {
   setVal('today-pnl', fmt(summary.today_pnl) + ' USDT', summary.today_pnl < 0);
   document.getElementById('trades').textContent   = summary.trades;
   document.getElementById('win-rate').textContent = summary.win_rate;
-
-  equityChart.data.labels              = equity.map(e => e.timestamp.slice(11,16));
-  equityChart.data.datasets[0].data    = equity.map(e => e.capital);
-  equityChart.update();
 
   document.getElementById('trade-body').innerHTML = trades.map(t => `
     <tr>
@@ -332,9 +320,66 @@ es.onmessage = e => {
   if (s.capital) document.getElementById('capital').textContent = s.capital.toFixed(2) + ' USDT';
 };
 
+// ── Offene Positionen ─────────────────────────────────────────────────────────
+function renderOpenPositions(grids) {
+  const container = document.getElementById('open-positions-container');
+  const positions = [];
+
+  for (const g of grids) {
+    const cur = g.current_price;
+    for (const l of g.levels) {
+      if (l.side === 'sell' && l.bought_at != null && !l.filled && !l.pre_seeded) {
+        const pnlPct   = (cur - l.bought_at) / l.bought_at * 100;
+        const pnlUsdt  = (cur - l.bought_at) * (l.qty || 0);
+        const toTarget = (l.price - cur) / cur * 100;
+        positions.push({ symbol: g.symbol, bought_at: l.bought_at, sell_target: l.price,
+                         sl_price: l.sl_price, current: cur, qty: l.qty || 0,
+                         pnl_pct: pnlPct, pnl_usdt: pnlUsdt, to_target: toTarget });
+      }
+    }
+  }
+
+  if (!positions.length) {
+    container.innerHTML = '<p style="color:#555;font-size:13px;padding:8px 0">Keine offenen Positionen.</p>';
+    return;
+  }
+
+  positions.sort((a, b) => a.pnl_pct - b.pnl_pct);
+
+  const totalPnl = positions.reduce((s, p) => s + p.pnl_usdt, 0);
+  const sign = v => (v >= 0 ? '+' : '') + v.toFixed(2);
+  const fmtP = p => `<span class="${p >= 0 ? 'pos' : 'neg'}">${sign(p)}%</span>`;
+  const fmtU = u => `<span class="${u >= 0 ? 'pos' : 'neg'}">${sign(u)}</span>`;
+
+  container.innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Symbol</th><th>Kauf</th><th>Aktuell</th>
+        <th>Sell-Ziel</th><th>SL</th><th>Unreal. PnL</th><th>USDT</th><th>Bis Ziel</th>
+      </tr></thead>
+      <tbody>
+        ${positions.map(p => `<tr>
+          <td><b style="color:#00c896">${p.symbol}</b></td>
+          <td style="font-family:monospace">${p.bought_at.toFixed(4)}</td>
+          <td style="font-family:monospace">${p.current.toFixed(4)}</td>
+          <td style="font-family:monospace;color:#5599cc">${p.sell_target.toFixed(4)}</td>
+          <td style="font-family:monospace;color:#ff7777">${p.sl_price ? p.sl_price.toFixed(4) : '–'}</td>
+          <td>${fmtP(p.pnl_pct)}</td>
+          <td>${fmtU(p.pnl_usdt)}</td>
+          <td style="color:#888">${sign(p.to_target)}%</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+    <div style="font-size:12px;color:#888;margin-top:10px;display:flex;gap:20px">
+      <span>${positions.length} Position${positions.length !== 1 ? 'en' : ''}</span>
+      <span>Gesamt unreal.: ${fmtU(totalPnl)} USDT</span>
+    </div>`;
+}
+
 // ── Grid-Visualisierung ───────────────────────────────────────────────────────
 async function refreshGrids() {
   const grids = await fetch('/api/grids').then(r => r.json());
+  renderOpenPositions(grids);
   const container = document.getElementById('grids-container');
   document.getElementById('grid-section').style.display = grids.length ? '' : 'none';
 
@@ -476,7 +521,6 @@ async function setLeverage(val) {
   }
 }
 
-initChart();
 refresh();
 refreshGrids();
 loadLeverage();

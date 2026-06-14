@@ -110,6 +110,26 @@ def api_stop_graceful():
     return jsonify({"ok": True, "msg": msg})
 
 
+@app.route("/api/bot/restart", methods=["POST"])
+def api_restart():
+    data = request.get_json() or {}
+    mode = data.get("mode")
+    _stop_bot_process()
+    set_status(running=False)
+    time.sleep(1)
+    if not mode:
+        con = get_conn()
+        row = con.execute("SELECT mode FROM bot_status LIMIT 1").fetchone()
+        con.close()
+        mode = row["mode"] if row and row["mode"] else "paper"
+    cmd = [sys.executable, "main.py", "--mode", mode, "--no-confirm"]
+    global _bot_process
+    _bot_process = subprocess.Popen(cmd, cwd=str(_ROOT))
+    (_ROOT / ".bot.pid").write_text(str(_bot_process.pid))
+    set_status(running=True, mode=mode, strategy="grid")
+    return jsonify({"ok": True, "msg": f"Bot neu gestartet ({mode.upper()})"})
+
+
 @app.route("/api/shutdown", methods=["POST"])
 def api_shutdown():
     """Stoppt Bot + Dashboard komplett (nichts läuft danach im Hintergrund)."""
