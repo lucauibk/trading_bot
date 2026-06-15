@@ -57,6 +57,8 @@ class Engine:
         self._waiting_for_fills = False  # set True by wait_fills stop mode
         # Last known prices (updated every tick) — used for mark-to-market equity
         self._last_prices: Dict[str, float] = {}
+        # Cache last logged prediction per symbol to avoid writing on every 15s tick
+        self._last_logged_pred: Dict[str, str] = {}
 
     def run(self):
         logger.info("Engine starting | symbols=%s", self.symbols)
@@ -184,6 +186,7 @@ class Engine:
             self._update_dashboard(sym, price)
 
         self._log_equity()
+        self._update_prediction_outcomes(fetch_ohlcv)  # noqa: F821 (imported in _tick scope)
 
         # wait_fills auto-termination: stop once all sell-with-bought_at positions are closed
         if self._waiting_for_fills:
@@ -359,7 +362,7 @@ class Engine:
 
     def _update_dashboard(self, symbol: str, price: float):
         try:
-            from dashboard.db import update_grid_state
+            from dashboard.db import update_grid_state, log_prediction
             state = getattr(self.strategy, "get_state", lambda s: None)(symbol)
             if not state:
                 return
@@ -375,6 +378,20 @@ class Engine:
                 directional=state._directional or {},
                 floor_sl=getattr(state, "floor_sl", 0.0),
             )
+            # Log prediction only when it changes (avoids writing every 15s tick)
+            current_pred = state._last_prediction
+            if self._last_logged_pred.get(symbol) != current_pred:
+                try:
+                    log_prediction(
+                        symbol,
+                        current_pred,
+                        getattr(state, "_last_confidence", 0.0),
+                        getattr(state, "_last_pred_low", 0.0),
+                        getattr(state, "_last_pred_high", 0.0),
+                    )
+                    self._last_logged_pred[symbol] = current_pred
+                except Exception as e:
+                    logger.debug("log_prediction failed %s: %s", symbol, e)
         except Exception:
             pass
 
@@ -422,6 +439,16 @@ class Engine:
             update_capital(total)
         except Exception:
             pass
+
+    def _update_prediction_outcomes(self, fetch_ohlcv_fn):
+        """Füllt realized_high_6h/low_6h/hit für gereifte Predictions nach (alle ~15min)."""
+        if self._loop_count % GRID_REBUILD_CYCLES != 0:
+            return
+        try:
+            from dashboard.db import update_prediction_outcomes
+            update_prediction_outcomes(fetch_ohlcv_fn)
+        except Exception as e:
+            logger.debug("update_prediction_outcomes failed: %s", e)
 
     def _cleanup(self):
         try:
