@@ -206,10 +206,36 @@ class GridStrategy(Strategy):
                 state._hard_trend_down = False
                 logger.info("[TREND] %s downtrend cleared → grid buys resumed", state.symbol)
 
+    def _deployed_notional(self, state: _GridState) -> float:
+        """Aggregate leveraged notional of open (non-pre-seeded) grid positions.
+
+        Uses the same filter as _log_equity: not filled, side=sell, has bought_at,
+        not pre_seeded.  qty already bakes in leverage (qty = usdt*lev/price),
+        so qty*bought_at is the actual leveraged notional currently deployed.
+        """
+        total = 0.0
+        for o in state.orders.values():
+            if (not o.get("filled") and o.get("side") == "sell"
+                    and "bought_at" in o and not o.get("pre_seeded")):
+                total += o.get("qty", 0.0) * o["bought_at"]
+        return total
+
     def _buys_allowed(self, state: _GridState) -> bool:
         if not state.with_position:
             return False
         if self.p.trend_filter_enabled and state._hard_trend_down:
+            return False
+        # Inventory/exposure cap: block new buys when deployed leveraged notional
+        # reaches the threshold.  Auto-tightens with leverage (qty bakes in lev).
+        # Covers desired_orders emission + smart-replenish + (via engine cancel-on-
+        # absent) already-resting pending buys when the cap is freshly hit.
+        if self.p.max_inventory_notional_mult > 0 and \
+           self._deployed_notional(state) >= self.p.max_inventory_notional_mult * state.investment:
+            return False
+        # Optional confidence floor: skip buys if PricePredictor confidence is low.
+        # Note: NOT ml/predictor.py MIN_CONFIDENCE (different, unrelated gate).
+        if self.p.min_confidence_to_buy > 0 and \
+           state._last_confidence < self.p.min_confidence_to_buy:
             return False
         return True
 
@@ -378,7 +404,11 @@ class GridStrategy(Strategy):
         if idx is not None and idx < len(state.grid_lines) - 1:
             sell_price = state.grid_lines[idx + 1]
             if self.p.sl_mode == "floor" and state.floor_sl > 0:
-                sl_price = state.floor_sl
+                # Per-cohort mode: use the floor stamped at seeding time so each
+                # rebuild cohort has its own SL trigger.  A breach then only flushes
+                # that cohort, not all accumulated positions from every rebuild.
+                sl_price = (order.get("cohort_floor", state.floor_sl)
+                            if self.p.floor_sl_per_cohort else state.floor_sl)
             else:
                 step_pct = (sell_price - buy_price) / buy_price
                 sl_pct = max(step_pct * self.p.per_pos_sl_step_mult, self.p.per_pos_sl_min_pct)
@@ -747,8 +777,11 @@ class GridStrategy(Strategy):
             cid: o for cid, o in state.orders.items()
             if not o.get("filled") and o.get("side") == "sell" and "bought_at" in o
         }
-        # Floor ratchet: never lower an existing position's SL on rebuild
-        if self.p.sl_mode == "floor" and state.floor_sl > 0:
+        # Floor ratchet: never lower an existing position's SL on rebuild.
+        # Skipped in per-cohort mode — each cohort keeps its own floor from
+        # when it was seeded, so survivors should NOT be ratcheted to the
+        # new (potentially lower or different) global floor.
+        if self.p.sl_mode == "floor" and state.floor_sl > 0 and not self.p.floor_sl_per_cohort:
             for o in open_positions.values():
                 if "sl_price" in o:
                     o["sl_price"] = max(o["sl_price"], state.floor_sl)
@@ -757,6 +790,13 @@ class GridStrategy(Strategy):
         # Build new price → client_id map, recycling existing IDs where possible
         old_price_to_id = state.price_to_id
         state.price_to_id = {}
+
+        # Evaluate once — covers all three buy-creation paths (setup, desired_orders,
+        # smart-replenish) through this single gate.  Gating setup_grid here prevents
+        # monotone inventory accumulation during downtrends (B in the plan).  The
+        # engine's cancel-on-absent in _sync_orders will also retract any resting
+        # pending buys whose client_ids are absent from desired_orders after this.
+        buys_ok = self._buys_allowed(state)
 
         for i, gp in enumerate(grid_lines):
             # Reuse existing client_id for this price level if unchanged (avoids cancel-storm)
@@ -767,7 +807,17 @@ class GridStrategy(Strategy):
             qty = usdt * lev / gp
 
             if gp < price:
-                state.orders[cid] = {"side": "buy", "price": gp, "qty": qty, "filled": False}
+                if buys_ok:
+                    buy_order: dict = {"side": "buy", "price": gp, "qty": qty, "filled": False}
+                    # In per-cohort floor mode, stamp each buy with the current cohort's
+                    # floor so _handle_buy_fill can assign an individual sl_price.
+                    if self.p.floor_sl_per_cohort and self.p.sl_mode == "floor" and state.floor_sl > 0:
+                        buy_order["cohort_floor"] = state.floor_sl
+                    state.orders[cid] = buy_order
+                    state.price_to_id[gp] = cid
+                # else: buy seeding blocked by inventory cap or trend filter.
+                # desired_orders won't emit this level; engine _sync_orders will
+                # cancel any already-resting pending buy order at this price.
             else:
                 # Pre-seed sells above price so grid is two-sided from the start.
                 # bought_at = current price (not a grid line above price) so that:
@@ -778,7 +828,7 @@ class GridStrategy(Strategy):
                     "side": "sell", "price": gp, "qty": sell_qty, "filled": False,
                     "bought_at": price, "pre_seeded": True,
                 }
-            state.price_to_id[gp] = cid
+                state.price_to_id[gp] = cid
 
         logger.info("[GRID] Built %s: %.4f–%.4f | %d levels | ±%.1f%% | regime=%s | lev=%.1f×",
                     symbol, lower, upper, levels, range_pct * 100, regime, lev)

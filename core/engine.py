@@ -167,6 +167,15 @@ class Engine:
             self._reconcile_fills()
 
             if (out_of_range or do_rebuild) and hasattr(self.strategy, "setup_grid"):
+                # Note: setup_grid runs even during a daily-drawdown freeze because
+                # price can escape the grid while frozen.  setup_grid gates buy-seeding
+                # internally via _buys_allowed (inventory cap + trend filter).  Even if
+                # setup_grid seeds new buys, they won't be submitted to the broker while
+                # frozen because _sync_orders is blocked below (if not is_frozen()).
+                # on_tick_safety still fires SLs during freeze — intentional one-way
+                # liquidation.  The real prevention against cascade losses is the
+                # inventory cap (max_inventory_notional_mult) which stops accumulation
+                # before a cascade can form, regardless of freeze state.
                 self.strategy.setup_grid(sym, price, self.ctx)
 
             if not self.ctx.is_frozen():
@@ -364,6 +373,7 @@ class Engine:
                 confidence=state._last_confidence,
                 regime=state._last_regime,
                 directional=state._directional or {},
+                floor_sl=getattr(state, "floor_sl", 0.0),
             )
         except Exception:
             pass

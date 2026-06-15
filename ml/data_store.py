@@ -1,9 +1,12 @@
 import json
+import logging
 import sqlite3
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
+
+logger = logging.getLogger("ml.data_store")
 
 DB_PATH = Path("data/ml_training.db")
 
@@ -54,6 +57,9 @@ class MLDataStore:
             ).fetchall()
 
     def get_labeled(self, symbol: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        from .features.combined import ALL_FEATURE_NAMES
+        expected_dim = len(ALL_FEATURE_NAMES)  # 34
+
         q = "SELECT features, label FROM samples WHERE label IS NOT NULL"
         p: list = []
         if symbol:
@@ -63,10 +69,25 @@ class MLDataStore:
         with sqlite3.connect(DB_PATH) as c:
             rows = c.execute(q, p).fetchall()
         if not rows:
-            return np.empty((0, 16), np.float32), np.empty(0, np.int32)
-        X = np.array([json.loads(r[0]) for r in rows], np.float32)
-        y = np.array([r[1] for r in rows], np.int32)
-        return X, y
+            return np.empty((0, expected_dim), np.float32), np.empty(0, np.int32)
+
+        xs, ys, skipped = [], [], 0
+        for feat_json, label in rows:
+            feats = json.loads(feat_json)
+            if len(feats) != expected_dim:
+                skipped += 1
+                continue
+            xs.append(feats)
+            ys.append(label)
+
+        if skipped:
+            logger.debug(
+                "get_labeled: %d Zeilen mit falscher Dimension (erwartet %d) übersprungen",
+                skipped, expected_dim,
+            )
+        if not xs:
+            return np.empty((0, expected_dim), np.float32), np.empty(0, np.int32)
+        return np.array(xs, np.float32), np.array(ys, np.int32)
 
     def count_labeled(self, symbol: Optional[str] = None) -> int:
         q = "SELECT COUNT(*) FROM samples WHERE label IS NOT NULL"

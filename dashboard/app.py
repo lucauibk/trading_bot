@@ -234,8 +234,10 @@ def api_grids():
 
 @app.route("/api/summary", methods=["GET"])
 def api_summary():
-    session = _session_start()
-    con     = get_conn()
+    from datetime import datetime, timezone
+    session  = _session_start()
+    today_str = datetime.now(timezone.utc).date().isoformat()  # 'YYYY-MM-DD'
+    con      = get_conn()
     if session:
         total = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE timestamp >= ?", (session,)).fetchone()[0]
         count = con.execute("SELECT COUNT(*) FROM trades WHERE timestamp >= ?", (session,)).fetchone()[0]
@@ -244,10 +246,14 @@ def api_summary():
         total = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades").fetchone()[0]
         count = con.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
         wins  = con.execute("SELECT COUNT(*) FROM trades WHERE pnl > 0").fetchone()[0]
+    # today_pnl: trades since midnight UTC (ISO timestamp comparison is lexicographic)
+    today_pnl = con.execute(
+        "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE timestamp >= ?", (today_str,)
+    ).fetchone()[0]
     con.close()
     return jsonify({"total_pnl": total, "trades": count,
                     "win_rate": f"{wins/count*100:.1f}%" if count else "–",
-                    "today_pnl": total})
+                    "today_pnl": today_pnl})
 
 
 @app.route("/api/leverage", methods=["GET"])

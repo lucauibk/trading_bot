@@ -213,14 +213,22 @@ class ModelTrainer:
             self._maybe_retrain(symbol)
 
     def _maybe_retrain(self, symbol: str):
-        last_ts   = self._last_retrain_ts.get(symbol, 0)
-        new_count = self.store.count_new_labeled_since(last_ts)
-        if new_count < RETRAIN_EVERY_N:
-            return
+        try:
+            last_ts   = self._last_retrain_ts.get(symbol, 0)
+            new_count = self.store.count_new_labeled_since(last_ts)
+            if new_count < RETRAIN_EVERY_N:
+                return
 
-        X, y  = self.store.get_labeled(symbol)
-        model = self.models.get(symbol)
-        if model and len(X) >= model.MIN_SAMPLES:
-            model.train(X, y)
-            self._last_retrain_ts[symbol] = int(time.time())
-            logger.info("Retrain %s: %d Samples gesamt", symbol, len(X))
+            X, y  = self.store.get_labeled(symbol)
+            model = self.models.get(symbol)
+            if model and len(X) >= model.MIN_SAMPLES:
+                model.train(X, y)
+                self._last_retrain_ts[symbol] = int(time.time())
+                logger.info("Retrain %s: %d Samples gesamt", symbol, len(X))
+            elif model:
+                logger.debug(
+                    "Retrain %s übersprungen: nur %d saubere 34-Feature-Samples (min %d)",
+                    symbol, len(X), model.MIN_SAMPLES,
+                )
+        except Exception as e:
+            logger.error("Retrain fehlgeschlagen %s: %s", symbol, e, exc_info=True)

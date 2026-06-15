@@ -154,14 +154,30 @@ class TradingModel:
         if not self._model_path.exists():
             return
         try:
+            from .features.combined import ALL_FEATURE_NAMES
+            expected_dim = len(ALL_FEATURE_NAMES)  # 34
+
             self._clf = joblib.load(self._model_path)
             if self._meta_path.exists():
                 meta = json.loads(self._meta_path.read_text())
-                self._n_samples  = meta.get("n_samples", self.MIN_SAMPLES)
+                self._n_samples   = meta.get("n_samples", self.MIN_SAMPLES)
                 self._last_oos_f1 = meta.get("oos_f1", 0.0)
                 self._feature_names = meta.get("feature_names", [])
             else:
                 self._n_samples = self.MIN_SAMPLES
+
+            # Verwirf inkompatible Modelle (z.B. mit 16 statt 34 Features)
+            # damit Bootstrap beim nächsten Start frische 34-Feature-Modelle erzeugt.
+            if self._feature_names and len(self._feature_names) != expected_dim:
+                logger.warning(
+                    "Modell %s hat %d Features, erwartet %d – verwerfe stales Modell",
+                    self.symbol, len(self._feature_names), expected_dim,
+                )
+                self._clf           = None
+                self._n_samples     = 0
+                self._feature_names = []
+                return
+
             logger.info(
                 "Modell geladen: %s (%d Samples, OOS-F1=%.3f)",
                 self.symbol, self._n_samples, self._last_oos_f1,

@@ -116,6 +116,8 @@ def run_backtest(
                     symbol=order.symbol, side=order.side,
                     price=order.price, qty=order.qty,
                     post_only=order.post_only, client_id=cid,
+                    sl_price=order.sl_price,
+                    meta=order.meta,   # carries leverage + pre_seeded for correct margin accounting
                 )
 
         # Track equity including unrealized PnL of open positions — without it,

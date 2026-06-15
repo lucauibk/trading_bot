@@ -50,6 +50,25 @@ class GridParams:
     directional_tp_atr: float = 3.0
     directional_sl_atr: float = 1.5
 
+    # ── Inventory / Exposure governor ───────────────────────────────────
+    # Stop new grid buys when deployed leveraged notional ≥ mult × investment.
+    # qty already bakes in leverage (qty = usdt*lev/price), so the cap
+    # auto-tightens with leverage: at lev=3 a full grid ≈ 3× investment →
+    # mult=2.0 cuts new buys at ~⅔ deployment.  Set to 0 to disable.
+    # Sweep axis: {1.0, 1.5, 2.0, 3.0} — pick by OOS Calmar.
+    max_inventory_notional_mult: float = 2.0
+
+    # Stop new buys when PricePredictor/BB confidence < threshold (0.0 = off).
+    # NOTE: this is NOT ml/predictor.py MIN_CONFIDENCE (which gates rule-based
+    # fallback, not trades).  0.0 means disabled; sweep to find optimum.
+    min_confidence_to_buy: float = 0.0
+
+    # When True, each rebuild cohort's buys keep their own floor SL (stored
+    # at seeding time) instead of being ratcheted to the global floor on the
+    # next rebuild.  A single-price breach then only flushes one cohort rather
+    # than the entire accumulated inventory.  Default off (sweep to validate).
+    floor_sl_per_cohort: bool = False
+
     @property
     def regime_levels(self) -> dict:
         return dict(self.levels_by_regime)

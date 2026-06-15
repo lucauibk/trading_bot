@@ -118,8 +118,6 @@
     <div class="controls-row">
       <select id="sel-strategy">
         <option value="grid">Grid Bot</option>
-        <option value="ema">EMA Crossover</option>
-        <option value="rsi">RSI Mean Reversion</option>
       </select>
       <select id="sel-mode">
         <option value="paper">Paper Trading</option>
@@ -426,6 +424,23 @@ async function refreshGrids() {
       ? `<div style="font-size:10px;color:#555;margin-top:4px">Pred: ${g.predicted_low.toFixed(2)} – ${g.predicted_high.toFixed(2)}</div>`
       : '';
 
+    // ── Risk indicator: open inventory + deployed notional + distance to floor SL ──
+    const openLevels = (g.levels || []).filter(l =>
+      l.side === 'sell' && l.bought_at != null && !l.pre_seeded && !l.filled
+    );
+    const openPos = openLevels.length;
+    const deployedNotional = openLevels.reduce((s, l) => s + (l.qty || 0) * (l.bought_at || 0), 0);
+    const invPct = (g.investment > 0) ? deployedNotional / g.investment * 100 : 0;
+    const floorSl = g.floor_sl || 0;
+    const distFloor = (floorSl > 0 && price > 0) ? (price - floorSl) / price * 100 : null;
+    const riskColor = invPct > 150 ? '#ff4d4d' : invPct > 80 ? '#f0a500' : '#00c896';
+    const riskBadge = openPos > 0 ? `
+      <div style="padding:5px 10px;background:#0d1a1a;border:1px solid ${riskColor}55;border-radius:6px;font-size:11px;margin-bottom:6px;display:flex;gap:14px;flex-wrap:wrap;align-items:center">
+        <span style="color:${riskColor}">📦 ${openPos} Pos</span>
+        <span style="color:#aaa">Notional: <b style="color:#fff">${deployedNotional.toFixed(0)} USDT</b> (${invPct.toFixed(0)}% v. Invest.)</span>
+        ${distFloor !== null ? `<span style="color:${distFloor < 3 ? '#ff4d4d' : distFloor < 6 ? '#f0a500' : '#888'}">Floor-SL: ${distFloor.toFixed(1)}% weg</span>` : ''}
+      </div>` : '';
+
     const sorted = [...levels].sort((a, b) => b.price - a.price);
     let priceInserted = false;
     const rowParts = [];
@@ -482,6 +497,7 @@ async function refreshGrids() {
           <span style="color:${g.total_profit>=0?'#00c896':'#ff4d4d'}">${g.total_profit>=0?'+':''}${g.total_profit.toFixed(2)} USDT</span>
         </div>
         ${predRange}
+        ${riskBadge}
         ${dirBadge}
         <div style="margin:8px 0">${rows}</div>
         <div style="font-size:10px;color:#444;text-align:right">Stand: ${updatedAt}</div>

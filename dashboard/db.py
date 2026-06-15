@@ -141,6 +141,8 @@ def _init(con: sqlite3.Connection):
         ("predicted_high", "REAL DEFAULT 0"),
         ("confidence",     "REAL DEFAULT 0"),
         ("regime",         "TEXT DEFAULT ''"),
+        ("directional",    "TEXT DEFAULT '{}'"),
+        ("floor_sl",       "REAL DEFAULT 0"),
     ]:
         try:
             con.execute(f"ALTER TABLE grid_state ADD COLUMN {col} {coldef}")
@@ -291,15 +293,20 @@ def update_grid_state(symbol: str, current_price: float, orders: dict,
                       total_profit: float, trade_count: int, prediction: str = "",
                       predicted_low: float = 0.0, predicted_high: float = 0.0,
                       confidence: float = 0.0, regime: str = "",
-                      directional: dict = None):
+                      directional: dict = None, floor_sl: float = 0.0):
     import json
     from datetime import datetime
+    # Enrich per-level data: qty + sl_price + pre_seeded enable correct PnL
+    # calculation and pre-seed filtering in the dashboard's open-positions table.
     levels = [
         {
-            "price":     o["price"],
-            "side":      o["side"],
-            "filled":    o.get("filled", False),
-            "bought_at": o.get("bought_at"),
+            "price":      o["price"],
+            "side":       o["side"],
+            "filled":     o.get("filled", False),
+            "bought_at":  o.get("bought_at"),
+            "qty":        o.get("qty", 0.0),
+            "sl_price":   o.get("sl_price"),
+            "pre_seeded": o.get("pre_seeded", False),
         }
         for o in sorted(orders.values(), key=lambda x: x.get("price", 0), reverse=True)
         if isinstance(o.get("price"), (int, float))
@@ -309,8 +316,8 @@ def update_grid_state(symbol: str, current_price: float, orders: dict,
         """INSERT INTO grid_state
                (symbol, current_price, levels, range_pct, investment,
                 total_profit, trade_count, prediction, updated_at,
-                predicted_low, predicted_high, confidence, regime, directional)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                predicted_low, predicted_high, confidence, regime, directional, floor_sl)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(symbol) DO UPDATE SET
                current_price=excluded.current_price,
                levels=excluded.levels,
@@ -324,11 +331,12 @@ def update_grid_state(symbol: str, current_price: float, orders: dict,
                predicted_high=excluded.predicted_high,
                confidence=excluded.confidence,
                regime=excluded.regime,
-               directional=excluded.directional""",
+               directional=excluded.directional,
+               floor_sl=excluded.floor_sl""",
         (symbol, current_price, json.dumps(levels), range_pct, investment,
          total_profit, trade_count, prediction, datetime.utcnow().isoformat(),
          predicted_low, predicted_high, confidence, regime,
-         json.dumps(directional or {}))
+         json.dumps(directional or {}), floor_sl)
     )
     con.commit()
     con.close()

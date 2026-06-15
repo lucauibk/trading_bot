@@ -92,8 +92,13 @@ class MLPredictor:
                 ts = int(time.time())
                 if self._trainer:
                     self._trainer.record(symbol, ts, feats, price, label_int)
-                    self._retrain_executor.submit(
+                    future = self._retrain_executor.submit(
                         self._trainer.label_and_maybe_retrain, symbol, df
+                    )
+                    future.add_done_callback(
+                        lambda f: logger.error(
+                            "Retrain-Thread %s abgestürzt: %s", symbol, f.exception()
+                        ) if f.exception() else None
                     )
 
             # LLM-Analyse (gecacht, ~1×/Stunde pro Coin)
