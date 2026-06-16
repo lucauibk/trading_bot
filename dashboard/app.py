@@ -107,6 +107,18 @@ def api_stop_graceful():
     return jsonify({"ok": True, "msg": msg})
 
 
+@app.route("/api/stats/reset", methods=["POST"])
+def api_stats_reset():
+    """Setzt Trade-Anzahl/Gesamt-PnL/Heute im Dashboard auf 0 zurück.
+
+    Bewusst getrennt von Bot-Start/Restart (anders als die alte session_start-
+    Logik) — die DB-Historie bleibt unangetastet, nur die Anzeige zählt neu.
+    """
+    from dashboard.db import reset_stats
+    reset_stats()
+    return jsonify({"ok": True, "msg": "Statistik zurückgesetzt"})
+
+
 @app.route("/api/bot/restart", methods=["POST"])
 def api_restart():
     data = request.get_json() or {}
@@ -175,23 +187,42 @@ def api_status():
     return jsonify(data)
 
 
+def _stats_reset_at():
+    from dashboard.db import get_stats_reset_at
+    return get_stats_reset_at()
+
+
 @app.route("/api/trades", methods=["GET"])
 def api_trades():
-    limit = request.args.get("limit", 50, type=int)
-    con   = get_conn()
-    rows = con.execute(
-        "SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)
-    ).fetchall()
+    limit    = request.args.get("limit", 50, type=int)
+    reset_at = _stats_reset_at()
+    con      = get_conn()
+    if reset_at:
+        rows = con.execute(
+            "SELECT * FROM trades WHERE timestamp >= ? ORDER BY id DESC LIMIT ?",
+            (reset_at, limit)
+        ).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
     con.close()
     return jsonify([dict(r) for r in rows])
 
 
 @app.route("/api/equity", methods=["GET"])
 def api_equity():
-    con  = get_conn()
-    rows = con.execute(
-        "SELECT timestamp, capital FROM equity ORDER BY id DESC LIMIT 200"
-    ).fetchall()
+    reset_at = _stats_reset_at()
+    con      = get_conn()
+    if reset_at:
+        rows = con.execute(
+            "SELECT timestamp, capital FROM equity WHERE timestamp >= ? ORDER BY id DESC LIMIT 200",
+            (reset_at,)
+        ).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT timestamp, capital FROM equity ORDER BY id DESC LIMIT 200"
+        ).fetchall()
     con.close()
     return jsonify(list(reversed([dict(r) for r in rows])))
 
@@ -215,13 +246,21 @@ def api_grids():
 def api_summary():
     from datetime import datetime, timezone
     today_str = datetime.now(timezone.utc).date().isoformat()  # 'YYYY-MM-DD'
-    con   = get_conn()
-    total = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades").fetchone()[0]
-    count = con.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-    wins  = con.execute("SELECT COUNT(*) FROM trades WHERE pnl > 0").fetchone()[0]
-    # today_pnl: trades since midnight UTC (ISO timestamp comparison is lexicographic)
+    reset_at  = _stats_reset_at()
+    con = get_conn()
+    if reset_at:
+        total = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE timestamp >= ?", (reset_at,)).fetchone()[0]
+        count = con.execute("SELECT COUNT(*) FROM trades WHERE timestamp >= ?", (reset_at,)).fetchone()[0]
+        wins  = con.execute("SELECT COUNT(*) FROM trades WHERE timestamp >= ? AND pnl > 0", (reset_at,)).fetchone()[0]
+    else:
+        total = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades").fetchone()[0]
+        count = con.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        wins  = con.execute("SELECT COUNT(*) FROM trades WHERE pnl > 0").fetchone()[0]
+    # today_pnl: since midnight UTC, or since reset if that happened later today
+    # (ISO timestamp comparison is lexicographic, so max() works as a string op)
+    today_cutoff = max(today_str, reset_at) if reset_at else today_str
     today_pnl = con.execute(
-        "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE timestamp >= ?", (today_str,)
+        "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE timestamp >= ?", (today_cutoff,)
     ).fetchone()[0]
     con.close()
     return jsonify({"total_pnl": total, "trades": count,

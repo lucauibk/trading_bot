@@ -161,6 +161,7 @@ def _init(con: sqlite3.Connection):
             pass
     for col, coldef in [
         ("stop_mode", "TEXT DEFAULT NULL"),
+        ("stats_reset_at", "TEXT DEFAULT NULL"),
     ]:
         try:
             con.execute(f"ALTER TABLE bot_status ADD COLUMN {col} {coldef}")
@@ -433,3 +434,25 @@ def get_stop_mode():
     row = con.execute("SELECT stop_mode FROM bot_status WHERE id=1").fetchone()
     con.close()
     return row["stop_mode"] if row else None
+
+
+def reset_stats():
+    """Setzt den Reset-Zeitpunkt für die Dashboard-Statistik (Trades/PnL/Heute) auf jetzt.
+
+    Die Trades bleiben in der DB erhalten — nur die Anzeige zählt ab diesem
+    Zeitpunkt neu (siehe dashboard/app.py: /api/trades, /api/equity, /api/summary).
+    """
+    from datetime import datetime
+    now = datetime.utcnow().isoformat()
+    con = get_conn()
+    con.execute("UPDATE bot_status SET stats_reset_at=? WHERE id=1", (now,))
+    con.commit()
+    con.close()
+    return now
+
+
+def get_stats_reset_at():
+    con = get_conn()
+    row = con.execute("SELECT stats_reset_at FROM bot_status WHERE id=1").fetchone()
+    con.close()
+    return row["stats_reset_at"] if row else None

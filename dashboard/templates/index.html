@@ -5,59 +5,152 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Trading Bot Dashboard</title>
 <style>
+  :root {
+    --bg:        #0b0c14;
+    --bg-soft:   #11131f;
+    --card:      #161827;
+    --card-2:    #1b1e30;
+    --border:    #262a42;
+    --border-hi: #3a3f60;
+    --text:      #e7e9f3;
+    --text-dim:  #8b8fa8;
+    --text-faint:#5a5e78;
+    --green:     #00d9a3;
+    --green-dim: rgba(0,217,163,.13);
+    --red:       #ff5c72;
+    --red-dim:   rgba(255,92,114,.13);
+    --orange:    #ffb648;
+    --orange-dim:rgba(255,182,72,.13);
+    --blue:      #5b9cf6;
+    --blue-dim:  rgba(91,156,246,.13);
+    --radius:    14px;
+    --shadow:    0 4px 18px rgba(0,0,0,.35);
+  }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'Segoe UI', Arial, sans-serif; background: #0f0f1a; color: #e0e0e0; }
-  header { background: #16213e; padding: 16px 24px; display: flex; align-items: center; gap: 16px; border-bottom: 1px solid #2a2a4a; flex-wrap: wrap; }
-  header h1 { font-size: 20px; color: #00c896; }
-  .badge { padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: bold; }
-  .badge.running  { background: #00c896; color: #000; }
-  .badge.stopped  { background: #ff4d4d; color: #fff; }
-  .badge.paper    { background: #f0a500; color: #000; }
-  .badge.live     { background: #ff4d4d; color: #fff; }
-  main { padding: 24px; max-width: 1400px; margin: 0 auto; }
-  .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
-  .card { background: #16213e; border-radius: 12px; padding: 20px; border: 1px solid #2a2a4a; }
-  .card .label { font-size: 12px; color: #888; margin-bottom: 6px; text-transform: uppercase; }
-  .card .value { font-size: 28px; font-weight: bold; color: #00c896; }
-  .card .value.neg { color: #ff4d4d; }
-  .chart-card { background: #16213e; border-radius: 12px; padding: 20px; border: 1px solid #2a2a4a; margin-bottom: 24px; }
-  .chart-card h2 { font-size: 13px; color: #888; margin-bottom: 16px; text-transform: uppercase; letter-spacing: 1px; }
+  body {
+    font-family: -apple-system, 'Segoe UI', Inter, Arial, sans-serif;
+    background: radial-gradient(ellipse 1200px 600px at 50% -10%, #161a2e 0%, var(--bg) 60%);
+    color: var(--text);
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 8px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--border-hi); }
+
+  header {
+    position: sticky; top: 0; z-index: 50;
+    background: rgba(15,17,28,.82); backdrop-filter: blur(12px);
+    padding: 14px 28px; display: flex; align-items: center; gap: 14px;
+    border-bottom: 1px solid var(--border); flex-wrap: wrap;
+  }
+  header h1 { font-size: 17px; font-weight: 700; color: var(--text); letter-spacing:-.2px; }
+
+  .badge {
+    padding: 5px 13px; border-radius: 20px; font-size: 11px; font-weight: 700;
+    letter-spacing: .3px; display: inline-flex; align-items: center; gap: 7px;
+  }
+  .badge.running  { background: var(--green-dim); color: var(--green); }
+  .badge.running::before {
+    content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--green);
+    box-shadow: 0 0 6px var(--green); animation: pulse 1.6s ease-in-out infinite;
+  }
+  .badge.stopped  { background: var(--red-dim); color: var(--red); }
+  .badge.paper    { background: var(--orange-dim); color: var(--orange); }
+  .badge.live     { background: var(--red-dim); color: var(--red); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+
+  main { padding: 28px; max-width: 1440px; margin: 0 auto; }
+
+  .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .card {
+    background: linear-gradient(160deg, var(--card), var(--card-2));
+    border-radius: var(--radius); padding: 18px 20px; border: 1px solid var(--border);
+    box-shadow: var(--shadow); transition: transform .15s ease, border-color .15s ease;
+  }
+  .card:hover { transform: translateY(-2px); border-color: var(--border-hi); }
+  .card .label {
+    font-size: 11px; color: var(--text-dim); margin-bottom: 8px; text-transform: uppercase;
+    letter-spacing: .6px; display: flex; align-items: center; gap: 6px;
+  }
+  .card .value { font-size: 26px; font-weight: 700; color: var(--green); letter-spacing: -.3px; }
+  .card .value.neg { color: var(--red); }
+
+  .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; gap: 12px; flex-wrap: wrap; }
+  .section-head h2 { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1.2px; font-weight: 700; }
+
+  .chart-card { background: var(--card); border-radius: var(--radius); padding: 22px; border: 1px solid var(--border); margin-bottom: 24px; box-shadow: var(--shadow); }
+
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { background: #0f0f1a; padding: 10px 12px; text-align: left; color: #00c896; font-size: 11px; text-transform: uppercase; }
-  td { padding: 10px 12px; border-bottom: 1px solid #1a1a2e; }
-  tr:hover td { background: #1e2a4a; }
-  .pos { color: #00c896; } .neg { color: #ff4d4d; }
-  .updated { font-size: 11px; color: #555; margin-left: auto; }
+  th {
+    background: var(--bg-soft); padding: 11px 14px; text-align: left; color: var(--text-dim);
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: .6px; position: sticky; top: 0;
+  }
+  td { padding: 11px 14px; border-bottom: 1px solid #1d2034; }
+  tbody tr { transition: background .12s; }
+  tbody tr:nth-child(even) td { background: rgba(255,255,255,.015); }
+  tbody tr:hover td { background: #1d2036; }
+  .pos { color: var(--green); font-weight: 600; } .neg { color: var(--red); font-weight: 600; }
+  .updated { font-size: 11px; color: var(--text-faint); margin-left: auto; }
+  .table-scroll { max-height: 420px; overflow-y: auto; border-radius: 8px; }
 
   /* ── Bot Controls ── */
-  .controls { background: #16213e; border-radius: 12px; padding: 20px; border: 1px solid #2a2a4a; margin-bottom: 24px; }
-  .controls h2 { font-size: 13px; color: #888; margin-bottom: 16px; text-transform: uppercase; letter-spacing: 1px; }
+  .controls { background: var(--card); border-radius: var(--radius); padding: 22px; border: 1px solid var(--border); margin-bottom: 24px; box-shadow: var(--shadow); }
   .controls-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-  select { background: #0f0f1a; color: #e0e0e0; border: 1px solid #2a2a4a; padding: 10px 14px; border-radius: 8px; font-size: 14px; cursor: pointer; }
-  select:focus { outline: none; border-color: #00c896; }
-  .btn { padding: 10px 24px; border: none; border-radius: 8px; font-size: 14px; font-weight: bold; cursor: pointer; transition: opacity .2s; }
-  .btn:hover { opacity: 0.85; }
-  .btn-start    { background: #00c896; color: #000; }
-  .btn-stop     { background: #ff4d4d; color: #fff; }
-  .btn-restart  { background: #f0a500; color: #000; }
-  .btn-shutdown { background: #555; color: #fff; }
-  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  .msg { font-size: 13px; color: #888; margin-top: 8px; min-height: 20px; }
+  select {
+    background: var(--bg-soft); color: var(--text); border: 1px solid var(--border);
+    padding: 10px 14px; border-radius: 9px; font-size: 13.5px; cursor: pointer; transition: border-color .15s;
+  }
+  select:hover { border-color: var(--border-hi); }
+  select:focus { outline: none; border-color: var(--blue); }
+
+  .btn {
+    padding: 10px 20px; border: none; border-radius: 9px; font-size: 13.5px; font-weight: 600;
+    cursor: pointer; transition: opacity .15s, transform .08s; display: inline-flex; align-items: center; gap: 7px;
+  }
+  .btn:hover { opacity: .88; } .btn:active { transform: scale(.97); }
+  .btn-start    { background: var(--green); color: #04140f; }
+  .btn-stop     { background: var(--red); color: #fff; }
+  .btn-restart  { background: var(--orange); color: #1a1200; }
+  .btn-shutdown { background: #34395c; color: #fff; }
+  .btn-ghost    { background: transparent; color: var(--text-dim); border: 1px solid var(--border); }
+  .btn-ghost:hover { color: var(--text); border-color: var(--border-hi); opacity: 1; }
+  .btn-sm       { padding: 7px 14px; font-size: 12.5px; }
+  .btn:disabled { opacity: .35; cursor: not-allowed; }
+  .msg { font-size: 13px; margin-top: 10px; min-height: 20px; transition: color .2s; }
 
   .toggle { position: relative; display: inline-block; width: 36px; height: 20px; }
   .toggle input { opacity: 0; width: 0; height: 0; }
   .slider { position: absolute; inset: 0; background: #444; border-radius: 20px; cursor: pointer; transition: .2s; }
   .slider:before { content: ''; position: absolute; height: 14px; width: 14px; left: 3px; bottom: 3px; background: white; border-radius: 50%; transition: .2s; }
-  input:checked + .slider { background: #00c896; }
+  input:checked + .slider { background: var(--green); }
   input:checked + .slider:before { transform: translateX(16px); }
 
-  /* ── Live-Confirmation Modal ── */
-  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 100; align-items: center; justify-content: center; }
+  /* ── Modals ── */
+  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(5,6,12,.75); backdrop-filter: blur(3px); z-index: 100; align-items: center; justify-content: center; }
   .modal-overlay.active { display: flex; }
-  .modal { background: #16213e; border: 1px solid #ff4d4d; border-radius: 12px; padding: 32px; max-width: 420px; text-align: center; }
-  .modal h3 { color: #ff4d4d; margin-bottom: 12px; }
-  .modal p  { color: #aaa; font-size: 14px; margin-bottom: 24px; line-height: 1.6; }
+  .modal {
+    background: var(--card); border: 1px solid var(--red); border-radius: var(--radius);
+    padding: 32px; max-width: 420px; text-align: center; box-shadow: 0 12px 44px rgba(0,0,0,.55);
+    animation: pop .15s ease;
+  }
+  @keyframes pop { from { transform: scale(.96); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+  .modal h3 { color: var(--red); margin-bottom: 12px; font-size: 18px; }
+  .modal p  { color: var(--text-dim); font-size: 14px; margin-bottom: 24px; line-height: 1.6; }
   .modal-btns { display: flex; gap: 12px; justify-content: center; }
+
+  .empty-state { color: var(--text-faint); font-size: 13px; padding: 22px 0; text-align: center; }
+
+  .grids-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .grid-card { background: var(--bg-soft); border-radius: 12px; padding: 16px; border: 1px solid var(--border); transition: border-color .15s; }
+  .grid-card:hover { border-color: var(--border-hi); }
+  .grid-levels { margin: 10px 0; max-height: 280px; overflow-y: auto; padding-right: 4px; }
+
+  @media (max-width: 640px) {
+    header, main { padding: 16px; }
+    .modal { padding: 24px; }
+  }
 </style>
 </head>
 <body>
@@ -71,10 +164,10 @@
       <button class="btn btn-stop" onclick="stopGraceful('sell_all')">
         💰 Sofort alle Positionen verkaufen
       </button>
-      <button class="btn" style="background:#e6a817;color:#fff;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-size:14px" onclick="stopGraceful('wait_fills')">
+      <button class="btn" style="background:var(--orange);color:#1a1200" onclick="stopGraceful('wait_fills')">
         ⏳ Auf Grid-Fills warten, dann beenden
       </button>
-      <button class="btn" style="background:#555;color:#fff;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-size:14px" onclick="closeStopModal()">
+      <button class="btn btn-ghost" onclick="closeStopModal()">
         Abbrechen
       </button>
     </div>
@@ -85,10 +178,10 @@
 <div class="modal-overlay" id="confirm-modal">
   <div class="modal">
     <h3>⚠️ LIVE TRADING</h3>
-    <p>Du bist dabei, den Bot mit <b>echtem Geld</b> zu starten.<br>
+    <p>Du bist dabei, den Bot mit <b style="color:var(--text)">echtem Geld</b> zu starten.<br>
        Verluste sind möglich. Bist du sicher?</p>
     <div class="modal-btns">
-      <button class="btn btn-stop" onclick="closeModal()">Abbrechen</button>
+      <button class="btn btn-ghost" onclick="closeModal()">Abbrechen</button>
       <button class="btn btn-start" onclick="confirmStart()">Ja, starten</button>
     </div>
   </div>
@@ -98,23 +191,29 @@
   <h1>🤖 Trading Bot</h1>
   <span id="status-badge" class="badge stopped">STOPPED</span>
   <span id="mode-badge"   class="badge paper">PAPER</span>
-  <span id="strat-badge"  class="badge" style="background:#2a2a6a">GRID</span>
+  <span id="strat-badge"  class="badge" style="background:var(--blue-dim);color:var(--blue)">GRID</span>
   <span class="updated" id="updated">–</span>
 </header>
 
 <main>
   <!-- KPI-Karten -->
+  <div class="section-head">
+    <h2>📊 Performance</h2>
+    <button class="btn btn-ghost btn-sm" onclick="resetStats()">↺ Statistik zurücksetzen</button>
+  </div>
   <div class="kpi-grid">
-    <div class="card"><div class="label">Gesamt PnL</div><div class="value" id="total-pnl">–</div></div>
-    <div class="card"><div class="label">Heute</div><div class="value" id="today-pnl">–</div></div>
-    <div class="card"><div class="label">Trades</div><div class="value" id="trades">–</div></div>
-    <div class="card"><div class="label">Win-Rate</div><div class="value" id="win-rate">–</div></div>
-    <div class="card"><div class="label">Kapital</div><div class="value" id="capital">–</div></div>
+    <div class="card"><div class="label">💹 Gesamt PnL</div><div class="value" id="total-pnl">–</div></div>
+    <div class="card"><div class="label">📅 Heute</div><div class="value" id="today-pnl">–</div></div>
+    <div class="card"><div class="label">🔁 Trades</div><div class="value" id="trades">–</div></div>
+    <div class="card"><div class="label">🎯 Win-Rate</div><div class="value" id="win-rate">–</div></div>
+    <div class="card"><div class="label">💰 Kapital</div><div class="value" id="capital">–</div></div>
   </div>
 
   <!-- Bot Controls -->
   <div class="controls">
-    <h2>Bot steuern</h2>
+    <div class="section-head" style="margin-bottom:16px">
+      <h2>🎛️ Bot steuern</h2>
+    </div>
     <div class="controls-row">
       <select id="sel-strategy">
         <option value="grid">Grid Bot</option>
@@ -128,15 +227,15 @@
       <button class="btn btn-restart"  id="btn-restart" onclick="restartBot()" disabled>↺ Restart</button>
       <button class="btn btn-shutdown" onclick="shutdownAll()" title="Bot + Dashboard komplett beenden">⏻ Alles beenden</button>
     </div>
-    <div style="margin-top:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-      <span style="font-size:13px;color:#888">Hebel:</span>
+    <div style="margin-top:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <span style="font-size:13px;color:var(--text-dim)">Hebel:</span>
       <select id="leverage-select" onchange="setLeverage(this.value)" style="width:auto">
         <option value="1.0">1× – kein Hebel (sicher)</option>
         <option value="2.0">2× – moderater Hebel</option>
         <option value="3.0">3× – aggressiv</option>
       </select>
-      <span id="leverage-badge" class="badge" style="background:#2a2a6a;color:#aaa">1×</span>
-      <span style="font-size:11px;color:#555" id="leverage-msg"></span>
+      <span id="leverage-badge" class="badge" style="background:var(--blue-dim);color:var(--text-dim)">1×</span>
+      <span style="font-size:11px;color:var(--text-faint)" id="leverage-msg"></span>
     </div>
     <div class="msg" id="ctrl-msg"></div>
   </div>
@@ -144,28 +243,30 @@
 
   <!-- Offene Positionen -->
   <div class="chart-card">
-    <h2>Offene Positionen</h2>
+    <div class="section-head"><h2>📦 Offene Positionen</h2></div>
     <div id="open-positions-container">
-      <p style="color:#555;font-size:13px;padding:8px 0">Keine offenen Positionen.</p>
+      <p class="empty-state">Keine offenen Positionen.</p>
     </div>
   </div>
 
   <!-- Grid-Visualisierung -->
   <div class="chart-card" id="grid-section">
-    <h2>Aktive Grids</h2>
-    <div id="grids-container" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px"></div>
+    <div class="section-head"><h2>🧩 Aktive Grids</h2></div>
+    <div id="grids-container" class="grids-list"></div>
   </div>
 
   <!-- Trade-History -->
   <div class="chart-card">
-    <h2>Trade-History</h2>
-    <table>
-      <thead><tr>
-        <th>Zeit</th><th>Symbol</th><th>Richtung</th>
-        <th>Entry</th><th>Exit</th><th>PnL</th><th>Grund</th><th>Modus</th>
-      </tr></thead>
-      <tbody id="trade-body"></tbody>
-    </table>
+    <div class="section-head"><h2>📜 Trade-History</h2></div>
+    <div class="table-scroll">
+      <table>
+        <thead><tr>
+          <th>Zeit</th><th>Symbol</th><th>Richtung</th>
+          <th>Entry</th><th>Exit</th><th>PnL</th><th>Grund</th><th>Modus</th>
+        </tr></thead>
+        <tbody id="trade-body"></tbody>
+      </table>
+    </div>
   </div>
 </main>
 
@@ -240,10 +341,19 @@ async function shutdownAll() {
   document.querySelector('.btn-shutdown').disabled = true;
 }
 
+// ── Statistik zurücksetzen ───────────────────────────────────────────────────
+async function resetStats() {
+  if (!confirm('Trade-Anzahl, Gesamt PnL und Heute im Dashboard auf 0 zurücksetzen?\n\nDie Trade-History in der Datenbank bleibt erhalten — nur die Anzeige zählt ab jetzt neu.')) return;
+  const res  = await fetch('/api/stats/reset', { method: 'POST' });
+  const data = await res.json();
+  setMsg(data.msg || 'Zurückgesetzt', !data.ok);
+  refresh();
+}
+
 function setMsg(text, isError) {
   const el = document.getElementById('ctrl-msg');
   el.textContent = text;
-  el.style.color = isError ? '#ff4d4d' : '#00c896';
+  el.style.color = isError ? 'var(--red)' : 'var(--green)';
 }
 
 function updateControls(running) {
@@ -291,7 +401,7 @@ async function refresh() {
       <td class="${t.pnl>=0?'pos':'neg'}">${t.pnl>=0?'+':''}${t.pnl.toFixed(2)}</td>
       <td>${t.reason}</td>
       <td>${t.mode||'–'}</td>
-    </tr>`).join('');
+    </tr>`).join('') || `<tr><td colspan="8" style="text-align:center;color:var(--text-faint);padding:24px 0">Noch keine Trades.</td></tr>`;
 
   document.getElementById('updated').textContent =
     'aktualisiert ' + new Date().toLocaleTimeString('de');
@@ -338,7 +448,7 @@ function renderOpenPositions(grids) {
   }
 
   if (!positions.length) {
-    container.innerHTML = '<p style="color:#555;font-size:13px;padding:8px 0">Keine offenen Positionen.</p>';
+    container.innerHTML = '<p class="empty-state">Keine offenen Positionen.</p>';
     return;
   }
 
@@ -350,25 +460,27 @@ function renderOpenPositions(grids) {
   const fmtU = u => `<span class="${u >= 0 ? 'pos' : 'neg'}">${sign(u)}</span>`;
 
   container.innerHTML = `
-    <table>
-      <thead><tr>
-        <th>Symbol</th><th>Kauf</th><th>Aktuell</th>
-        <th>Sell-Ziel</th><th>SL</th><th>Unreal. PnL</th><th>USDT</th><th>Bis Ziel</th>
-      </tr></thead>
-      <tbody>
-        ${positions.map(p => `<tr>
-          <td><b style="color:#00c896">${p.symbol}</b></td>
-          <td style="font-family:monospace">${p.bought_at.toFixed(4)}</td>
-          <td style="font-family:monospace">${p.current.toFixed(4)}</td>
-          <td style="font-family:monospace;color:#5599cc">${p.sell_target.toFixed(4)}</td>
-          <td style="font-family:monospace;color:#ff7777">${p.sl_price ? p.sl_price.toFixed(4) : '–'}</td>
-          <td>${fmtP(p.pnl_pct)}</td>
-          <td>${fmtU(p.pnl_usdt)}</td>
-          <td style="color:#888">${sign(p.to_target)}%</td>
-        </tr>`).join('')}
-      </tbody>
-    </table>
-    <div style="font-size:12px;color:#888;margin-top:10px;display:flex;gap:20px">
+    <div class="table-scroll">
+      <table>
+        <thead><tr>
+          <th>Symbol</th><th>Kauf</th><th>Aktuell</th>
+          <th>Sell-Ziel</th><th>SL</th><th>Unreal. PnL</th><th>USDT</th><th>Bis Ziel</th>
+        </tr></thead>
+        <tbody>
+          ${positions.map(p => `<tr>
+            <td><b style="color:var(--green)">${p.symbol}</b></td>
+            <td style="font-family:monospace">${p.bought_at.toFixed(4)}</td>
+            <td style="font-family:monospace">${p.current.toFixed(4)}</td>
+            <td style="font-family:monospace;color:var(--blue)">${p.sell_target.toFixed(4)}</td>
+            <td style="font-family:monospace;color:var(--red)">${p.sl_price ? p.sl_price.toFixed(4) : '–'}</td>
+            <td>${fmtP(p.pnl_pct)}</td>
+            <td>${fmtU(p.pnl_usdt)}</td>
+            <td style="color:var(--text-dim)">${sign(p.to_target)}%</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+    <div style="font-size:12px;color:var(--text-dim);margin-top:10px;display:flex;gap:20px">
       <span>${positions.length} Position${positions.length !== 1 ? 'en' : ''}</span>
       <span>Gesamt unreal.: ${fmtU(totalPnl)} USDT</span>
     </div>`;
@@ -389,16 +501,16 @@ async function refreshGrids() {
     const range  = max_p - min_p || 1;
 
     // Vorhersage-Badges
-    const mlColor   = g.prediction === 'up' ? '#00c896' : g.prediction === 'down' ? '#ff4d4d' : '#888';
+    const mlColor   = g.prediction === 'up' ? '#00d9a3' : g.prediction === 'down' ? '#ff5c72' : '#8b8fa8';
     const mlBadge   = g.prediction
       ? `<span style="font-size:10px;padding:2px 7px;border-radius:10px;background:${mlColor}22;color:${mlColor};border:1px solid ${mlColor}44">ML: ${g.prediction.toUpperCase()}</span>`
       : '';
-    const regColor  = g.regime === 'trending' ? '#f0a500' : g.regime === 'volatile' ? '#ff4d4d' : '#00c896';
+    const regColor  = g.regime === 'trending' ? '#ffb648' : g.regime === 'volatile' ? '#ff5c72' : '#00d9a3';
     const regBadge  = g.regime
       ? `<span style="font-size:10px;padding:2px 7px;border-radius:10px;background:${regColor}22;color:${regColor};border:1px solid ${regColor}44">${g.regime.toUpperCase()}</span>`
       : '';
     const confBadge = g.confidence > 0
-      ? `<span style="font-size:10px;color:#666">Conf: ${(g.confidence*100).toFixed(0)}%</span>`
+      ? `<span style="font-size:10px;color:var(--text-faint)">Conf: ${(g.confidence*100).toFixed(0)}%</span>`
       : '';
 
     // Directional Trade Badge
@@ -406,22 +518,22 @@ async function refreshGrids() {
     if (g.directional && g.directional.entry) {
       const d = g.directional;
       const pnlPct = ((g.current_price - d.entry) / d.entry * 100).toFixed(2);
-      const pnlColor = pnlPct >= 0 ? '#00c896' : '#ff4d4d';
+      const pnlColor = pnlPct >= 0 ? 'var(--green)' : 'var(--red)';
       const pnlSign  = pnlPct >= 0 ? '+' : '';
       dirBadge = `
-        <div style="margin-top:8px;padding:8px 10px;background:#1a1a0a;border:1px solid #f0a50044;border-radius:8px;font-size:11px">
-          <div style="color:#f0a500;font-weight:bold;margin-bottom:4px">⚡ DIRECTIONAL AKTIV</div>
-          <div style="display:flex;gap:12px;flex-wrap:wrap;color:#aaa">
-            <span>Einstieg: <b style="color:#fff">${d.entry.toFixed(4)}</b></span>
-            <span>TP: <b style="color:#00c896">${d.tp.toFixed(4)}</b></span>
-            <span>SL: <b style="color:#ff4d4d">${d.sl.toFixed(4)}</b></span>
+        <div style="margin-top:8px;padding:8px 10px;background:var(--orange-dim);border:1px solid #ffb64844;border-radius:8px;font-size:11px">
+          <div style="color:var(--orange);font-weight:bold;margin-bottom:4px">⚡ DIRECTIONAL AKTIV</div>
+          <div style="display:flex;gap:12px;flex-wrap:wrap;color:var(--text-dim)">
+            <span>Einstieg: <b style="color:var(--text)">${d.entry.toFixed(4)}</b></span>
+            <span>TP: <b style="color:var(--green)">${d.tp.toFixed(4)}</b></span>
+            <span>SL: <b style="color:var(--red)">${d.sl.toFixed(4)}</b></span>
           </div>
           <div style="margin-top:4px">PnL: <b style="color:${pnlColor}">${pnlSign}${pnlPct}%</b> | ${(d.usdt||0).toFixed(0)} USDT</div>
         </div>`;
     }
 
     const predRange = (g.predicted_low > 0 && g.predicted_high > 0)
-      ? `<div style="font-size:10px;color:#555;margin-top:4px">Pred: ${g.predicted_low.toFixed(2)} – ${g.predicted_high.toFixed(2)}</div>`
+      ? `<div style="font-size:10px;color:var(--text-faint);margin-top:4px">Pred: ${g.predicted_low.toFixed(2)} – ${g.predicted_high.toFixed(2)}</div>`
       : '';
 
     // ── Risk indicator: open inventory + deployed notional + distance to floor SL ──
@@ -433,12 +545,12 @@ async function refreshGrids() {
     const invPct = (g.investment > 0) ? deployedNotional / g.investment * 100 : 0;
     const floorSl = g.floor_sl || 0;
     const distFloor = (floorSl > 0 && price > 0) ? (price - floorSl) / price * 100 : null;
-    const riskColor = invPct > 150 ? '#ff4d4d' : invPct > 80 ? '#f0a500' : '#00c896';
+    const riskColor = invPct > 150 ? '#ff5c72' : invPct > 80 ? '#ffb648' : '#00d9a3';
     const riskBadge = openPos > 0 ? `
-      <div style="padding:5px 10px;background:#0d1a1a;border:1px solid ${riskColor}55;border-radius:6px;font-size:11px;margin-bottom:6px;display:flex;gap:14px;flex-wrap:wrap;align-items:center">
+      <div style="padding:5px 10px;background:var(--bg-soft);border:1px solid ${riskColor}55;border-radius:6px;font-size:11px;margin-bottom:6px;display:flex;gap:14px;flex-wrap:wrap;align-items:center">
         <span style="color:${riskColor}">📦 ${openPos} Pos</span>
-        <span style="color:#aaa">Notional: <b style="color:#fff">${deployedNotional.toFixed(0)} USDT</b> (${invPct.toFixed(0)}% v. Invest.)</span>
-        ${distFloor !== null ? `<span style="color:${distFloor < 3 ? '#ff4d4d' : distFloor < 6 ? '#f0a500' : '#888'}">Floor-SL: ${distFloor.toFixed(1)}% weg</span>` : ''}
+        <span style="color:var(--text-dim)">Notional: <b style="color:var(--text)">${deployedNotional.toFixed(0)} USDT</b> (${invPct.toFixed(0)}% v. Invest.)</span>
+        ${distFloor !== null ? `<span style="color:${distFloor < 3 ? 'var(--red)' : distFloor < 6 ? 'var(--orange)' : 'var(--text-dim)'}">Floor-SL: ${distFloor.toFixed(1)}% weg</span>` : ''}
       </div>` : '';
 
     const sorted = [...levels].sort((a, b) => b.price - a.price);
@@ -446,61 +558,61 @@ async function refreshGrids() {
     const rowParts = [];
     for (const l of sorted) {
       if (!priceInserted && l.price < price) {
-        rowParts.push(`<div style="display:flex;align-items:center;gap:8px;padding:4px 10px;border-top:2px solid #f0a500;border-bottom:2px solid #f0a500;margin:3px 0">
-          <span style="font-size:13px;font-family:monospace;color:#f0a500;font-weight:bold">${price.toFixed(4)}</span>
-          <span style="font-size:11px;color:#f0a500;margin-left:auto">◄ AKTUELL</span>
+        rowParts.push(`<div style="display:flex;align-items:center;gap:8px;padding:4px 10px;border-top:2px solid var(--orange);border-bottom:2px solid var(--orange);margin:3px 0">
+          <span style="font-size:13px;font-family:monospace;color:var(--orange);font-weight:bold">${price.toFixed(4)}</span>
+          <span style="font-size:11px;color:var(--orange);margin-left:auto">◄ AKTUELL</span>
         </div>`);
         priceInserted = true;
       }
       const pct       = ((l.price - min_p) / range * 100).toFixed(1);
       const isFilled  = !!l.filled;
       const hasBought = !!l.bought_at;
-      const bg    = isFilled   ? '#2a2a2a'
-                  : l.side === 'sell' && hasBought ? '#1a3a2a'
-                  : l.side === 'sell'               ? '#1a2a3a'
-                  :                                   '#2a1a1a';
-      const color = l.side === 'sell' && hasBought ? '#00c896'
-                  : l.side === 'sell'               ? '#5599cc'
-                  :                                   '#ff7777';
+      const bg    = isFilled   ? '#23263a'
+                  : l.side === 'sell' && hasBought ? 'var(--green-dim)'
+                  : l.side === 'sell'               ? 'var(--blue-dim)'
+                  :                                   'var(--red-dim)';
+      const color = l.side === 'sell' && hasBought ? 'var(--green)'
+                  : l.side === 'sell'               ? 'var(--blue)'
+                  :                                   'var(--red)';
       const tag        = isFilled ? ' ✓' : '';
-      const boughtInfo = hasBought ? `<span style="color:#888;font-size:10px"> ↑${l.bought_at.toFixed(2)}</span>` : '';
+      const boughtInfo = hasBought ? `<span style="color:var(--text-faint);font-size:10px"> ↑${l.bought_at.toFixed(2)}</span>` : '';
       rowParts.push(`<div style="display:flex;align-items:center;gap:8px;padding:5px 10px;background:${bg};border-radius:4px;margin:2px 0">
-        <div style="width:38px;height:4px;background:#333;border-radius:2px;flex-shrink:0">
+        <div style="width:38px;height:4px;background:#2a2d44;border-radius:2px;flex-shrink:0">
           <div style="width:${pct}%;height:100%;background:${color};border-radius:2px"></div>
         </div>
         <span style="font-size:13px;font-family:monospace;color:${color}">${l.price.toFixed(4)}</span>
-        <span style="font-size:11px;color:#888;margin-left:auto">${l.side.toUpperCase()}${tag}</span>
+        <span style="font-size:11px;color:var(--text-dim);margin-left:auto">${l.side.toUpperCase()}${tag}</span>
         ${boughtInfo}
       </div>`);
     }
     if (!priceInserted) {
-      rowParts.push(`<div style="display:flex;align-items:center;gap:8px;padding:4px 10px;border-top:2px solid #f0a500;border-bottom:2px solid #f0a500;margin:3px 0">
-        <span style="font-size:13px;font-family:monospace;color:#f0a500;font-weight:bold">${price.toFixed(4)}</span>
-        <span style="font-size:11px;color:#f0a500;margin-left:auto">◄ AKTUELL</span>
+      rowParts.push(`<div style="display:flex;align-items:center;gap:8px;padding:4px 10px;border-top:2px solid var(--orange);border-bottom:2px solid var(--orange);margin:3px 0">
+        <span style="font-size:13px;font-family:monospace;color:var(--orange);font-weight:bold">${price.toFixed(4)}</span>
+        <span style="font-size:11px;color:var(--orange);margin-left:auto">◄ AKTUELL</span>
       </div>`);
     }
     const rows = rowParts.join('');
     const updatedAt = g.updated_at ? new Date(g.updated_at + 'Z').toLocaleTimeString('de') : '–';
 
     return `
-      <div style="background:#0f0f1a;border-radius:10px;padding:16px;border:1px solid #2a2a4a">
+      <div class="grid-card">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-          <b style="color:#00c896">${g.symbol}</b>
-          <span style="font-size:12px;color:#aaa">${price.toFixed(4)}</span>
+          <b style="color:var(--green)">${g.symbol}</b>
+          <span style="font-size:12px;color:var(--text-dim)">${price.toFixed(4)}</span>
         </div>
         <div style="display:flex;gap:8px;margin-bottom:6px;flex-wrap:wrap;align-items:center">
           ${mlBadge}${regBadge}${confBadge}
         </div>
-        <div style="display:flex;gap:16px;font-size:12px;color:#888;margin-bottom:6px;flex-wrap:wrap">
+        <div style="display:flex;gap:16px;font-size:12px;color:var(--text-dim);margin-bottom:6px;flex-wrap:wrap">
           <span>±${(g.range_pct*100).toFixed(0)}% Range</span>
           <span>${g.trade_count} Trades</span>
-          <span style="color:${g.total_profit>=0?'#00c896':'#ff4d4d'}">${g.total_profit>=0?'+':''}${g.total_profit.toFixed(2)} USDT</span>
+          <span style="color:${g.total_profit>=0?'var(--green)':'var(--red)'}">${g.total_profit>=0?'+':''}${g.total_profit.toFixed(2)} USDT</span>
         </div>
         ${predRange}
         ${riskBadge}
         ${dirBadge}
-        <div style="margin:8px 0">${rows}</div>
-        <div style="font-size:10px;color:#444;text-align:right">Stand: ${updatedAt}</div>
+        <div class="grid-levels">${rows}</div>
+        <div style="font-size:10px;color:var(--text-faint);text-align:right">Stand: ${updatedAt}</div>
       </div>`;
   }).join('');
 }
@@ -514,8 +626,8 @@ async function loadLeverage() {
     document.getElementById('leverage-select').value = lev.toFixed(1);
     const badge = document.getElementById('leverage-badge');
     badge.textContent = lev.toFixed(0) + '×';
-    badge.style.background = lev >= 3 ? '#ff4d4d44' : lev >= 2 ? '#f0a50044' : '#2a2a6a';
-    badge.style.color       = lev >= 3 ? '#ff4d4d'   : lev >= 2 ? '#f0a500'   : '#aaa';
+    badge.style.background = lev >= 3 ? 'var(--red-dim)' : lev >= 2 ? 'var(--orange-dim)' : 'var(--blue-dim)';
+    badge.style.color       = lev >= 3 ? 'var(--red)'   : lev >= 2 ? 'var(--orange)'   : 'var(--text-dim)';
   } catch (_) {}
 }
 
