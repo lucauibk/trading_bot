@@ -294,7 +294,10 @@ Wird vom Bot nach Lesen automatisch auf NULL zurückgesetzt.
 
 ## Nightly Auto-Tune (05:00 täglich)
 
-`scripts/nightly_tune.py` läuft als Cloud-Routine:
+`scripts/nightly_tune.py` läuft als lokaler launchd-Job (`~/Library/LaunchAgents/com.tradingbot.nightlytune.plist`,
+geladen via `launchctl bootstrap gui/$(id -u) ...`) — **kein Cloud-Routine**, weil Trade-Analyse (`trades.db`) und
+Telegram-Notify lokale, gitignored Dateien (`data/trades.db`, `.env`) brauchen, auf die eine Cloud-Sandbox keinen
+Zugriff hat. Läuft nur, wenn der Mac um 05:00 wach ist. Log: `logs/nightly_tune.log`.
 1. Branch `auto-tune/YYYY-MM-DD` von main
 2. Trade-Analyse (7 Tage) + Pattern Mining
 3. OOS-Sweep je Symbol (180 Tage, 120 Train)

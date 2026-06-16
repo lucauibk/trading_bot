@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Nightly auto-tuning routine (runs daily at 05:00 via /schedule Cloud routine).
+Nightly auto-tuning routine (runs daily at 05:00 local time via launchd,
+~/Library/LaunchAgents/com.tradingbot.nightlytune.plist — requires the Mac
+to be awake; needs local trades.db + .env for analysis/Telegram, so a cloud
+routine can't run this step).
 
 Workflow
 --------
