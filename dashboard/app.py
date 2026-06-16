@@ -175,44 +175,23 @@ def api_status():
     return jsonify(data)
 
 
-def _session_start():
-    con = get_conn()
-    row = con.execute("SELECT session_start FROM bot_status WHERE id=1").fetchone()
-    con.close()
-    return row["session_start"] if row else None
-
-
 @app.route("/api/trades", methods=["GET"])
 def api_trades():
-    limit   = request.args.get("limit", 50, type=int)
-    session = _session_start()
-    con     = get_conn()
-    if session:
-        rows = con.execute(
-            "SELECT * FROM trades WHERE timestamp >= ? ORDER BY id DESC LIMIT ?",
-            (session, limit)
-        ).fetchall()
-    else:
-        rows = con.execute(
-            "SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
+    limit = request.args.get("limit", 50, type=int)
+    con   = get_conn()
+    rows = con.execute(
+        "SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
     con.close()
     return jsonify([dict(r) for r in rows])
 
 
 @app.route("/api/equity", methods=["GET"])
 def api_equity():
-    session = _session_start()
-    con     = get_conn()
-    if session:
-        rows = con.execute(
-            "SELECT timestamp, capital FROM equity WHERE timestamp >= ? ORDER BY id DESC LIMIT 200",
-            (session,)
-        ).fetchall()
-    else:
-        rows = con.execute(
-            "SELECT timestamp, capital FROM equity ORDER BY id DESC LIMIT 200"
-        ).fetchall()
+    con  = get_conn()
+    rows = con.execute(
+        "SELECT timestamp, capital FROM equity ORDER BY id DESC LIMIT 200"
+    ).fetchall()
     con.close()
     return jsonify(list(reversed([dict(r) for r in rows])))
 
@@ -235,17 +214,11 @@ def api_grids():
 @app.route("/api/summary", methods=["GET"])
 def api_summary():
     from datetime import datetime, timezone
-    session  = _session_start()
     today_str = datetime.now(timezone.utc).date().isoformat()  # 'YYYY-MM-DD'
-    con      = get_conn()
-    if session:
-        total = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE timestamp >= ?", (session,)).fetchone()[0]
-        count = con.execute("SELECT COUNT(*) FROM trades WHERE timestamp >= ?", (session,)).fetchone()[0]
-        wins  = con.execute("SELECT COUNT(*) FROM trades WHERE timestamp >= ? AND pnl > 0", (session,)).fetchone()[0]
-    else:
-        total = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades").fetchone()[0]
-        count = con.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-        wins  = con.execute("SELECT COUNT(*) FROM trades WHERE pnl > 0").fetchone()[0]
+    con   = get_conn()
+    total = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades").fetchone()[0]
+    count = con.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+    wins  = con.execute("SELECT COUNT(*) FROM trades WHERE pnl > 0").fetchone()[0]
     # today_pnl: trades since midnight UTC (ISO timestamp comparison is lexicographic)
     today_pnl = con.execute(
         "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE timestamp >= ?", (today_str,)
@@ -303,12 +276,14 @@ def api_coin_settings_post():
 def stream():
     def generate():
         while True:
-            con  = get_conn()
-            row  = con.execute("SELECT * FROM bot_status WHERE id=1").fetchone()
-            last = con.execute(
-                "SELECT symbol, pnl, timestamp FROM trades ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            con.close()
+            con = get_conn()
+            try:
+                row  = con.execute("SELECT * FROM bot_status WHERE id=1").fetchone()
+                last = con.execute(
+                    "SELECT symbol, pnl, timestamp FROM trades ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            finally:
+                con.close()
             data = dict(row) if row else {}
             data["running"] = int(_is_running())
             yield f"data: {json.dumps({'status': data, 'last_trade': dict(last) if last else None})}\n\n"

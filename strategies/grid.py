@@ -772,10 +772,14 @@ class GridStrategy(Strategy):
         allocations = _calc_level_allocations(grid_lines, price, state.investment,
                                               state._direction_score)
 
-        # Preserve open positions through rebuild (real filled buys with pending sells)
+        # Preserve open positions through rebuild (real filled buys with pending sells).
+        # Excludes pre_seeded sells: those are placeholder walls, not real positions,
+        # and must be rebuilt fresh each cycle — otherwise they never get removed and
+        # accumulate across rebuilds (state.orders growing without bound).
         open_positions = {
             cid: o for cid, o in state.orders.items()
             if not o.get("filled") and o.get("side") == "sell" and "bought_at" in o
+            and not o.get("pre_seeded")
         }
         # Floor ratchet: never lower an existing position's SL on rebuild.
         # Skipped in per-cohort mode — each cohort keeps its own floor from
