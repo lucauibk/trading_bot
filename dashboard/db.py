@@ -150,6 +150,7 @@ def _init(con: sqlite3.Connection):
             pass
     for col, coldef in [
         ("leverage", "REAL DEFAULT 1.0"),
+        ("initial_capital", "REAL DEFAULT 1000.0"),
     ]:
         try:
             con.execute(f"ALTER TABLE bot_status ADD COLUMN {col} {coldef}")
@@ -391,6 +392,22 @@ def set_leverage(value: float):
     value = max(1.0, min(3.0, float(value)))
     con = get_conn()
     con.execute("UPDATE bot_status SET leverage=? WHERE id=1", (value,))
+    con.commit()
+    con.close()
+
+
+def get_initial_capital() -> float:
+    """Startkapital für den nächsten Bot-Start (Paper-Modus). Fallback: 1000."""
+    con = get_conn()
+    row = con.execute("SELECT initial_capital FROM bot_status WHERE id=1").fetchone()
+    con.close()
+    return float(row["initial_capital"]) if row and row["initial_capital"] else 1000.0
+
+
+def set_initial_capital(value: float):
+    value = max(10.0, float(value))
+    con = get_conn()
+    con.execute("UPDATE bot_status SET initial_capital=? WHERE id=1", (value,))
     con.commit()
     con.close()
 

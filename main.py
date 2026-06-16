@@ -77,6 +77,14 @@ def main():
         symbols = ["SOL/USD", "ETH/USD", "AVAX/USD", "LINK/USD", "XRP/USD"]
         initial_investment = 1000.0
 
+    # Dashboard-set starting capital (paper mode) overrides config.yaml, if set
+    if paper:
+        try:
+            from dashboard.db import get_initial_capital
+            initial_investment = get_initial_capital()
+        except Exception:
+            pass
+
     per_coin = initial_investment / len(symbols)
     grids_config = [{"symbol": s, "investment": per_coin, "levels": 8} for s in symbols]
 

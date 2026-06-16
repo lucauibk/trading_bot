@@ -283,6 +283,27 @@ def api_leverage_set():
     return jsonify({"ok": True, "leverage": val, "msg": f"Hebel auf {val:.1f}× gesetzt"})
 
 
+@app.route("/api/capital", methods=["GET"])
+def api_capital_get():
+    from dashboard.db import get_initial_capital
+    return jsonify({"initial_capital": get_initial_capital()})
+
+
+@app.route("/api/capital", methods=["POST"])
+def api_capital_set():
+    from dashboard.db import set_initial_capital
+    data = request.get_json() or {}
+    try:
+        val = float(data.get("initial_capital", 0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "msg": "Ungültiger Wert"}), 400
+    if val < 10:
+        return jsonify({"ok": False, "msg": "Minimum 10 USDT"})
+    set_initial_capital(val)
+    return jsonify({"ok": True, "initial_capital": val,
+                    "msg": f"Startkapital auf {val:.0f} USDT gesetzt (wirkt beim nächsten Bot-Start)"})
+
+
 @app.route("/api/coin-settings", methods=["GET"])
 def api_coin_settings_get():
     from dashboard.db import get_all_coin_settings

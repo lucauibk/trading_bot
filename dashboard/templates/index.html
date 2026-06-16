@@ -237,6 +237,14 @@
       <span id="leverage-badge" class="badge" style="background:var(--blue-dim);color:var(--text-dim)">1×</span>
       <span style="font-size:11px;color:var(--text-faint)" id="leverage-msg"></span>
     </div>
+    <div style="margin-top:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <span style="font-size:13px;color:var(--text-dim)">Startkapital (Paper):</span>
+      <input id="capital-input" type="number" min="10" step="10" placeholder="1000"
+             style="background:var(--bg-soft);color:var(--text);border:1px solid var(--border);padding:9px 12px;border-radius:9px;font-size:13.5px;width:120px">
+      <button class="btn btn-ghost btn-sm" onclick="setCapital()">Setzen</button>
+      <span style="font-size:11px;color:var(--text-faint)">wirkt beim nächsten Bot-Start</span>
+      <span style="font-size:11px;color:var(--text-faint)" id="capital-msg"></span>
+    </div>
     <div class="msg" id="ctrl-msg"></div>
   </div>
 
@@ -649,9 +657,38 @@ async function setLeverage(val) {
   }
 }
 
+// ── Startkapital ─────────────────────────────────────────────────────────────
+async function loadCapital() {
+  try {
+    const r = await fetch('/api/capital');
+    const d = await r.json();
+    document.getElementById('capital-input').value = Math.round(d.initial_capital);
+  } catch (_) {}
+}
+
+async function setCapital() {
+  const val = parseFloat(document.getElementById('capital-input').value);
+  const msg = document.getElementById('capital-msg');
+  if (!val || val < 10) { msg.textContent = 'Minimum 10 USDT'; return; }
+  try {
+    const r = await fetch('/api/capital', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initial_capital: val })
+    });
+    const d = await r.json();
+    msg.textContent = d.msg || '';
+    if (d.ok) await loadCapital();
+    setTimeout(() => { msg.textContent = ''; }, 4000);
+  } catch (e) {
+    msg.textContent = 'Fehler: ' + e;
+  }
+}
+
 refresh();
 refreshGrids();
 loadLeverage();
+loadCapital();
 setInterval(refresh, 10000);
 setInterval(refreshGrids, 10000);
 setInterval(loadLeverage, 15000);
