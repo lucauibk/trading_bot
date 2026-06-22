@@ -111,7 +111,20 @@ def main():
     risk = RiskManager(corr)
 
     from strategies.grid import GridStrategy
-    strategy = GridStrategy(grids_config, risk_manager=risk)
+    from strategies.grid_params import GridParams
+    import json as _json
+    _params_path = Path("config/grid_params.json")
+    if _params_path.exists():
+        try:
+            _raw = _json.loads(_params_path.read_text())
+            grid_params = GridParams.from_dict(_raw)
+            logger.info("Grid params loaded from config/grid_params.json: %s", _raw)
+        except Exception as _e:
+            logger.warning("Failed to load grid_params.json (%s) – using defaults", _e)
+            grid_params = GridParams()
+    else:
+        grid_params = GridParams()
+    strategy = GridStrategy(grids_config, risk_manager=risk, params=grid_params)
 
     if paper:
         from execution.paper import PaperBroker
