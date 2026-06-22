@@ -60,6 +60,13 @@
   .badge.paper    { background: var(--orange-dim); color: var(--orange); }
   .badge.live     { background: var(--red-dim); color: var(--red); }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+  .badge.building { background: #1a1200; color: var(--orange); }
+  .badge.building::before {
+    content: ''; width: 8px; height: 8px; border-radius: 50%; box-sizing: border-box;
+    border: 2px solid var(--orange); border-top-color: transparent;
+    animation: spin 0.8s linear infinite; display: inline-block; flex-shrink: 0;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
 
   main { padding: 28px; max-width: 1440px; margin: 0 auto; }
 
@@ -192,8 +199,15 @@
   <span id="status-badge" class="badge stopped">STOPPED</span>
   <span id="mode-badge"   class="badge paper">PAPER</span>
   <span id="strat-badge"  class="badge" style="background:var(--blue-dim);color:var(--blue)">GRID</span>
+  <span id="freeze-badge" class="badge" style="display:none;background:#7c2d12;color:#fca5a5">❄️ FREEZE</span>
   <span class="updated" id="updated">–</span>
 </header>
+
+<div id="freeze-banner" style="display:none;background:#450a0a;border:1px solid #991b1b;border-radius:8px;padding:12px 16px;margin:0 0 16px 0;color:#fca5a5;font-size:13px">
+  <b>❄️ Freeze aktiv – keine neuen Käufe</b>
+  <span id="freeze-reason" style="color:#f87171;margin-left:8px"></span>
+  <span style="color:var(--text-dim);margin-left:8px;font-size:11px">Löst sich automatisch beim nächsten Bot-Start auf.</span>
+</div>
 
 <main>
   <!-- KPI-Karten -->
@@ -279,7 +293,21 @@
 </main>
 
 <script>
-let _pendingStart = null;   // gespeicherte Start-Params beim Live-Confirm
+let _pendingStart  = null;   // gespeicherte Start-Params beim Live-Confirm
+let _sessionStart  = null;   // ISO-Timestamp des letzten Bot-Starts (aus bot_status)
+let _gridBuilt     = false;  // true sobald mind. ein Grid nach session_start aktualisiert wurde
+let _botRunning    = false;
+
+function _applyStatusBadge() {
+  const sb = document.getElementById('status-badge');
+  if (!_botRunning) {
+    sb.textContent = 'STOPPED';  sb.className = 'badge stopped';
+  } else if (!_gridBuilt) {
+    sb.textContent = 'BUILDING'; sb.className = 'badge building';
+  } else {
+    sb.textContent = 'RUNNING';  sb.className = 'badge running';
+  }
+}
 
 // ── Bot starten ───────────────────────────────────────────────────────────────
 async function startBot() {
@@ -424,9 +452,10 @@ es.onmessage = e => {
   const running = !!s.running;
   updateControls(running);
 
-  const sb = document.getElementById('status-badge');
-  sb.textContent = running ? 'RUNNING' : 'STOPPED';
-  sb.className   = 'badge ' + (running ? 'running' : 'stopped');
+  _botRunning   = running;
+  _sessionStart = s.session_start || null;
+  if (!running) _gridBuilt = false;
+  _applyStatusBadge();
 
   const mb = document.getElementById('mode-badge');
   mb.textContent = (s.mode || 'paper').toUpperCase();
@@ -434,6 +463,11 @@ es.onmessage = e => {
 
   document.getElementById('strat-badge').textContent = (s.strategy || '').toUpperCase();
   if (s.capital) document.getElementById('capital').textContent = s.capital.toFixed(2) + ' USDT';
+
+  const frozen = !!s.frozen && !!s.running;
+  document.getElementById('freeze-badge').style.display = frozen ? '' : 'none';
+  document.getElementById('freeze-banner').style.display = frozen ? '' : 'none';
+  document.getElementById('freeze-reason').textContent   = frozen ? (s.frozen_reason || '') : '';
 };
 
 // ── Offene Positionen ─────────────────────────────────────────────────────────
@@ -497,6 +531,10 @@ function renderOpenPositions(grids) {
 // ── Grid-Visualisierung ───────────────────────────────────────────────────────
 async function refreshGrids() {
   const grids = await fetch('/api/grids').then(r => r.json());
+  if (_botRunning && _sessionStart) {
+    _gridBuilt = grids.some(g => g.updated_at && g.updated_at >= _sessionStart);
+    _applyStatusBadge();
+  }
   renderOpenPositions(grids);
   const container = document.getElementById('grids-container');
   document.getElementById('grid-section').style.display = grids.length ? '' : 'none';

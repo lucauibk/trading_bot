@@ -57,8 +57,20 @@ class Engine:
         self._waiting_for_fills = False  # set True by wait_fills stop mode
         # Last known prices (updated every tick) — used for mark-to-market equity
         self._last_prices: Dict[str, float] = {}
+        # Timestamp of the last successful price fetch per symbol.  Used by
+        # _log_equity() to guard against stale MTM after a Mac-sleep: if the
+        # host was suspended, _last_prices holds pre-sleep values but the broker
+        # balance already reflects post-wake reality → equity would spike/drop
+        # by the full leveraged MTM delta.  We skip MTM for any symbol whose
+        # cached price is older than 2× CHECK_INTERVAL (30 s).
+        self._last_price_ts: Dict[str, float] = {}
         # Cache last logged prediction per symbol to avoid writing on every 15s tick
         self._last_logged_pred: Dict[str, str] = {}
+        # Rebuild cooldown: prevents out_of_range events from back-to-back grid
+        # rebuilds when price hovers near the edge.  Scheduled rebuilds (do_rebuild)
+        # always run unconditionally; only out_of_range rebuilds are rate-limited
+        # to once per 20 ticks (~5 min).
+        self._last_rebuild: Dict[str, int] = {}
 
     def run(self):
         logger.info("Engine starting | symbols=%s", self.symbols)
@@ -127,7 +139,10 @@ class Engine:
                 logger.warning("Ticker failed %s: %s", sym, e)
 
         # Cache for mark-to-market equity calculation
+        now = time.time()
         self._last_prices.update(prices)
+        for sym in prices:
+            self._last_price_ts[sym] = now
 
         for sym in self.symbols:
             price = prices.get(sym)
@@ -153,7 +168,7 @@ class Engine:
             if state_obj and state_obj.grid_lines:
                 lo = state_obj.grid_lines[0]
                 hi = state_obj.grid_lines[-1]
-                out_of_range = price < lo * 0.99 or price > hi * 1.01
+                out_of_range = price < lo * 0.98 or price > hi * 1.02
 
             # Safety ticks (SL/TP) run even during freeze
             if hasattr(self.strategy, "on_tick_safety"):
@@ -168,7 +183,14 @@ class Engine:
             # For live mode: reconcile fills from exchange (paper has no reconciler)
             self._reconcile_fills()
 
-            if (out_of_range or do_rebuild) and hasattr(self.strategy, "setup_grid"):
+            # Scheduled rebuild (every 60 ticks) always fires.  out_of_range
+            # rebuilds are rate-limited to once per 20 ticks (~5 min) so that
+            # price hovering near the grid edge does not cause a rebuild storm.
+            rebuild_allowed = do_rebuild or (
+                out_of_range and
+                self._loop_count - self._last_rebuild.get(sym, 0) >= 20
+            )
+            if rebuild_allowed and hasattr(self.strategy, "setup_grid"):
                 # Note: setup_grid runs even during a daily-drawdown freeze because
                 # price can escape the grid while frozen.  setup_grid gates buy-seeding
                 # internally via _buys_allowed (inventory cap + trend filter).  Even if
@@ -179,6 +201,7 @@ class Engine:
                 # inventory cap (max_inventory_notional_mult) which stops accumulation
                 # before a cascade can form, regardless of freeze state.
                 self.strategy.setup_grid(sym, price, self.ctx)
+                self._last_rebuild[sym] = self._loop_count
 
             if not self.ctx.is_frozen():
                 self._sync_orders(sym, price)
@@ -273,14 +296,29 @@ class Engine:
 
         if hasattr(self.strategy, "_risk") and self.strategy._risk:
             rm = self.strategy._risk
-            rm.set_daily_start(total_equity)
-            dd_ok = rm.daily_drawdown_ok(total_equity + total_profit)
+            # Anchor baseline to configured starting capital so the brake always
+            # measures against what the user deposited, not a mid-session equity.
+            # total_profit is already baked into total_equity (cash balance), so
+            # adding it again would double-count it — just use total_equity.
+            baseline = self._initial_capital if self._initial_capital > 0 else total_equity
+            rm.set_daily_start(baseline)
+            dd_ok = rm.daily_drawdown_ok(total_equity)
             was_frozen = self.ctx.is_frozen()
             self.ctx.set_freeze(not dd_ok)
             if not dd_ok and not was_frozen:
                 logger.warning("FREEZE: daily drawdown exceeded – no new buys")
+                try:
+                    from dashboard.db import set_frozen
+                    set_frozen(True, f"Daily drawdown >{self.strategy._risk.max_daily_drawdown*100:.0f}%")
+                except Exception:
+                    pass
             elif dd_ok and was_frozen:
                 logger.info("Freeze lifted – new trading day")
+                try:
+                    from dashboard.db import set_frozen
+                    set_frozen(False)
+                except Exception:
+                    pass
 
     def _refresh_btc(self):
         try:
@@ -388,6 +426,10 @@ class Engine:
                         getattr(state, "_last_confidence", 0.0),
                         getattr(state, "_last_pred_low", 0.0),
                         getattr(state, "_last_pred_high", 0.0),
+                        # ML-specific fields for accurate calibration (separate from
+                        # PricePredictor bounds which are a different system).
+                        ml_score=getattr(state, "_direction_score", 0.0),
+                        entry_price=self._last_prices.get(symbol, 0.0),
                     )
                     self._last_logged_pred[symbol] = current_pred
                 except Exception as e:
@@ -402,6 +444,14 @@ class Engine:
                          = qty × bought_at / leverage + qty × (price - bought_at)
         Using full notional (qty × price) inflates equity by (lev-1)/lev × notional
         per position when leverage > 1, because PaperBroker only deducts margin on buy.
+
+        Stale-price guard: after a Mac-sleep the host process is suspended for an
+        arbitrary duration.  _last_prices still holds pre-sleep values, but when the
+        machine wakes up the market has moved.  Using stale prices for MTM would create
+        a spurious equity spike/drop that could falsely trigger the daily-drawdown brake
+        or EMERGENCY_STOP_PCT.  We skip MTM for any symbol whose price is older than
+        2× CHECK_INTERVAL (30 s); those positions are treated as cash-equivalent until
+        the next fresh tick arrives.
         """
         try:
             balance = self.broker.get_balance("USD")
@@ -411,10 +461,17 @@ class Engine:
             except Exception:
                 default_lev = 1.0
             mtm = 0.0
+            price_age_limit = 2 * CHECK_INTERVAL  # 30 s
+            now = time.time()
+            stale_syms = []
             for sym in self.symbols:
                 price = self._last_prices.get(sym, 0.0)
                 if price <= 0:
                     continue
+                age = now - self._last_price_ts.get(sym, 0.0)
+                if age > price_age_limit:
+                    stale_syms.append(sym)
+                    continue  # skip MTM — price is from before a possible sleep
                 state = getattr(self.strategy, "get_state", lambda s: None)(sym)
                 if state is None:
                     continue
@@ -432,6 +489,12 @@ class Engine:
                         unrealized = qty * (price - bought_at)
                         mtm += margin + unrealized
 
+            if stale_syms:
+                logger.warning(
+                    "_log_equity: stale prices for %s (>%ds) — MTM skipped, "
+                    "likely waking from sleep. Equity = cash-only until next tick.",
+                    stale_syms, price_age_limit,
+                )
             total = balance + mtm
             self.ctx.set_equity(total)
             from dashboard.db import log_equity, update_capital

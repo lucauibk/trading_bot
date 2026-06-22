@@ -8,6 +8,34 @@ import config
 
 logger = logging.getLogger(__name__)
 
+_MAX_RETRIES = 3
+_BACKOFF_BASE = 1.5  # seconds — matches execution/kraken.py
+
+
+def _with_retry(fn, *args, **kwargs):
+    """Retry on transient network/timeout errors with exponential backoff.
+
+    Mirrors the implementation in execution/kraken.py so both code paths
+    handle Kraken rate-limit spikes and short outages consistently.
+    ccxt.ExchangeError (bad symbol, auth failure, etc.) is re-raised immediately
+    without retry since those are logic errors, not transient issues.
+    """
+    last_exc = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            return fn(*args, **kwargs)
+        except (ccxt.NetworkError, ccxt.RequestTimeout) as e:
+            last_exc = e
+            sleep = _BACKOFF_BASE ** attempt
+            logger.warning(
+                "data_fetcher network error (attempt %d/%d): %s – retry in %.1fs",
+                attempt + 1, _MAX_RETRIES, e, sleep,
+            )
+            time.sleep(sleep)
+        except ccxt.ExchangeError:
+            raise  # don't retry logic errors (bad symbol, auth, etc.)
+    raise last_exc
+
 
 def _build_exchange(public_only: bool = False) -> ccxt.Exchange:
     exchange_class = getattr(ccxt, config.EXCHANGE_ID)
@@ -37,7 +65,7 @@ def get_public_exchange() -> ccxt.Exchange:
 
 
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
-    raw = get_public_exchange().fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    raw = _with_retry(get_public_exchange().fetch_ohlcv, symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df.set_index("timestamp", inplace=True)
@@ -45,14 +73,7 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
 
 
 def fetch_ticker(symbol: str) -> dict:
-    last_exc = None
-    for attempt in range(3):
-        try:
-            return get_public_exchange().fetch_ticker(symbol)
-        except Exception as e:
-            last_exc = e
-            time.sleep(2 ** attempt)
-    raise last_exc
+    return _with_retry(get_public_exchange().fetch_ticker, symbol)
 
 
 def get_balance(currency: str = "USDT") -> float:

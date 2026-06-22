@@ -70,14 +70,21 @@ class MLPredictor:
                 import threading
                 funding    = get_funding(symbol)
                 btc_ctx    = get_btc_context()
-                # Approximate BTC correlation from the context (not available per-symbol in cache,
-                # use a conservative default; the model was trained with this as well)
+                # btc_corr is not available per-symbol in the live cache. We use 0.7 as
+                # a conservative default, but NOTE: the model was trained with btc_corr=0.0
+                # (trainer.py always passes 0.0). LightGBM never splits on this feature
+                # because it was constant in training → live value does not affect predictions.
+                # Real fix requires retraining with historical BTC-correlation values.
                 btc_corr   = 0.7
                 dt         = df.index[-1].to_pydatetime() if hasattr(df.index[-1], "to_pydatetime") else None
                 feats = extract_all_features(df, funding=funding, btc=btc_ctx,
                                              btc_corr=btc_corr, dt=dt)
             except Exception as e:
-                logger.debug("34-feature extraction failed (%s), falling back to 16", e)
+                # WARNING intentionally (not debug): a 34→16 downgrade means the
+                # 34-feature model will return (hold, 0.0) → every prediction falls
+                # back to rule-based without any visible signal at INFO level.
+                logger.warning("34-feature extraction failed (%s) – falling back to 16-feature; "
+                               "model will return hold/0.0 until fixed", e)
                 feats = extract_features(df)
             price = float(df["close"].iloc[-1])
             model = self._models.get(symbol)
@@ -132,8 +139,12 @@ class MLPredictor:
 
             result = self._rule_based(df)
             logger.info("Fallback %-12s → %s", symbol, result.upper())
-            # ±0.5 so rule-based can trigger momentum-hold (threshold 0.35)
-            _fallback_score = {"up": 0.5, "down": -0.5, "neutral": 0.0}
+            # Fallback score is capped at ±0.1 — deliberately below directional_score_min
+            # (0.12) and momentum_hold_score (0.35) so that a rule-based guess cannot
+            # open leveraged directional trades or delay stop-losses without a real ML
+            # signal.  The direction string ("up"/"down") is still forwarded for
+            # with_position gating (buy-pause-on-down), which is string-based.
+            _fallback_score = {"up": 0.1, "down": -0.1, "neutral": 0.0}
             self._last_scores[symbol] = _fallback_score.get(result, 0.0)
             return result
 
