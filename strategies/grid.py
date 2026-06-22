@@ -25,7 +25,7 @@ logger = logging.getLogger("strategies.grid")
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 KRAKEN_FEE = 0.0016
-MIN_STEP_FEE_MULTIPLE = 2.5
+MIN_STEP_FEE_MULTIPLE = 4.0
 COMPOUND_EVERY_TRADES = 3
 MAX_INVESTMENT_MULT = 3.0          # Compounding cap: max 3× initial investment
 

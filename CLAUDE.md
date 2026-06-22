@@ -238,7 +238,7 @@ predict(symbol)
   │
   ├── extract_all(df_1h, funding, btc, btc_corr, dt)
   │     → 34-Feature-Vektor:
-  │       technical(16) + htf(4) + market(5) + perp(4) + seasonality(5)
+  │       technical(16) + perp(4) + market(5) + htf(4) + seasonality(5)
   │
   ├── LightGBM (CalibratedClassifier, Walk-Forward 5-Folds)
   │     └── lgbm_score + lgbm_conf
