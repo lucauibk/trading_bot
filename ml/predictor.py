@@ -43,6 +43,14 @@ class MLPredictor:
             self._models[sym] = TradingModel(sym)
         self._trainer = ModelTrainer(self._store, self._models)
 
+        # Fetch BTC OHLCV once for btc_corr_30d backfill (all non-BTC symbols share it)
+        btc_df = None
+        try:
+            btc_df = self._fetch_ohlcv("BTC/USD", "1h", 1000)
+            logger.info("BTC/USD OHLCV für btc_corr-Backfill geladen (%d Candles)", len(btc_df))
+        except Exception as exc:
+            logger.warning("BTC/USD fetch für btc_corr-Backfill fehlgeschlagen: %s – Fallback 0.0", exc)
+
         for sym in symbols:
             model = self._models[sym]
             if model.is_ready():
@@ -51,7 +59,8 @@ class MLPredictor:
             logger.info("Bootstrap ML-Modell für %s (1000 Candles)…", sym)
             try:
                 df = self._fetch_ohlcv(sym, "1h", 1000)
-                bootstrap_from_history(sym, df, self._store, model)
+                sym_btc_df = None if sym == "BTC/USD" else btc_df
+                bootstrap_from_history(sym, df, self._store, model, btc_df=sym_btc_df)
             except Exception as e:
                 logger.warning("Bootstrap fehlgeschlagen %s: %s", sym, e)
 

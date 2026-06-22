@@ -44,8 +44,12 @@ class GridParams:
     leverage: float = 0.0                  # 0 = read live from dashboard DB
 
     # ── Directional trades ─────────────────────────────────────────────
+    # NOTE: directional_score_min is temporarily raised to 0.75 (ML-Rehab gate).
+    # Near-random models (OOS-F1 ≈ 0.33) produce blended scores well below 0.75,
+    # so no leveraged directional trade can fire until ML rehab raises model quality.
+    # Lower to ~0.30–0.40 once OOS-F1 ≥ 0.45 across all symbols.
     directional_enabled: bool = True
-    directional_score_min: float = 0.12
+    directional_score_min: float = 0.75
     directional_pct: float = 0.20
     directional_tp_atr: float = 3.0
     directional_sl_atr: float = 1.5
