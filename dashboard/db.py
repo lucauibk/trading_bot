@@ -163,12 +163,34 @@ def _init(con: sqlite3.Connection):
     for col, coldef in [
         ("stop_mode", "TEXT DEFAULT NULL"),
         ("stats_reset_at", "TEXT DEFAULT NULL"),
+        ("frozen", "INTEGER DEFAULT 0"),
+        ("frozen_reason", "TEXT DEFAULT NULL"),
     ]:
         try:
             con.execute(f"ALTER TABLE bot_status ADD COLUMN {col} {coldef}")
         except Exception:
             pass
+    # predictions: add ML-score + entry_price so hit-eval is based on the ML
+    # direction rather than PricePredictor bounds (which are a different system).
+    for col, coldef in [
+        ("ml_score",    "REAL DEFAULT NULL"),
+        ("entry_price", "REAL DEFAULT NULL"),
+    ]:
+        try:
+            con.execute(f"ALTER TABLE predictions ADD COLUMN {col} {coldef}")
+        except Exception:
+            pass
     con.commit()
+
+
+def set_frozen(frozen: bool, reason: str = None):
+    con = get_conn()
+    con.execute(
+        "UPDATE bot_status SET frozen=?, frozen_reason=? WHERE id=1",
+        (1 if frozen else 0, reason if frozen else None)
+    )
+    con.commit()
+    con.close()
 
 
 def log_trade(symbol: str, direction: str, entry: float, exit_: float,
@@ -209,14 +231,23 @@ def log_trade(symbol: str, direction: str, entry: float, exit_: float,
 
 
 def log_prediction(symbol: str, prediction: str, confidence: float,
-                   predicted_low: float, predicted_high: float):
-    """Speichert eine ML/PricePredictor-Vorhersage für spätere Kalibrierungsauswertung."""
+                   predicted_low: float, predicted_high: float,
+                   ml_score: float = 0.0, entry_price: float = 0.0):
+    """Speichert eine ML-Vorhersage für spätere Kalibrierungsauswertung.
+
+    ml_score   – LGBM+LLM blend-score (-1..+1), dient der Hit-Auswertung.
+    entry_price – aktueller Preis bei der Vorhersage (für realized-return-Hit).
+    predicted_low/high – PricePredictor-Range (separates System, nur zur Info).
+    """
     from datetime import datetime
     con = get_conn()
     con.execute(
-        """INSERT INTO predictions (symbol, ts, prediction, confidence, predicted_low, predicted_high)
-           VALUES (?,?,?,?,?,?)""",
-        (symbol, datetime.utcnow().isoformat(), prediction, confidence, predicted_low, predicted_high)
+        """INSERT INTO predictions
+               (symbol, ts, prediction, confidence, predicted_low, predicted_high,
+                ml_score, entry_price)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (symbol, datetime.utcnow().isoformat(), prediction, confidence,
+         predicted_low, predicted_high, ml_score, entry_price)
     )
     con.commit()
     con.close()
@@ -227,18 +258,29 @@ def update_prediction_outcomes(fetch_ohlcv_fn):
     Füllt realized_high_6h, realized_low_6h und hit für Predictions nach, die
     älter als 6h sind und noch kein Ergebnis haben. Muss periodisch aufgerufen werden.
     fetch_ohlcv_fn(symbol, timeframe, limit) → DataFrame mit high/low-Spalten.
+
+    Hit-Definition (ML-direction-based):
+      up      → Kurs stieg ≥0.3 % über entry_price im 6h-Fenster
+      down    → Kurs fiel  ≥0.3 % unter entry_price im 6h-Fenster
+      neutral → Kurs blieb innerhalb ±0.3 % um entry_price
+
+    0.3 % ≈ Kraken-Round-Trip-Fee (2 × 0.16 %) → ein Hit bedeutet die Prediction
+    war zumindest kostendeckend. Legacy-Zeilen ohne entry_price fallen auf die alte
+    PricePredictor-Bound-Logik zurück.
     """
+    HIT_THRESHOLD = 0.003  # 0.3 % round-trip-fee-Niveau
     from datetime import datetime, timedelta, timezone
     con = get_conn()
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
     rows = con.execute(
-        "SELECT id, symbol, ts, prediction, predicted_low, predicted_high "
+        "SELECT id, symbol, ts, prediction, predicted_low, predicted_high, "
+        "COALESCE(entry_price, 0.0) as entry_price "
         "FROM predictions WHERE hit IS NULL AND ts <= ?",
         (cutoff,)
     ).fetchall()
 
     for row in rows:
-        pid, symbol, ts_str, pred, p_low, p_high = row
+        pid, symbol, ts_str, pred, p_low, p_high, entry_price = row
         try:
             df = fetch_ohlcv_fn(symbol, "1h", 8)
             ts_pred = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
@@ -249,12 +291,26 @@ def update_prediction_outcomes(fetch_ohlcv_fn):
                 after = df.tail(6)
             r_high = float(after["high"].max())
             r_low  = float(after["low"].min())
-            if pred == "up":
-                hit = 1 if (p_high and r_high >= p_high) else 0
-            elif pred == "down":
-                hit = 1 if (p_low and r_low <= p_low) else 0
+
+            if entry_price and entry_price > 0:
+                # ML-direction hit: did price move ≥threshold in the predicted direction?
+                up_barrier   = entry_price * (1 + HIT_THRESHOLD)
+                down_barrier = entry_price * (1 - HIT_THRESHOLD)
+                if pred == "up":
+                    hit = 1 if r_high >= up_barrier else 0
+                elif pred == "down":
+                    hit = 1 if r_low <= down_barrier else 0
+                else:  # neutral: price stayed in band
+                    hit = 1 if (r_high < up_barrier and r_low > down_barrier) else 0
             else:
-                hit = 1 if (p_high and p_low and r_high <= p_high and r_low >= p_low) else 0
+                # Legacy rows (no entry_price): fall back to PricePredictor-bound logic
+                if pred == "up":
+                    hit = 1 if (p_high and r_high >= p_high) else 0
+                elif pred == "down":
+                    hit = 1 if (p_low and r_low <= p_low) else 0
+                else:
+                    hit = 1 if (p_high and p_low and r_high <= p_high and r_low >= p_low) else 0
+
             con.execute(
                 "UPDATE predictions SET realized_high_6h=?, realized_low_6h=?, hit=? WHERE id=?",
                 (r_high, r_low, hit, pid)
@@ -430,7 +486,7 @@ def set_status(running: bool, mode: str = "paper", strategy: str = "grid", capit
         )
     else:
         con.execute(
-            "UPDATE bot_status SET running=0, updated_at=? WHERE id=1",
+            "UPDATE bot_status SET running=0, frozen=0, frozen_reason=NULL, updated_at=? WHERE id=1",
             (now,)
         )
     con.commit()

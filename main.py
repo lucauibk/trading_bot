@@ -86,7 +86,20 @@ def main():
             pass
 
     per_coin = initial_investment / len(symbols)
-    grids_config = [{"symbol": s, "investment": per_coin, "levels": 8} for s in symbols]
+    overrides = {}
+    if paper:
+        try:
+            from dashboard.db import get_all_coin_settings
+            overrides = {r["symbol"]: r["max_investment"]
+                         for r in get_all_coin_settings() if r["enabled"]}
+        except Exception:
+            pass
+    grids_config = [
+        # coin_settings can only reduce budget below per_coin, never exceed the
+        # broker's hard per-symbol cash bucket (initial_capital / n_symbols).
+        {"symbol": s, "investment": min(overrides.get(s, per_coin), per_coin), "levels": 8}
+        for s in symbols
+    ]
 
     # Build components
     from core.context import MarketContext
@@ -111,7 +124,7 @@ def main():
         reconciler = Reconciler(broker.reconcile_fills)
 
     from core.engine import Engine
-    engine = Engine(strategy, broker, symbols, ctx, reconciler)
+    engine = Engine(strategy, broker, symbols, ctx, reconciler, initial_capital=initial_investment)
 
     logger.info("Starting | mode=%s | symbols=%s | capital=%.0f USDT",
                 args.mode.upper(), symbols, initial_investment)
