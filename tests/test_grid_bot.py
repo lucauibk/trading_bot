@@ -215,7 +215,9 @@ class TestRiskManager:
         rm = self._make_rm()
         ctx = MarketContext()
         ctx.set_equity(1000.0)
-        rm.set_daily_start(1040.0)  # started at 1040 → 3.8% loss
+        # max_daily_drawdown is 0.10 (10%) per config.yaml (raised from 0.03 in dd0531b).
+        # Use an 11% loss so the check still triggers regardless of the configured value.
+        rm.set_daily_start(1124.0)  # 1000/1124 − 1 = −11.0% loss → exceeds 10% threshold
         ok, reason = rm.can_open("SOL/USD", 50.0, ctx)
         assert ok is False
         assert "drawdown" in reason
