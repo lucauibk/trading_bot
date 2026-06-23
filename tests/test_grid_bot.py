@@ -262,8 +262,9 @@ class TestGridStrategy:
         strategy = self._strategy()
         ctx = MarketContext()
         strategy.init(["SOL/USD"], ctx)
-        strategy.setup_grid("SOL/USD", 100.0, ctx)
         state = strategy.get_state("SOL/USD")
+        state.with_position = True  # mirror _refresh_prediction: buys only seed when with_position
+        strategy.setup_grid("SOL/USD", 100.0, ctx)
 
         buy_orders = [(cid, o) for cid, o in state.orders.items() if o["side"] == "buy"]
         assert len(buy_orders) > 0
@@ -382,6 +383,7 @@ class TestFloorSL:
         strategy.init(["SOL/USD"], ctx)
         state = strategy.get_state("SOL/USD")
         state._atr = atr
+        state.with_position = True  # mirror _refresh_prediction: buys only seed when with_position
         strategy.setup_grid("SOL/USD", price, ctx)
         return ctx, state
 
@@ -532,11 +534,13 @@ class TestBacktestEquity:
         from strategies.grid import GridStrategy
         from strategies.grid_params import GridParams
 
-        n_flat, n_drop, n_tail = 70, 20, 30
+        # fast drop below grid floor (~91.6): fills resting buys before the
+        # downtrend buy-pause can cancel them; price held below → losses stay unrealized.
+        n_flat, n_drop, n_tail = 70, 4, 46
         closes = np.concatenate([
             100 + 0.3 * np.sin(np.arange(n_flat)),
-            np.linspace(100, 90, n_drop),
-            90 + 0.3 * np.sin(np.arange(n_tail)),
+            np.linspace(100, 88, n_drop),
+            88 + 0.3 * np.sin(np.arange(n_tail)),
         ])
         idx = pd.date_range("2026-01-01", periods=len(closes), freq="h", tz="UTC")
         df = pd.DataFrame({

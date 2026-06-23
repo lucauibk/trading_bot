@@ -31,7 +31,7 @@ class GridParams:
     )
     range_atr_mult_trending: float = 2.0
     range_atr_mult_volatile: float = 1.5
-    min_step_pct: float = 0.006            # 0 = off; else cap levels so step ≥ this (0.6% ≈ 1.9× round-trip fee)
+    min_step_pct: float = 0.0              # 0 = off; else cap levels so step ≥ this (0.6% ≈ 1.9× round-trip fee)
 
     # ── Trend filter (ML-independent) ──────────────────────────────────
     # Default ON: sweep winner 2026-06-12 (results/sweep_20260612_1242) —
