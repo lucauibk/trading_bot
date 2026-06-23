@@ -215,7 +215,7 @@ class TestRiskManager:
         rm = self._make_rm()
         ctx = MarketContext()
         ctx.set_equity(1000.0)
-        rm.set_daily_start(1040.0)  # started at 1040 → 3.8% loss
+        rm.set_daily_start(1124.0)  # started at 1124 → 11% loss (threshold raised to 10% in dd0531b)
         ok, reason = rm.can_open("SOL/USD", 50.0, ctx)
         assert ok is False
         assert "drawdown" in reason
