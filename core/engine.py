@@ -491,10 +491,14 @@ class Engine:
 
             if stale_syms:
                 logger.warning(
-                    "_log_equity: stale prices for %s (>%ds) — MTM skipped, "
-                    "likely waking from sleep. Equity = cash-only until next tick.",
+                    "_log_equity: stale prices for %s (>%ds) — equity update skipped "
+                    "(retaining last good value), likely waking from sleep.",
                     stale_syms, price_age_limit,
                 )
+                return  # do NOT propagate a cash-only value — it would falsely
+                        # trigger the daily-drawdown FREEZE in _check_daily_drawdown()
+                        # (ctx.total_equity stays at the last valid full-MTM value).
+
             total = balance + mtm
             self.ctx.set_equity(total)
             from dashboard.db import log_equity, update_capital
