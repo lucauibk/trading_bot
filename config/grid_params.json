@@ -1,0 +1,8 @@
+{
+  "sl_mode": "per_position",
+  "momentum_hold_max": 0,
+  "trend_filter_enabled": true,
+  "min_step_pct": 0.006,
+  "directional_enabled": true,
+  "directional_score_min": 0.75
+}

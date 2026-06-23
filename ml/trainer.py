@@ -20,19 +20,37 @@ TB_UPPER_ATR = 0.5   # Gewinn-Barriere = 0.5× ATR  (war 2.0× → zu weit für 
 TB_LOWER_ATR = 0.5   # Verlust-Barriere = 0.5× ATR (war 1.5× → Swing-Trade-Skala)
 
 
-def _extract_training_features(df: pd.DataFrame, window: pd.DataFrame) -> np.ndarray:
+def _compute_rolling_btc_corr(df: pd.DataFrame, btc_df: pd.DataFrame, window: int = 720) -> "pd.Series":
+    """
+    Pre-computes a rolling 30-day (720 × 1h candles) Pearson correlation between
+    symbol and BTC log-returns. Aligned on the symbol's index.
+
+    Returned Series is indexed by df.index; NaN where insufficient history.
+    Caller is responsible for handling NaN (fall back to 0.0).
+    """
+    sym_ret = np.log(df["close"] / df["close"].shift(1))
+    btc_ret = np.log(btc_df["close"] / btc_df["close"].shift(1))
+    # Align: inner join on datetime index, then compute rolling corr on symbol axis
+    aligned = pd.DataFrame({"sym": sym_ret, "btc": btc_ret}).dropna()
+    if len(aligned) < 60:
+        return pd.Series(dtype=float)
+    corr = aligned["sym"].rolling(window, min_periods=60).corr(aligned["btc"])
+    # Reindex back to the full symbol index (fills gaps with NaN)
+    return corr.reindex(df.index)
+
+
+def _extract_training_features(df: pd.DataFrame, window: pd.DataFrame, btc_corr: float = 0.0) -> np.ndarray:
     """
     Extract 34-feature vector for a training window.
     htf(4) and seasonality(5) are computable from OHLCV + timestamp.
     market(5) uses aligned BTC returns from the same df (historical backfill).
     perp(4) defaults to 0 (no historical funding-rate archive available).
+    btc_corr: rolling 30d BTC-correlation passed from bootstrap/refresh caller.
     Falls back to 16-feature technical-only on any error.
     """
     try:
         dt = window.index[-1].to_pydatetime() if hasattr(window.index[-1], "to_pydatetime") else None
-        # Build a minimal BTCContext-like from the same OHLCV data if the symbol is BTC,
-        # otherwise use None (market features will be 0 — acceptable for training).
-        feats = extract_all_features(window, funding=None, btc=None, btc_corr=0.0, dt=dt)
+        feats = extract_all_features(window, funding=None, btc=None, btc_corr=btc_corr, dt=dt)
         return feats
     except Exception:
         return extract_features(window)
@@ -83,15 +101,35 @@ def bootstrap_from_history(
     df: pd.DataFrame,
     store: MLDataStore,
     model: TradingModel,
+    btc_df: Optional[pd.DataFrame] = None,
 ):
-    """Generiert Trainingsdaten aus historischen OHLCV-Daten und trainiert das Modell."""
+    """Generiert Trainingsdaten aus historischen OHLCV-Daten und trainiert das Modell.
+
+    btc_df: optional BTC/USD OHLCV aligned to the same timeframe and covering the
+    same range. When provided the trainer computes a rolling 30d BTC-correlation
+    feature (btc_corr_30d) instead of the constant 0.0 placeholder.
+    """
     min_window = 60
     xs, ys = [], []
 
+    # Pre-compute rolling BTC-correlation series if BTC data is available
+    btc_corr_series = None
+    if btc_df is not None and len(btc_df) >= 60:
+        try:
+            btc_corr_series = _compute_rolling_btc_corr(df, btc_df)
+        except Exception as exc:
+            logger.warning("btc_corr pre-compute failed for %s: %s", symbol, exc)
+
     for i in range(min_window, len(df) - LOOKFORWARD_H):
         window = df.iloc[: i + 1]
+        # Resolve per-step BTC correlation (NaN → 0.0 fallback)
+        btc_corr = 0.0
+        if btc_corr_series is not None and i < len(btc_corr_series):
+            val = btc_corr_series.iloc[i]
+            if not (isinstance(val, float) and val != val):  # not NaN
+                btc_corr = float(np.clip(val, -1.0, 1.0))
         try:
-            feats = _extract_training_features(df, window)
+            feats = _extract_training_features(df, window, btc_corr=btc_corr)
             atr_pct = _get_atr_pct(df, i)
             label = _compute_label_triple_barrier(df, i, atr_pct)
             xs.append(feats)
@@ -120,19 +158,34 @@ def refresh_from_recent_history(
     df: pd.DataFrame,
     store: MLDataStore,
     model: TradingModel,
+    btc_df: Optional[pd.DataFrame] = None,
 ):
     """
     Täglicher ML-Refresh auf frischen OHLCV-Daten (letzten 30 Tage).
     Ersetzt das Modell nur wenn neues OOS-F1 ≥ altes F1 - 0.05.
     LLM-frei — reiner LightGBM-Retrain.
+
+    btc_df: optional BTC/USD OHLCV for rolling btc_corr_30d feature (same fix as bootstrap).
     """
     min_window = 60
     xs, ys = [], []
 
+    btc_corr_series = None
+    if btc_df is not None and len(btc_df) >= 60:
+        try:
+            btc_corr_series = _compute_rolling_btc_corr(df, btc_df)
+        except Exception as exc:
+            logger.warning("btc_corr pre-compute failed for %s (refresh): %s", symbol, exc)
+
     for i in range(min_window, len(df) - LOOKFORWARD_H):
         window = df.iloc[: i + 1]
+        btc_corr = 0.0
+        if btc_corr_series is not None and i < len(btc_corr_series):
+            val = btc_corr_series.iloc[i]
+            if not (isinstance(val, float) and val != val):
+                btc_corr = float(np.clip(val, -1.0, 1.0))
         try:
-            feats = _extract_training_features(df, window)
+            feats = _extract_training_features(df, window, btc_corr=btc_corr)
             atr_pct = _get_atr_pct(df, i)
             label = _compute_label_triple_barrier(df, i, atr_pct)
             xs.append(feats)

@@ -45,7 +45,7 @@ class GridParams:
 
     # ── Directional trades ─────────────────────────────────────────────
     directional_enabled: bool = True
-    directional_score_min: float = 0.12
+    directional_score_min: float = 0.12   # legacy default; override via grid_params.json
     directional_pct: float = 0.20
     directional_tp_atr: float = 3.0
     directional_sl_atr: float = 1.5
