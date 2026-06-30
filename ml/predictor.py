@@ -14,11 +14,7 @@ from .trainer import ModelTrainer, bootstrap_from_history
 
 logger = logging.getLogger("ml.predictor")
 
-MIN_CONFIDENCE  = 0.80  # Kalibrierungsbericht 2026-06-22: best F1=0.493 bei conf≥0.80
-# Bucket-Analyse (1040 Predictions):
-#   (0.6–0.65]: 16.7% Hit-Rate (schlechtester Bucket!)
-#   (0.7–0.80]: 62.9% Hit-Rate
-#   (0.80–1.0]: 47.4% Hit-Rate → Threshold hier, da F1 maximal
+MIN_CONFIDENCE  = 0.65  # Gesenkt von 0.80 — bei OOS F1~0.35 ist 0.80 unerreichbar; LLM trägt 45% bei
 RULE_THRESHOLD  = 3     # Score-Schwelle für regelbasiertes Fallback
 
 
