@@ -36,6 +36,10 @@ class MLPredictor:
         self._last_scores: Dict[str, float]     = {}
         # Single-worker executor prevents multiple concurrent retrains competing on _clf
         self._retrain_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ml-retrain")
+        # Rolling BTC-correlation cache (computed from real OHLCV, refreshed every 2h)
+        self._btc_df:      Optional[object]     = None
+        self._btc_corr:    Dict[str, float]     = {}
+        self._btc_corr_ts: Dict[str, float]     = {}
 
     def get_score(self, symbol: str) -> float:
         """Letzter normierter Blended-Score (-1.0=down … +1.0=up) für adaptive Sizing."""
@@ -51,6 +55,7 @@ class MLPredictor:
         btc_df = None
         try:
             btc_df = self._fetch_ohlcv("BTC/USD", "1h", 1000)
+            self._btc_df = btc_df  # keep for rolling btc_corr in predict()
             logger.info("BTC/USD OHLCV für btc_corr-Backfill geladen (%d Candles)", len(btc_df))
         except Exception as exc:
             logger.warning("BTC/USD fetch für btc_corr-Backfill fehlgeschlagen: %s – Fallback 0.0", exc)
@@ -68,6 +73,11 @@ class MLPredictor:
             except Exception as e:
                 logger.warning("Bootstrap fehlgeschlagen %s: %s", sym, e)
 
+        # Pre-compute rolling btc_corr for all symbols so predict() has real values immediately
+        if self._btc_df is not None:
+            for sym in symbols:
+                self._refresh_btc_corr(sym)
+
     def predict(self, symbol: str) -> str:
         """
         Gibt 'up', 'down' oder 'neutral' zurück.
@@ -83,12 +93,10 @@ class MLPredictor:
                 import threading
                 funding    = get_funding(symbol)
                 btc_ctx    = get_btc_context()
-                # btc_corr is not available per-symbol in the live cache. We use 0.7 as
-                # a conservative default, but NOTE: the model was trained with btc_corr=0.0
-                # (trainer.py always passes 0.0). LightGBM never splits on this feature
-                # because it was constant in training → live value does not affect predictions.
-                # Real fix requires retraining with historical BTC-correlation values.
-                btc_corr   = 0.7
+                # Refresh rolling btc_corr every 2h (30d rolling correlation changes slowly).
+                if time.time() - self._btc_corr_ts.get(symbol, 0) > 7200:
+                    self._refresh_btc_corr(symbol)
+                btc_corr   = self._btc_corr.get(symbol, 0.0)
                 dt         = df.index[-1].to_pydatetime() if hasattr(df.index[-1], "to_pydatetime") else None
                 feats = extract_all_features(df, funding=funding, btc=btc_ctx,
                                              btc_corr=btc_corr, dt=dt)
@@ -164,6 +172,24 @@ class MLPredictor:
         except Exception as e:
             logger.warning("ML Fehler %s: %s", symbol, e)
             return "neutral"
+
+    def _refresh_btc_corr(self, symbol: str) -> None:
+        """Compute and cache the rolling 30d BTC-correlation for *symbol* from real OHLCV."""
+        if self._btc_df is None:
+            return
+        try:
+            import numpy as np
+            from ml.trainer import _compute_rolling_btc_corr
+            df_sym = self._fetch_ohlcv(symbol, "1h", 800)
+            series = _compute_rolling_btc_corr(df_sym, self._btc_df)
+            valid  = series.dropna()
+            val    = float(np.clip(valid.iloc[-1], -1.0, 1.0)) if len(valid) > 0 else 0.0
+            self._btc_corr[symbol]    = val
+            self._btc_corr_ts[symbol] = time.time()
+            logger.info("btc_corr[%s] = %.3f", symbol, val)
+        except Exception as exc:
+            logger.warning("btc_corr refresh fehlgeschlagen %s: %s", symbol, exc)
+            self._btc_corr[symbol] = 0.0
 
     def _build_llm_indicators(self, df, symbol: str) -> dict:
         """Bereitet Indikatoren für den LLM-Prompt auf."""
