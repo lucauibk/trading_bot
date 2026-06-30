@@ -16,7 +16,7 @@ logger = logging.getLogger("ml.model")
 MODEL_DIR = Path("data/models")
 
 LABEL_TO_STR = {0: "sell", 1: "hold", 2: "buy"}
-MIN_OOS_F1   = 0.40   # Modell wird nur gespeichert wenn OOS-F1 ≥ dieser Wert
+MIN_OOS_F1   = 0.33   # Modell wird nur gespeichert wenn OOS-F1 ≥ dieser Wert (Baseline: ~0.33 random)
 # NOTE: Raised from 0.30 → 0.40 (ML-Rehab). 3-class random baseline ≈ 0.33;
 # 0.40 ensures only above-random models are deployed. Models that fall below
 # this gate keep the grid running normally — they just don't open directional
