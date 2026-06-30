@@ -201,6 +201,21 @@ class PaperBroker(Broker):
         return [o for o in self._orders.values()
                 if o.symbol == symbol and o.status == "open"]
 
+    def load_balances(self, balances: dict) -> None:
+        """Restore per-symbol balances from a previous session."""
+        for sym, val in balances.items():
+            if sym in self._balances:
+                self._balances[sym] = float(val)
+
+    def sl_credit(self, symbol: str, amount: float) -> None:
+        """Credit the margin + PnL back to the symbol bucket after a strategy-side SL.
+
+        Strategy-handled stop losses never route through the broker's normal fill path,
+        so the margin deducted on the original buy fill would otherwise be lost permanently.
+        """
+        self._credit(symbol, amount)
+        logger.debug("[PAPER] SL credit %.4f for %s", amount, symbol)
+
     def get_balance(self, currency: str = "USD") -> float:
         """Total cash across all symbol buckets."""
         if self._balances:

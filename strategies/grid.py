@@ -127,6 +127,7 @@ class GridStrategy(Strategy):
         self._states: Dict[str, _GridState] = {}
         self._ml_predictor = None
         self._price_predictors: dict = {}
+        self._broker = None  # set by engine; used to credit margin on SL
 
     def _lev(self) -> float:
         """Pinned leverage from params (backtest/sweep determinism) or live dashboard value."""
@@ -617,6 +618,19 @@ class GridStrategy(Strategy):
                               leverage=lev)
                 except Exception:
                     pass
+                # Credit margin + PnL back to the paper broker balance.
+                # The broker never sees the SL fill (the sell order is just
+                # cancelled in _sync_orders), so without this the margin
+                # from the original buy fill is permanently lost.
+                if self._broker is not None:
+                    try:
+                        from execution.paper import PaperBroker
+                        if isinstance(self._broker, PaperBroker):
+                            sl_fee = (price + buy_price) * qty * KRAKEN_FEE
+                            credit = buy_price * qty / lev + (price - buy_price) * qty - sl_fee
+                            self._broker.sl_credit(symbol, credit)
+                    except Exception:
+                        pass
                 ctx.remove_position(symbol, "grid")
                 # Remove from orders after SL
                 state.orders.pop(cid, None)

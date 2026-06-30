@@ -129,6 +129,15 @@ def main():
     if paper:
         from execution.paper import PaperBroker
         broker = PaperBroker(initial_balance=initial_investment, symbols=symbols)
+        try:
+            from dashboard.db import load_paper_balances
+            saved = load_paper_balances()
+            if saved and set(saved.keys()) == set(symbols):
+                broker.load_balances(saved)
+                logger.info("PaperBroker: Balances aus DB geladen: %s",
+                            {k: f"{v:.2f}" for k, v in saved.items()})
+        except Exception as _e:
+            logger.debug("PaperBroker balance restore skipped: %s", _e)
         reconciler = None
     else:
         from execution.kraken import KrakenBroker

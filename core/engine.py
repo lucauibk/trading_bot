@@ -49,6 +49,9 @@ class Engine:
         self.ctx = ctx or MarketContext()
         self.reconciler = reconciler
         self._shutdown = ShutdownFlag()
+        # Give the strategy a broker reference so SL events can credit the balance.
+        if hasattr(strategy, "_broker"):
+            strategy._broker = broker
         self._loop_count = 0
         self._initial_capital = initial_capital
 
@@ -188,7 +191,7 @@ class Engine:
             # price hovering near the grid edge does not cause a rebuild storm.
             rebuild_allowed = do_rebuild or (
                 out_of_range and
-                self._loop_count - self._last_rebuild.get(sym, 0) >= 20
+                self._loop_count - self._last_rebuild.get(sym, 0) >= 40
             )
             if rebuild_allowed and hasattr(self.strategy, "setup_grid"):
                 # Note: setup_grid runs even during a daily-drawdown freeze because
@@ -501,9 +504,14 @@ class Engine:
 
             total = balance + mtm
             self.ctx.set_equity(total)
-            from dashboard.db import log_equity, update_capital
+            from dashboard.db import log_equity, update_capital, save_paper_balances
             log_equity(total)
             update_capital(total)
+            if hasattr(self.broker, "_balances") and self.broker._balances:
+                try:
+                    save_paper_balances(dict(self.broker._balances))
+                except Exception:
+                    pass
         except Exception:
             pass
 

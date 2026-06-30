@@ -165,6 +165,7 @@ def _init(con: sqlite3.Connection):
         ("stats_reset_at", "TEXT DEFAULT NULL"),
         ("frozen", "INTEGER DEFAULT 0"),
         ("frozen_reason", "TEXT DEFAULT NULL"),
+        ("paper_balances", "TEXT DEFAULT NULL"),
     ]:
         try:
             con.execute(f"ALTER TABLE bot_status ADD COLUMN {col} {coldef}")
@@ -529,3 +530,21 @@ def get_stats_reset_at():
     row = con.execute("SELECT stats_reset_at FROM bot_status WHERE id=1").fetchone()
     con.close()
     return row["stats_reset_at"] if row else None
+
+
+def save_paper_balances(balances: dict) -> None:
+    import json
+    con = get_conn()
+    con.execute("UPDATE bot_status SET paper_balances=? WHERE id=1", (json.dumps(balances),))
+    con.commit()
+    con.close()
+
+
+def load_paper_balances():
+    import json
+    con = get_conn()
+    row = con.execute("SELECT paper_balances FROM bot_status WHERE id=1").fetchone()
+    con.close()
+    if row and row["paper_balances"]:
+        return json.loads(row["paper_balances"])
+    return None
