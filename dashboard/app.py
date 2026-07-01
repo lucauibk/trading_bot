@@ -332,6 +332,19 @@ def api_coin_settings_post():
     return jsonify({"ok": True, "msg": f"{symbol} gespeichert: {max_inv:.0f} USDT"})
 
 
+@app.route("/api/coin-settings/mtf", methods=["POST"])
+def api_coin_mtf_post():
+    from dashboard.db import set_mtf_auto_execute
+    data = request.get_json() or {}
+    symbol = data.get("symbol", "").strip().upper()
+    if not symbol:
+        return jsonify({"ok": False, "msg": "Symbol fehlt"})
+    enabled = bool(data.get("mtf_auto_execute", False))
+    set_mtf_auto_execute(symbol, enabled)
+    state = "aktiviert" if enabled else "deaktiviert"
+    return jsonify({"ok": True, "msg": f"MTF Auto-Execute {state} für {symbol}"})
+
+
 @app.route("/stream", methods=["GET"])
 def stream():
     def generate():

@@ -136,6 +136,19 @@ def _init(con: sqlite3.Connection):
             created_at  TEXT
         );
     """)
+    con.executescript("""
+        CREATE TABLE IF NOT EXISTS mtf_state (
+            symbol       TEXT PRIMARY KEY,
+            daily_bias   TEXT DEFAULT 'neutral',
+            confirmed_4h INTEGER DEFAULT 0,
+            daily_adx    REAL DEFAULT 0,
+            zone_low     REAL DEFAULT 0,
+            zone_high    REAL DEFAULT 0,
+            direction    TEXT DEFAULT '',
+            target       REAL DEFAULT 0,
+            updated_at   TEXT
+        );
+    """)
     for col, coldef in [
         ("predicted_low",  "REAL DEFAULT 0"),
         ("predicted_high", "REAL DEFAULT 0"),
@@ -146,6 +159,13 @@ def _init(con: sqlite3.Connection):
     ]:
         try:
             con.execute(f"ALTER TABLE grid_state ADD COLUMN {col} {coldef}")
+        except Exception:
+            pass
+    for col, coldef in [
+        ("mtf_auto_execute", "INTEGER DEFAULT 0"),
+    ]:
+        try:
+            con.execute(f"ALTER TABLE coin_settings ADD COLUMN {col} {coldef}")
         except Exception:
             pass
     for col, coldef in [
@@ -548,3 +568,60 @@ def load_paper_balances():
     if row and row["paper_balances"]:
         return json.loads(row["paper_balances"])
     return None
+
+
+def update_mtf_state(symbol: str, bias: dict, setup: dict = None):
+    """UPSERT den aktuellen MTF-Status (Bias + optionale Retest-Zone) für ein Symbol."""
+    from datetime import datetime
+    con = get_conn()
+    zone_low  = setup["zone_low"]  if setup else 0.0
+    zone_high = setup["zone_high"] if setup else 0.0
+    direction = setup["direction"] if setup else ""
+    target    = setup["target"]    if setup else 0.0
+    con.execute(
+        """INSERT INTO mtf_state
+               (symbol, daily_bias, confirmed_4h, daily_adx,
+                zone_low, zone_high, direction, target, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(symbol) DO UPDATE SET
+               daily_bias=excluded.daily_bias,
+               confirmed_4h=excluded.confirmed_4h,
+               daily_adx=excluded.daily_adx,
+               zone_low=excluded.zone_low,
+               zone_high=excluded.zone_high,
+               direction=excluded.direction,
+               target=excluded.target,
+               updated_at=excluded.updated_at""",
+        (symbol, bias.get("daily_bias", "neutral"),
+         1 if bias.get("confirmed_4h") else 0,
+         bias.get("daily_adx", 0.0),
+         zone_low, zone_high, direction, target,
+         datetime.utcnow().isoformat())
+    )
+    con.commit()
+    con.close()
+
+
+def get_mtf_auto_execute(symbol: str) -> bool:
+    """Gibt zurück ob MTF-Auto-Execute für dieses Symbol aktiviert ist."""
+    con = get_conn()
+    row = con.execute(
+        "SELECT mtf_auto_execute FROM coin_settings WHERE symbol=?", (symbol,)
+    ).fetchone()
+    con.close()
+    return bool(row["mtf_auto_execute"]) if row and row["mtf_auto_execute"] is not None else False
+
+
+def set_mtf_auto_execute(symbol: str, enabled: bool) -> None:
+    from datetime import datetime
+    con = get_conn()
+    con.execute(
+        """INSERT INTO coin_settings (symbol, max_investment, enabled, mtf_auto_execute, updated_at)
+           VALUES (?, 300.0, 1, ?, ?)
+           ON CONFLICT(symbol) DO UPDATE SET
+               mtf_auto_execute=excluded.mtf_auto_execute,
+               updated_at=excluded.updated_at""",
+        (symbol, 1 if enabled else 0, datetime.utcnow().isoformat())
+    )
+    con.commit()
+    con.close()

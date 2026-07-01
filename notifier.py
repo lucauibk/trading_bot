@@ -57,6 +57,43 @@ def notify_trade_close(symbol: str, direction: str, entry: float, exit_price: fl
     _send(text)
 
 
+def notify_mtf_zone_reached(symbol: str, direction: str, zone_low: float, zone_high: float,
+                            current_price: float, structure_level: float):
+    arrow = "📈" if direction == "long" else "📉"
+    _send(
+        f"{arrow} <b>MTF Retest-Zone erreicht</b>\n"
+        f"Symbol:    <code>{symbol}</code>\n"
+        f"Richtung:  <b>{'LONG' if direction == 'long' else 'SHORT'}</b>\n"
+        f"Zone:      <code>{zone_low:.4f} – {zone_high:.4f}</code>\n"
+        f"Struktur:  <code>{structure_level:.4f}</code>\n"
+        f"Preis:     <code>{current_price:.4f}</code>"
+    )
+
+
+def notify_mtf_target_reached(symbol: str, direction: str, entry: float, target: float,
+                               current_price: float, auto_executed: bool):
+    tag = "✅ (auto)" if auto_executed else "✅"
+    _send(
+        f"{tag} <b>MTF Ziel erreicht</b>\n"
+        f"Symbol:  <code>{symbol}</code>\n"
+        f"Entry:   <code>{entry:.4f}</code>\n"
+        f"Target:  <code>{target:.4f}</code>\n"
+        f"Preis:   <code>{current_price:.4f}</code>"
+    )
+
+
+def notify_mtf_invalidated(symbol: str, direction: str, entry: float, exit_price: float,
+                            pnl: float, zone_low: float, zone_high: float):
+    _send(
+        f"❌ <b>MTF Setup invalidiert</b>\n"
+        f"Symbol:  <code>{symbol}</code>\n"
+        f"Entry:   <code>{entry:.4f}</code>\n"
+        f"Exit:    <code>{exit_price:.4f}</code>\n"
+        f"PnL:     <b>{pnl:+.2f} USDT</b>\n"
+        f"Zone:    <code>{zone_low:.4f} – {zone_high:.4f}</code>"
+    )
+
+
 def notify_error(message: str):
     _send(f"⚠️ <b>Bot-Fehler</b>\n{message}")
 

@@ -263,6 +263,18 @@
   </div>
 
 
+  <!-- Coin-Einstellungen -->
+  <div class="chart-card" id="coin-settings-section" style="display:none">
+    <div class="section-head">
+      <h2>⚙️ Coin-Einstellungen</h2>
+      <button class="btn btn-ghost btn-sm" onclick="loadCoinSettings()">↺ Aktualisieren</button>
+    </div>
+    <div id="coin-settings-container" style="display:flex;flex-direction:column;gap:8px"></div>
+    <div style="font-size:11px;color:var(--text-faint);margin-top:10px">
+      MTF Auto-Execute: Öffnet automatisch einen Directional Trade wenn der 5m-Entry-Trigger innerhalb der MTF-Retest-Zone ausgelöst wird.
+    </div>
+  </div>
+
   <!-- Offene Positionen -->
   <div class="chart-card">
     <div class="section-head"><h2>📦 Offene Positionen</h2></div>
@@ -664,6 +676,51 @@ async function refreshGrids() {
   }).join('');
 }
 
+// ── Coin-Einstellungen ────────────────────────────────────────────────────────
+async function loadCoinSettings() {
+  try {
+    const r = await fetch('/api/coin-settings');
+    const rows = await r.json();
+    if (!rows || rows.length === 0) return;
+    document.getElementById('coin-settings-section').style.display = '';
+    const container = document.getElementById('coin-settings-container');
+    container.innerHTML = rows.map(row => {
+      const sym = row.symbol;
+      const mtf = row.mtf_auto_execute ? 1 : 0;
+      const toggleId = `mtf-toggle-${sym.replace('/', '-')}`;
+      return `
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--bg-soft);border:1px solid var(--border);border-radius:8px">
+          <span style="font-size:13px;color:var(--text);font-weight:500">${sym}</span>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:11px;color:var(--text-dim)">MTF Auto-Execute</span>
+            <label class="toggle">
+              <input type="checkbox" id="${toggleId}" ${mtf ? 'checked' : ''} onchange="setMtfAutoExecute('${sym}', this.checked)">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>`;
+    }).join('');
+  } catch (_) {}
+}
+
+async function setMtfAutoExecute(symbol, enabled) {
+  try {
+    const r = await fetch('/api/coin-settings/mtf', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol, mtf_auto_execute: enabled })
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      console.error('MTF toggle Fehler:', d.msg);
+      await loadCoinSettings();
+    }
+  } catch (e) {
+    console.error('MTF toggle Fehler:', e);
+    await loadCoinSettings();
+  }
+}
+
 // ── Hebel-Toggle ─────────────────────────────────────────────────────────────
 async function loadLeverage() {
   try {
@@ -728,9 +785,11 @@ refresh();
 refreshGrids();
 loadLeverage();
 loadCapital();
+loadCoinSettings();
 setInterval(refresh, 10000);
 setInterval(refreshGrids, 10000);
 setInterval(loadLeverage, 15000);
+setInterval(loadCoinSettings, 30000);
 </script>
 </body>
 </html>

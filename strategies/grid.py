@@ -128,6 +128,11 @@ class GridStrategy(Strategy):
         self._ml_predictor = None
         self._price_predictors: dict = {}
         self._broker = None  # set by engine; used to credit margin on SL
+        # MTF analyzer state (symbol → MTFAnalyzer / bias / setup)
+        self._mtf_analyzers: dict = {}
+        self._mtf_bias: dict = {}
+        self._mtf_setup: dict = {}
+        self._mtf_bias_ts: dict = {}
 
     def _lev(self) -> float:
         """Pinned leverage from params (backtest/sweep determinism) or live dashboard value."""
@@ -159,6 +164,18 @@ class GridStrategy(Strategy):
         except Exception as e:
             logger.warning("PricePredictor unavailable: %s", e)
 
+        try:
+            from price_predictor.mtf_analyzer import MTFAnalyzer
+            from data_fetcher import fetch_ohlcv
+            for sym in symbols:
+                self._mtf_analyzers[sym] = MTFAnalyzer(sym, fetch_ohlcv)
+                self._mtf_bias[sym] = {"daily_bias": "neutral", "confirmed_4h": False, "daily_adx": 0.0}
+                self._mtf_setup[sym] = None
+                self._mtf_bias_ts[sym] = 0.0
+            logger.info("MTFAnalyzer initialized for %d symbols", len(symbols))
+        except Exception as e:
+            logger.warning("MTFAnalyzer unavailable: %s", e)
+
         logger.info("GridStrategy initialized for %d symbols", len(symbols))
 
     def on_candle(self, symbol: str, df: pd.DataFrame, ctx: MarketContext) -> None:
@@ -179,6 +196,7 @@ class GridStrategy(Strategy):
             self._update_trend_filter(state, df)
 
         self._refresh_prediction(symbol, df, ctx)
+        self._refresh_mtf_setup(symbol)
 
     def _update_trend_filter(self, state: _GridState, df: pd.DataFrame) -> None:
         """ML-independent hard downtrend detection with 2-candle exit hysteresis."""
@@ -541,6 +559,7 @@ class GridStrategy(Strategy):
         self._check_position_stops(symbol, price, state, ctx)
         self._check_directional(symbol, price, state, ctx)
         self._maybe_open_directional(symbol, price, state, ctx)
+        self._check_mtf_entry(symbol, price, state, ctx)
         self._update_trailing_stops(symbol, price, state)
 
         return []
@@ -575,6 +594,89 @@ class GridStrategy(Strategy):
                 if trailing_sl > current_sl:
                     order["sl_price"] = trailing_sl
                     logger.debug("[TRAIL] %s SL trailed to %.4f", symbol, trailing_sl)
+
+    def _refresh_mtf_setup(self, symbol: str) -> None:
+        """Aktualisiert MTF-Bias (alle 30min) und Retest-Setup (jede on_candle Iteration)."""
+        if symbol not in self._mtf_analyzers:
+            return
+        if time.time() - self._mtf_bias_ts.get(symbol, 0) > 1800:
+            try:
+                bias = self._mtf_analyzers[symbol].refresh_bias()
+                self._mtf_bias[symbol] = bias
+                self._mtf_bias_ts[symbol] = time.time()
+            except Exception as e:
+                logger.warning("MTF bias refresh %s: %s", symbol, e)
+        try:
+            bias = self._mtf_bias.get(symbol, {})
+            self._mtf_setup[symbol] = self._mtf_analyzers[symbol].find_retest_setup(bias)
+        except Exception as e:
+            logger.warning("MTF setup refresh %s: %s", symbol, e)
+        try:
+            if not os.getenv("GRIDBOT_BACKTEST"):
+                from dashboard.db import update_mtf_state
+                update_mtf_state(symbol, self._mtf_bias.get(symbol, {}), self._mtf_setup.get(symbol))
+        except Exception:
+            pass
+
+    def _check_mtf_entry(self, symbol: str, price: float,
+                         state: _GridState, ctx: MarketContext) -> None:
+        """Prüft 5m-Einstiegs-Trigger innerhalb der MTF-Retest-Zone."""
+        if symbol not in self._mtf_analyzers or state._directional:
+            return
+        setup = self._mtf_setup.get(symbol)
+        if not setup:
+            return
+        try:
+            trigger = self._mtf_analyzers[symbol].check_entry_trigger(setup, price)
+        except Exception as e:
+            logger.debug("MTF entry check %s: %s", symbol, e)
+            return
+        if not trigger:
+            return
+        logger.info("[MTF] %s Entry-Trigger @ %.4f RSI=%.1f (zone %.4f–%.4f)",
+                    symbol, trigger["trigger_price"], trigger["rsi"],
+                    setup["zone_low"], setup["zone_high"])
+        try:
+            if not os.getenv("GRIDBOT_BACKTEST"):
+                import notifier
+                notifier.notify_mtf_zone_reached(
+                    symbol, setup["direction"],
+                    setup["zone_low"], setup["zone_high"],
+                    price, setup["level"]
+                )
+        except Exception:
+            pass
+        # Bot ist long-only — SHORT-MTF-Setups nur als Alarm, kein Auto-Execute
+        if setup["direction"] != "long":
+            return
+        # Auto-execute only if enabled in dashboard coin settings
+        auto_exec = False
+        try:
+            if not os.getenv("GRIDBOT_BACKTEST"):
+                from dashboard.db import get_mtf_auto_execute
+                auto_exec = get_mtf_auto_execute(symbol)
+        except Exception:
+            pass
+        if not auto_exec or not self._buys_allowed(state):
+            return
+        usdt = state.investment * self.p.directional_pct
+        if self._risk is not None:
+            allowed, reason = self._risk.can_open(symbol, usdt, ctx)
+            if not allowed:
+                logger.debug("[MTF] %s blocked by risk: %s", symbol, reason)
+                return
+        lev = self._lev()
+        qty = usdt * lev / price
+        tp = setup["target"]
+        atr = setup.get("atr") or state._atr or price * 0.02
+        sl = (setup["zone_low"] - atr if setup["direction"] == "long"
+              else setup["zone_high"] + atr)
+        state._directional = {
+            "entry": price, "qty": qty, "usdt": usdt,
+            "tp": tp, "sl": sl, "entry_ts": time.time(), "mtf": True,
+        }
+        logger.info("[MTF] %s AUTO DIRECTIONAL %s @ %.4f | TP=%.4f SL=%.4f",
+                    symbol, setup["direction"].upper(), price, tp, sl)
 
     def _check_position_stops(self, symbol: str, price: float,
                                state: _GridState, ctx: MarketContext):
