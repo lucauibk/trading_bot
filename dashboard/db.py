@@ -3,12 +3,20 @@ SQLite-Datenbank für Trade-History und Bot-Status.
 """
 
 import sqlite3
+import threading
 from pathlib import Path
 
 DB_PATH = Path(__file__).parents[1] / "data" / "trades.db"
 
+# Schema-Init nur einmal pro Prozess: get_conn() wird im Hot-Path aufgerufen
+# (u.a. get_leverage pro Order pro Tick) — das volle DDL-_init bei jedem Call
+# waren hunderte executescript-Roundtrips pro Tick (P1-Fix Review 2026-07-02).
+_schema_lock = threading.Lock()
+_schema_ready = False
+
 
 def get_conn() -> sqlite3.Connection:
+    global _schema_ready
     DB_PATH.parent.mkdir(exist_ok=True)
     # timeout=30 + WAL: dashboard, bot loop and ML-retrain thread all hit this DB
     # concurrently.  WAL lets readers and a writer coexist; busy_timeout waits out
@@ -18,7 +26,11 @@ def get_conn() -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=30000")
-    _init(con)
+    if not _schema_ready:
+        with _schema_lock:
+            if not _schema_ready:
+                _init(con)
+                _schema_ready = True
     return con
 
 

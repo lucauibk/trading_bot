@@ -465,6 +465,7 @@ class GridStrategy(Strategy):
                 "leverage": lev,
                 "trailing_activated": False,
                 "momentum_holds": 0,
+                "entry_ts": time.time(),
             }
             state.price_to_id[sell_price] = sell_cid
             ctx.add_position(Position(
@@ -543,6 +544,7 @@ class GridStrategy(Strategy):
                 "leverage": lev,
                 "trailing_activated": False,
                 "momentum_holds": 0,
+                "entry_ts": time.time(),
             }
             state.price_to_id[sell_price] = sell_cid
             logger.info("[GRID] BUY fill %s @ %.4f | SL=%.4f | -> sell @ %.4f",
