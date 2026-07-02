@@ -40,6 +40,16 @@ def main():
 
     # Live safety check
     if not paper:
+        # Hartes Live-Gate (Review 2026-07-02): Paper-Modell und KrakenBroker
+        # sind ökonomisch nicht paritätisch — Start verweigern, bevor irgendein
+        # Zustand angefasst wird. Details: execution/kraken.py LIVE_PARITY_BLOCKERS.
+        from execution.kraken import LIVE_PARITY_OK, LIVE_PARITY_BLOCKERS
+        if not LIVE_PARITY_OK:
+            logger.error("LIVE-MODUS GESPERRT: Paper- und Live-Pfad divergieren ökonomisch. Blocker:")
+            for b in LIVE_PARITY_BLOCKERS:
+                logger.error("  - %s", b)
+            logger.error("Freischalten: Blocker beheben und LIVE_PARITY_OK=True in execution/kraken.py setzen.")
+            sys.exit(2)
         api_key = os.getenv("KRAKEN_API_KEY", os.getenv("BINANCE_API_KEY", ""))
         api_secret = os.getenv("KRAKEN_API_SECRET", os.getenv("BINANCE_API_SECRET", ""))
         if not api_key:

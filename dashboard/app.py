@@ -44,6 +44,13 @@ def api_start():
     mode = data.get("mode", "paper")
 
     if mode == "live":
+        # Live-Gate (Review 2026-07-02): main.py würde sofort mit Exit 2 abbrechen —
+        # hier direkt eine klare Fehlermeldung statt eines still sterbenden Prozesses.
+        from execution.kraken import LIVE_PARITY_OK
+        if not LIVE_PARITY_OK:
+            return jsonify({"ok": False,
+                            "msg": "Live-Modus gesperrt: Paper/Live nicht paritätisch "
+                                   "(siehe execution/kraken.py LIVE_PARITY_BLOCKERS)"})
         if not data.get("confirmed"):
             return jsonify({"ok": False, "confirm": True,
                             "msg": "Live Trading bestätigen?"})

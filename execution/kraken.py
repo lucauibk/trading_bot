@@ -26,6 +26,24 @@ KRAKEN_FEE = 0.0016
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 1.5  # seconds
 
+# ── Live-Gate (Review 2026-07-02) ────────────────────────────────────────────
+# Der Live-Pfad ist ökonomisch NICHT paritätisch zum Paper-Modell. Solange die
+# Blocker unten nicht behoben sind, verweigert main.py den Live-Start hart —
+# stillschweigendes Divergieren zwischen Paper und Live wäre gefährlicher als
+# gar kein Live-Modus. Zum Freischalten: Blocker beheben, dann Flag auf True
+# setzen (bewusste Code-Änderung, kein ENV-Override).
+LIVE_PARITY_OK = False
+LIVE_PARITY_BLOCKERS = [
+    "Spot-only (defaultType=spot): Paper rechnet Margin/Leverage (qty=usdt*lev/preis), "
+    "Kraken-Spot kennt weder Leverage noch Shorts",
+    "Pre-seeded Sells (Grid oberhalb des Preises) werden auf Spot ohne Bestand abgelehnt "
+    "→ Dauerfehler bei jedem Grid-Aufbau",
+    "_client_to_exchange nur in-memory: nach Restart sind alle offenen Orders verwaist, "
+    "reconcile_fills liefert client_id='' (Order-Map muss persistiert werden)",
+    "Strategy-seitige SL/Directional-Exits platzieren keine echten Market-Orders "
+    "(nur Paper-Bookkeeping via sl_credit)",
+]
+
 
 def _with_retry(fn, *args, **kwargs):
     last_exc = None
