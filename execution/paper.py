@@ -108,18 +108,23 @@ class PaperBroker(Broker):
         return order
 
     def cancel(self, client_id: str) -> bool:
+        # Gecancelte Orders sofort entfernen: _orders wuchs sonst unbegrenzt und
+        # update_price iterierte über jede jemals platzierte Order — O(n²) über
+        # einen Dauerlauf bzw. Backtest (Perf-Fix Review 2026-07-02).
         order = self._orders.get(client_id)
         if order and order.status == "open":
             order.status = "cancelled"
+            del self._orders[client_id]
             logger.debug("[PAPER] cancelled %s", client_id[:8])
             return True
         return False
 
     def cancel_all(self, symbol: str) -> int:
         count = 0
-        for order in self._orders.values():
+        for cid, order in list(self._orders.items()):
             if order.symbol == symbol and order.status == "open":
                 order.status = "cancelled"
+                del self._orders[cid]
                 count += 1
         return count
 
@@ -181,6 +186,10 @@ class PaperBroker(Broker):
 
                 order.status     = "filled"
                 order.filled_qty = order.qty
+                # Gefüllte Orders aus dem Buch entfernen (siehe cancel):
+                # der Fill wird unten als Fill-Objekt zurückgegeben, die Order
+                # selbst wird nie wieder gebraucht.
+                del self._orders[order.client_id]
 
                 fill = Fill(
                     client_id=order.client_id,
