@@ -482,6 +482,17 @@ class GridStrategy(Strategy):
         qty = order["qty"]
         lev = self._lev()
 
+        if order.get("pre_seeded"):
+            # Pre-seeded Sells hatten nie einen echten Buy — es gibt kein PnL,
+            # keinen Trade und kein Cash. Auf Kraken Spot könnte diese Order ohne
+            # Bestand gar nicht existieren; jede Gutschrift hier wäre Phantom-Profit
+            # (P0-Fix Review 2026-07-02: ~80% des historischen grid_fill-PnL).
+            # Der Replenish-Buy darunter ist dagegen eine echte Order und bleibt.
+            logger.info("[GRID] SEED fill %s @ %.4f — kein PnL (pre-seeded, kein echter Kauf)",
+                        fill.symbol, sell_price)
+            self._replenish_after_sell(state, order, buy_price)
+            return
+
         profit = (sell_price - buy_price) * qty
         fee = (sell_price + buy_price) * qty * KRAKEN_FEE
         net = profit - fee
@@ -521,34 +532,37 @@ class GridStrategy(Strategy):
         except Exception:
             pass
 
-        # Smart-replenish: follow trend one level higher when bullish
-        if self._buys_allowed(state):
-            new_cid = str(uuid.uuid4())
-            replenish_usdt = state.usdt_per_grid
-            if state._direction_score > 0.1:
-                # Follow trend upward: place replenish at next higher level
-                try:
-                    current_idx = state.grid_lines.index(order["price"])
-                    if current_idx < len(state.grid_lines) - 1:
-                        new_buy_price = state.grid_lines[current_idx + 1]
-                    else:
-                        new_buy_price = buy_price
-                except (ValueError, IndexError):
-                    new_buy_price = buy_price
-            else:
-                new_buy_price = buy_price
-            new_qty = replenish_usdt * lev / new_buy_price
-            state.orders[new_cid] = {
-                "side": "buy",
-                "price": new_buy_price,
-                "qty": new_qty,
-                "filled": False,
-            }
-            state.price_to_id[new_buy_price] = new_cid
+        self._replenish_after_sell(state, order, buy_price)
 
-        if not order.get("pre_seeded"):
-            ctx.remove_position(fill.symbol, "grid")
+        ctx.remove_position(fill.symbol, "grid")
         self._maybe_compound(sell_price, state)
+
+    def _replenish_after_sell(self, state: _GridState, order: dict, buy_price: float):
+        """Smart-replenish nach einem Sell-Fill: neuer Buy am selben Level,
+        bei bullischem Score ein Level höher (follow trend)."""
+        if not self._buys_allowed(state):
+            return
+        new_cid = str(uuid.uuid4())
+        replenish_usdt = state.usdt_per_grid
+        if state._direction_score > 0.1:
+            try:
+                current_idx = state.grid_lines.index(order["price"])
+                if current_idx < len(state.grid_lines) - 1:
+                    new_buy_price = state.grid_lines[current_idx + 1]
+                else:
+                    new_buy_price = buy_price
+            except (ValueError, IndexError):
+                new_buy_price = buy_price
+        else:
+            new_buy_price = buy_price
+        new_qty = replenish_usdt * self._lev() / new_buy_price
+        state.orders[new_cid] = {
+            "side": "buy",
+            "price": new_buy_price,
+            "qty": new_qty,
+            "filled": False,
+        }
+        state.price_to_id[new_buy_price] = new_cid
 
     def _maybe_compound(self, price: float, state: _GridState):
         if state.total_profit <= 0:

@@ -11,8 +11,10 @@ can starve the others.  Orders sized with leverage use *margin* accounting:
          = return of margin + leveraged P&L
 
 Pre-seeded sell orders (placed during grid setup without a real buy fill) never
-had margin deposited, so they credit only the profit leg:
-  pre_seeded sell → credit  (fill_price − bought_at) × qty  −  fee
+had margin deposited and therefore credit NOTHING on fill — on a real spot
+exchange a sell without inventory is rejected, so any credit here would be
+phantom profit (P0-Fix Review 2026-07-02):
+  pre_seeded sell → credit  0
 
 Fallback: if leverage/bought_at are not in order.meta the broker falls back to
 the simple full-notional model (backward-compatible with tests that don't set meta).
@@ -164,8 +166,11 @@ class PaperBroker(Broker):
                     bought_at  = float(order.meta.get("bought_at", fill_price))
 
                     if pre_seeded:
-                        # No margin was deposited for pre-seeded sells → credit profit only
-                        credit = (fill_price - bought_at) * order.qty - fee
+                        # Pre-seeded Sells hatten nie einen Buy → es gibt nichts
+                        # zu krediteren. Jede Gutschrift wäre Cash aus dem Nichts,
+                        # das auf Kraken Spot (Sell ohne Bestand wird abgelehnt)
+                        # unmöglich ist (P0-Fix Review 2026-07-02).
+                        credit = 0.0
                     else:
                         # Return margin + leveraged P&L
                         margin_return = bought_at * order.qty / leverage

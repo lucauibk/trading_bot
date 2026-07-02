@@ -322,6 +322,37 @@ class TestGridStrategy:
         assert state.orders[cid]["trailing_activated"] is True
         assert state.orders[cid]["sl_price"] >= 100.0  # SL moved to break-even
 
+    def test_pre_seeded_fill_books_no_pnl_and_no_cash(self):
+        """P0-Regression (Review 2026-07-02): Pre-seeded Sells (kein echter Kauf)
+        dürfen weder PnL buchen noch Cash krediteren — sonst Phantom-Profit."""
+        from core.context import MarketContext
+        from core.strategy import Fill
+        from execution.paper import PaperBroker
+
+        strategy = self._strategy()
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+
+        cid = str(uuid.uuid4())
+        state.orders[cid] = {
+            "side": "sell", "price": 101.0, "qty": 1.0, "filled": False,
+            "bought_at": 100.0, "pre_seeded": True,
+        }
+        fill = Fill(client_id=cid, symbol="SOL/USD", side="sell",
+                    price=101.0, qty=1.0, fee=0.16, ts=time.time())
+        strategy.on_fill(fill, ctx)
+        assert state.total_profit == 0.0, "Seed-Fill darf kein PnL buchen"
+        assert state.trade_count == 0, "Seed-Fill ist kein Trade"
+
+        broker = PaperBroker(initial_balance=100.0, symbols=["SOL/USD"])
+        broker.place_limit("SOL/USD", "sell", 101.0, 1.0,
+                           meta={"pre_seeded": True, "bought_at": 100.0, "leverage": 3.0})
+        broker.update_price("SOL/USD", 100.0)
+        fills = broker.update_price("SOL/USD", 102.0)
+        assert len(fills) == 1
+        assert broker.get_balance() == 100.0, "Seed-Fill darf kein Cash krediteren"
+
     def test_compounding_increases_investment(self):
         from core.context import MarketContext
         strategy = self._strategy()
