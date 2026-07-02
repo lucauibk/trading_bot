@@ -111,3 +111,49 @@ def fetch_ohlcv_since(symbol: str, timeframe: str, since_iso: str, limit: int = 
     df.set_index("timestamp", inplace=True)
     df = df[~df.index.duplicated(keep="last")]
     return df.astype(float)
+
+
+def fetch_funding_history(perp_symbol: str, since_iso: str, limit: int = 1000) -> pd.DataFrame:
+    """Historische Funding-Raten via Binance-Perp (8h-Intervall, bis 2 Jahre).
+
+    perp_symbol: ccxt-Perp-Notation, z.B. "SOL/USDT:USDT".
+    Rückgabe: DataFrame mit UTC-Index und Spalte "rate" (Funding-Rate, z.B. 0.0001).
+    OI wird bewusst NICHT geladen — Binance hält nur ~30 Tage OI-Historie vor.
+    """
+    binance = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "future"}})
+    since_ms = binance.parse8601(since_iso)
+    now_ms = binance.milliseconds()
+    rows: list = []
+
+    while True:
+        batch = _with_retry(
+            binance.fetch_funding_rate_history, perp_symbol, since=since_ms, limit=limit
+        )
+        if not batch:
+            break
+        rows.extend(batch)
+        last_ts = batch[-1]["timestamp"]
+        since_ms = last_ts + 1
+
+        # Funding wird alle 8h gepostet → wenn wir bis <8h an jetzt heran sind, fertig
+        if now_ms - last_ts < 8 * 60 * 60 * 1000:
+            break
+        time.sleep(binance.rateLimit / 1000)
+        print(f"  ...{len(rows)} Funding-Punkte geladen", end="\r")
+
+    if not rows:
+        return pd.DataFrame(columns=["rate"])
+
+    df = pd.DataFrame(
+        [{"timestamp": r["timestamp"], "rate": float(r["fundingRate"])} for r in rows]
+    )
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df.set_index("timestamp", inplace=True)
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    return df
+
+
+def perp_symbol_for(spot_symbol: str) -> str:
+    """Mappt Spot-Symbol ("SOL/USD") auf Binance-Perp ("SOL/USDT:USDT")."""
+    base = spot_symbol.split("/")[0]
+    return f"{base}/USDT:USDT"

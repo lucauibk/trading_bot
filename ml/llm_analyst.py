@@ -190,17 +190,54 @@ def blend_scores(lgbm_score: float, lgbm_confidence: float,
     Kombiniert LightGBM- und LLM-Score.
     Gibt (blended_score, blended_confidence) zurück.
     score: -1.0 (down) … +1.0 (up)
+
+    Konfidenz-Logik:
+    - Agreement (beide zeigen gleiche Richtung): max(lgbm_conf, llm_conf)
+      → Stärkstes Signal gilt, kein künstliches Mitteln nach unten.
+    - Disagreement (entgegengesetzte Richtungen): Durchschnitt × 0.7 Penalty
+    - Einer neutral: gewichteter Durchschnitt (heutiges Verhalten)
     """
     if llm_result is None or llm_result["confidence"] < LLM_CONFIDENCE_MIN:
         return lgbm_score, lgbm_confidence
 
     llm_score = llm_result["score"]
-    blended   = (1 - LLM_WEIGHT) * lgbm_score + LLM_WEIGHT * llm_score
-    blended_conf = (1 - LLM_WEIGHT) * lgbm_confidence + LLM_WEIGHT * llm_result["confidence"]
+    llm_conf  = llm_result["confidence"]
 
+    blended = (1 - LLM_WEIGHT) * lgbm_score + LLM_WEIGHT * llm_score
+
+    def _dir(s: float) -> str:
+        # Binary models produce dir_score = P(up)-P(down) in [-1,+1];
+        # a 0.02 lean means the model assigns 51% to one direction — real signal for binary.
+        if s > 0.02:  return "up"
+        if s < -0.02: return "down"
+        return "neutral"
+
+    lgbm_dir = _dir(lgbm_score)
+    llm_dir  = _dir(llm_score)
+
+    if lgbm_dir != "neutral" and llm_dir != "neutral" and lgbm_dir == llm_dir:
+        # Both signals agree: use the stronger confidence
+        blended_conf = max(lgbm_confidence, llm_conf)
+        mode = "agree"
+    elif lgbm_dir != "neutral" and llm_dir != "neutral" and lgbm_dir != llm_dir:
+        # Signals contradict: penalize
+        blended_conf = ((1 - LLM_WEIGHT) * lgbm_confidence + LLM_WEIGHT * llm_conf) * 0.7
+        mode = "disagree"
+    elif lgbm_dir == "neutral" and llm_dir != "neutral" and llm_conf >= 0.70:
+        # LGBM undecided, LLM strongly directional: trust LLM signal
+        # LLM_CONFIDENCE_MIN=0.60 gate already filters weak signals; ≥0.70 is a
+        # higher bar meaning Haiku is committing to a clear directional view.
+        blended_conf = llm_conf
+        mode = "llm-strong"
+    else:
+        # One/both neutral or LLM not highly confident: weighted average
+        blended_conf = (1 - LLM_WEIGHT) * lgbm_confidence + LLM_WEIGHT * llm_conf
+        mode = "neutral"
+
+    blended_conf = min(0.95, blended_conf)
     logger.debug(
-        "Blend: LGBM=%+.2f (%.2f) + LLM=%+.2f (%.2f) → %+.2f (%.2f)",
-        lgbm_score, lgbm_confidence, llm_score, llm_result["confidence"],
-        blended, blended_conf,
+        "Blend [%s]: LGBM=%+.2f/%s(%.2f) + LLM=%+.2f/%s(%.2f) → %+.2f (%.2f)",
+        mode, lgbm_score, lgbm_dir, lgbm_confidence,
+        llm_score, llm_dir, llm_conf, blended, blended_conf,
     )
     return blended, blended_conf

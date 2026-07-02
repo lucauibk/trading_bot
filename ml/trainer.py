@@ -102,12 +102,17 @@ def bootstrap_from_history(
     store: MLDataStore,
     model: TradingModel,
     btc_df: Optional[pd.DataFrame] = None,
+    step: int = 1,
 ):
     """Generiert Trainingsdaten aus historischen OHLCV-Daten und trainiert das Modell.
 
     btc_df: optional BTC/USD OHLCV aligned to the same timeframe and covering the
     same range. When provided the trainer computes a rolling 30d BTC-correlation
     feature (btc_corr_30d) instead of the constant 0.0 placeholder.
+
+    step: Schrittweite durch den Datensatz. step=6 = jeden 6. Candle (≈4h-Äquivalent),
+    reduziert O(n²)-Iterationen auf O(n²/step) und verringert Autokorrelation im
+    Trainingsset. Für n > 5000 Candles empfohlen.
     """
     min_window = 60
     xs, ys = [], []
@@ -120,8 +125,13 @@ def bootstrap_from_history(
         except Exception as exc:
             logger.warning("btc_corr pre-compute failed for %s: %s", symbol, exc)
 
-    for i in range(min_window, len(df) - LOOKFORWARD_H):
-        window = df.iloc[: i + 1]
+    # Lookback-Fenster: max 4800 1h-Candles reicht für alle Features inkl. EMA200 auf 1d
+    MAX_LOOKBACK = 4800
+    n_iters = (len(df) - LOOKFORWARD_H - min_window) // step
+    logger.info("Bootstrap %s: %d Candles, step=%d → ~%d Iterationen", symbol, len(df), step, n_iters)
+
+    for i in range(min_window, len(df) - LOOKFORWARD_H, step):
+        window = df.iloc[max(0, i - MAX_LOOKBACK): i + 1]
         # Resolve per-step BTC correlation (NaN → 0.0 fallback)
         btc_corr = 0.0
         if btc_corr_series is not None and i < len(btc_corr_series):

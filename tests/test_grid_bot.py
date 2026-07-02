@@ -133,9 +133,13 @@ class TestMLFeatures:
         assert (feats == 0).all()
 
     def test_market_features_zeros_when_no_data(self):
-        from ml.features.market import extract
+        from ml.features.market import extract, FEATURE_NAMES
         feats = extract(None)
-        assert (feats == 0).all()
+        # btc_corr_30d defaults to a neutral 0.5 prior when btc context is missing
+        # (commit d67be55); all other market features are 0.
+        corr_idx = FEATURE_NAMES.index("btc_corr_30d")
+        assert feats[corr_idx] == 0.5
+        assert (np.delete(feats, corr_idx) == 0).all()
 
     def test_seasonality_features_cyclic(self):
         from ml.features.seasonality import extract

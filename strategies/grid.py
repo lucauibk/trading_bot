@@ -113,6 +113,7 @@ class _GridState:
         self.floor_sl: float = 0.0
         self._hard_trend_down: bool = False
         self._trend_up_count: int = 0
+        self._fast_drop_active: bool = False   # set on fast-drop → longer resume confirmation
 
 
 class GridStrategy(Strategy):
@@ -213,16 +214,31 @@ class GridStrategy(Strategy):
         except Exception:
             return
 
-        hard_down = (ema9 < ema21 < ema50) or (adx > self.p.trend_adx_min and di_minus > di_plus)
+        # Fast-drop breakdown: catches a sharp sell-off before EMA/ADX align.
+        # Directly prevents accumulating into a falling knife (the 06-11/12 cascade).
+        fast_drop = False
+        if self.p.fast_drop_pct > 0 and len(close) > self.p.fast_drop_candles:
+            recent_ret = close.iloc[-1] / close.iloc[-1 - self.p.fast_drop_candles] - 1.0
+            fast_drop = recent_ret <= -self.p.fast_drop_pct
+
+        hard_down = fast_drop or (ema9 < ema21 < ema50) or (adx > self.p.trend_adx_min and di_minus > di_plus)
         if hard_down:
             if not state._hard_trend_down:
-                logger.info("[TREND] %s hard downtrend → grid buys paused", state.symbol)
+                logger.info("[TREND] %s hard downtrend → grid buys paused%s",
+                            state.symbol, " (fast-drop)" if fast_drop else "")
             state._hard_trend_down = True
             state._trend_up_count = 0
+            if fast_drop:
+                state._fast_drop_active = True
         elif state._hard_trend_down:
             state._trend_up_count += 1
-            if state._trend_up_count >= 2:
+            # After a fast-drop breakdown, require a longer confirmation before
+            # resuming buys — a 2-candle dead-cat bounce won't re-open accumulation
+            # into a multi-leg crash (the 2026-06-11/12 re-accumulation pattern).
+            needed = 4 if state._fast_drop_active else 2
+            if state._trend_up_count >= needed:
                 state._hard_trend_down = False
+                state._fast_drop_active = False
                 logger.info("[TREND] %s downtrend cleared → grid buys resumed", state.symbol)
 
     def _deployed_notional(self, state: _GridState) -> float:

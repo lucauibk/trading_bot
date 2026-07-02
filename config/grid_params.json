@@ -1,8 +1,11 @@
 {
-  "sl_mode": "floor",
-  "momentum_hold_max": 2,
+  "sl_mode": "per_position",
+  "momentum_hold_max": 0,
   "trend_filter_enabled": true,
   "min_step_pct": 0.006,
-  "directional_enabled": true,
+  "max_inventory_notional_mult": 1.5,
+  "fast_drop_candles": 3,
+  "fast_drop_pct": 0.04,
+  "directional_enabled": false,
   "directional_score_min": 0.15
 }

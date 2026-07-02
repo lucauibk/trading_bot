@@ -11,10 +11,19 @@ logger = logging.getLogger("ml.data_store")
 DB_PATH = Path("data/ml_training.db")
 
 
+def _conn() -> sqlite3.Connection:
+    """Connection with WAL + busy_timeout so the retrain thread's writes and
+    predict()'s reads coexist without 'database is locked' over a long run."""
+    c = sqlite3.connect(DB_PATH, timeout=30)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=30000")
+    return c
+
+
 class MLDataStore:
     def __init__(self):
         DB_PATH.parent.mkdir(exist_ok=True)
-        with sqlite3.connect(DB_PATH) as c:
+        with _conn() as c:
             c.execute("""
                 CREATE TABLE IF NOT EXISTS samples (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,7 +40,7 @@ class MLDataStore:
             c.commit()
 
     def store(self, symbol: str, ts: int, features: np.ndarray, entry_price: float, predicted: int):
-        with sqlite3.connect(DB_PATH) as c:
+        with _conn() as c:
             c.execute(
                 "INSERT OR IGNORE INTO samples "
                 "(symbol, timestamp, features, entry_price, predicted) VALUES (?,?,?,?,?)",
@@ -40,7 +49,7 @@ class MLDataStore:
             c.commit()
 
     def set_label(self, symbol: str, ts: int, label: int):
-        with sqlite3.connect(DB_PATH) as c:
+        with _conn() as c:
             c.execute(
                 "UPDATE samples SET label=? WHERE symbol=? AND timestamp=?",
                 (label, symbol, ts),
@@ -49,7 +58,7 @@ class MLDataStore:
 
     def get_unlabeled_before(self, before_ts: int) -> List[Tuple[str, int, float]]:
         """Returns [(symbol, timestamp, entry_price), ...] for samples without a label."""
-        with sqlite3.connect(DB_PATH) as c:
+        with _conn() as c:
             return c.execute(
                 "SELECT symbol, timestamp, entry_price FROM samples "
                 "WHERE label IS NULL AND timestamp <= ?",
@@ -66,7 +75,7 @@ class MLDataStore:
             q += " AND symbol=?"
             p.append(symbol)
         q += " ORDER BY timestamp"
-        with sqlite3.connect(DB_PATH) as c:
+        with _conn() as c:
             rows = c.execute(q, p).fetchall()
         if not rows:
             return np.empty((0, expected_dim), np.float32), np.empty(0, np.int32)
@@ -95,11 +104,11 @@ class MLDataStore:
         if symbol:
             q += " AND symbol=?"
             p.append(symbol)
-        with sqlite3.connect(DB_PATH) as c:
+        with _conn() as c:
             return c.execute(q, p).fetchone()[0]
 
     def count_new_labeled_since(self, since_ts: int) -> int:
-        with sqlite3.connect(DB_PATH) as c:
+        with _conn() as c:
             return c.execute(
                 "SELECT COUNT(*) FROM samples WHERE label IS NOT NULL AND timestamp > ?",
                 (since_ts,),

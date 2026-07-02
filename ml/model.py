@@ -15,12 +15,8 @@ logger = logging.getLogger("ml.model")
 
 MODEL_DIR = Path("data/models")
 
-LABEL_TO_STR = {0: "sell", 1: "hold", 2: "buy"}
-MIN_OOS_F1   = 0.33   # Modell wird nur gespeichert wenn OOS-F1 ≥ dieser Wert (Baseline: ~0.33 random)
-# NOTE: Raised from 0.30 → 0.40 (ML-Rehab). 3-class random baseline ≈ 0.33;
-# 0.40 ensures only above-random models are deployed. Models that fall below
-# this gate keep the grid running normally — they just don't open directional
-# trades (directional_score_min = 0.75 enforces this independently).
+LABEL_TO_STR = {0: "sell", 1: "buy"}   # Binary: HOLD-Klasse entfernt
+MIN_OOS_F1   = 0.50   # Binary-Baseline: ~0.50 (random); Modell muss echte Kante zeigen
 
 
 class TradingModel:
@@ -43,6 +39,14 @@ class TradingModel:
             logger.info("Zu wenig Samples für %s: %d < %d", self.symbol, len(X), self.MIN_SAMPLES)
             return
 
+        # Binary: HOLD-Samples (label=1) entfernen, buy(2)→1, sell(0)→0
+        mask = y != 1
+        X, y = X[mask], y[mask]
+        y = np.where(y == 2, 1, 0).astype(np.int32)
+        if len(X) < self.MIN_SAMPLES:
+            logger.info("Zu wenig Samples nach Hold-Filter für %s: %d < %d", self.symbol, len(X), self.MIN_SAMPLES)
+            return
+
         # Walk-Forward: letzter Fold ist Out-of-Sample
         tscv = TimeSeriesSplit(n_splits=5)
         oos_preds, oos_true = [], []
@@ -52,9 +56,14 @@ class TradingModel:
             if len(np.unique(y_tr)) < 2:
                 continue
             base = LGBMClassifier(
-                n_estimators=400,
-                max_depth=6,
-                learning_rate=0.05,
+                n_estimators=600,
+                max_depth=5,
+                learning_rate=0.04,
+                min_child_samples=20,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=0.1,
+                reg_lambda=0.1,
                 class_weight="balanced",
                 n_jobs=-1,
                 random_state=42,
@@ -78,17 +87,23 @@ class TradingModel:
 
         # Finales Modell auf allen Daten trainieren + kalibrieren
         base_final = LGBMClassifier(
-            n_estimators=400,
-            max_depth=6,
-            learning_rate=0.05,
+            n_estimators=600,
+            max_depth=5,
+            learning_rate=0.04,
+            min_child_samples=20,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
             class_weight="balanced",
             n_jobs=-1,
             random_state=42,
             verbose=-1,
         )
-        # Kalibrierung braucht mindestens 2 Folds mit ausreichend Daten
-        cv = min(3, max(2, len(X) // 100))
-        clf = CalibratedClassifierCV(base_final, method="isotonic", cv=cv)
+        # Sigmoid (Platt-Scaling) ist stabiler als isotonic bei n < 1000 Samples;
+        # isotonic neigt zum Overfitting auf kleinen Datensets und flacht Wahrscheinlichkeiten ab.
+        cv = min(5, max(3, len(X) // 100))
+        clf = CalibratedClassifierCV(base_final, method="sigmoid", cv=cv)
         clf.fit(X, y)
 
         with self._lock:
@@ -115,11 +130,15 @@ class TradingModel:
             self.symbol, len(X), oos_f1, dist,
         )
 
-    def predict(self, x: np.ndarray) -> Tuple[int, float]:
-        """Returns (label_int, calibrated_confidence). label: 0=sell, 1=hold, 2=buy"""
+    def predict(self, x: np.ndarray) -> Tuple[int, float, float]:
+        """Returns (label_int, calibrated_confidence, dir_score).
+        label: 0=sell, 1=hold, 2=buy
+        dir_score: buy_prob - sell_prob ∈ [-1, +1]; captures directional lean even when
+        argmax is hold (avoids lgbm_score=0 when model leans directional but not committed).
+        """
         with self._lock:
             if not self.is_ready():
-                return 1, 0.0
+                return 1, 0.0, 0.0
             import pandas as pd
 
             # Feature-count mismatch: model was trained with a different number of features.
@@ -130,7 +149,7 @@ class TradingModel:
                     "Feature count mismatch for %s: model=%d, input=%d – returning hold",
                     self.symbol, expected_n, x.shape[0],
                 )
-                return 1, 0.0
+                return 1, 0.0, 0.0
 
             feature_names = self._feature_names if self._feature_names else [f"f{i}" for i in range(x.shape[0])]
             x2 = pd.DataFrame(x.reshape(1, -1), columns=feature_names)
@@ -138,10 +157,11 @@ class TradingModel:
                 proba = self._clf.predict_proba(x2)[0]
             except Exception as e:
                 logger.warning("predict_proba failed for %s: %s", self.symbol, e)
-                return 1, 0.0
+                return 1, 0.0, 0.0
             label = int(proba.argmax())
             confidence = float(proba.max())
-            return label, confidence
+            dir_score = float(proba[1] - proba[0])  # P(up) - P(down), binary
+            return label, confidence, dir_score
 
     def is_ready(self) -> bool:
         return self._clf is not None and self._n_samples >= self.MIN_SAMPLES
@@ -171,11 +191,22 @@ class TradingModel:
                 self._n_samples = self.MIN_SAMPLES
 
             # Verwirf inkompatible Modelle (z.B. mit 16 statt 34 Features)
-            # damit Bootstrap beim nächsten Start frische 34-Feature-Modelle erzeugt.
             if self._feature_names and len(self._feature_names) != expected_dim:
                 logger.warning(
                     "Modell %s hat %d Features, erwartet %d – verwerfe stales Modell",
                     self.symbol, len(self._feature_names), expected_dim,
+                )
+                self._clf           = None
+                self._n_samples     = 0
+                self._feature_names = []
+                return
+
+            # Verwirf alte 3-Klassen-Modelle (vor Binary-Umstellung) → Bootstrap erzeugt neues
+            n_classes = len(getattr(self._clf, "classes_", []))
+            if n_classes not in (0, 2):
+                logger.warning(
+                    "Modell %s hat %d Klassen, erwartet 2 (binary) – verwerfe altes 3-Klassen-Modell",
+                    self.symbol, n_classes,
                 )
                 self._clf           = None
                 self._n_samples     = 0

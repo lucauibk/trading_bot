@@ -39,6 +39,12 @@ class GridParams:
     # worst-case drawdown across symbols.
     trend_filter_enabled: bool = True
     trend_adx_min: float = 25.0
+    # Fast-drop breakdown detector: pause grid buys immediately when price falls
+    # ≥ fast_drop_pct over fast_drop_candles, BEFORE EMA/ADX alignment catches up.
+    # Root-cause fix for the 2026-06-11/12 SOL cascade (484 buys swept into a crash
+    # because ema9<ema21<ema50 lags a fast breakdown).  0 = off.
+    fast_drop_candles: int = 3
+    fast_drop_pct: float = 0.04
 
     # ── Leverage ───────────────────────────────────────────────────────
     leverage: float = 0.0                  # 0 = read live from dashboard DB

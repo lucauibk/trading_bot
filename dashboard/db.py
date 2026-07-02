@@ -10,8 +10,14 @@ DB_PATH = Path(__file__).parents[1] / "data" / "trades.db"
 
 def get_conn() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(exist_ok=True)
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # timeout=30 + WAL: dashboard, bot loop and ML-retrain thread all hit this DB
+    # concurrently.  WAL lets readers and a writer coexist; busy_timeout waits out
+    # a transient lock instead of raising "database is locked" — critical for an
+    # unattended multi-day run.
+    con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=30000")
     _init(con)
     return con
 

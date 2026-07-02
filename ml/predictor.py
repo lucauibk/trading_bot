@@ -47,27 +47,58 @@ class MLPredictor:
             self._models[sym] = TradingModel(sym)
         self._trainer = ModelTrainer(self._store, self._models)
 
-        # Fetch BTC OHLCV once for btc_corr_30d backfill (all non-BTC symbols share it)
+        # 2-Jahres-OHLCV via Binance (öffentliche API, keine Kraken-Limits)
+        # Fallback auf 1000-Candle Kraken-Fetch wenn Binance nicht erreichbar
+        import datetime as _dt
+        from data_fetcher import fetch_ohlcv_since as _fetch_since
+        _since_iso = (
+            _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=730)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # BTC-Daten für btc_corr_30d Feature (alle non-BTC Coins teilen sich diese)
         btc_df = None
         try:
-            btc_df = self._fetch_ohlcv("BTC/USD", "1h", 1000)
-            self._btc_df = btc_df  # keep for rolling btc_corr in predict()
-            logger.info("BTC/USD OHLCV für btc_corr-Backfill geladen (%d Candles)", len(btc_df))
+            logger.info("Lade BTC/USDT 2-Jahres-OHLCV via Binance für btc_corr…")
+            btc_df = _fetch_since("BTC/USDT", "1h", _since_iso)
+            self._btc_df = btc_df
+            logger.info("BTC/USDT geladen: %d Candles", len(btc_df))
         except Exception as exc:
-            logger.warning("BTC/USD fetch für btc_corr-Backfill fehlgeschlagen: %s – Fallback 0.0", exc)
+            logger.warning("Binance BTC fetch fehlgeschlagen: %s – versuche Kraken 1000 Candles", exc)
+            try:
+                btc_df = self._fetch_ohlcv("BTC/USD", "1h", 1000)
+                self._btc_df = btc_df
+                logger.info("BTC/USD Fallback geladen: %d Candles", len(btc_df))
+            except Exception as exc2:
+                logger.warning("BTC fetch komplett fehlgeschlagen: %s", exc2)
 
         for sym in symbols:
             model = self._models[sym]
             if model.is_ready():
                 logger.info("ML-Modell bereits vorhanden für %s (%d Samples)", sym, model._n_samples)
                 continue
-            logger.info("Bootstrap ML-Modell für %s (1000 Candles)…", sym)
+            logger.info("Bootstrap ML-Modell für %s (2 Jahre via Binance)…", sym)
             try:
-                df = self._fetch_ohlcv(sym, "1h", 1000)
+                binance_sym = sym.replace("/USD", "/USDT")
+                df = _fetch_since(binance_sym, "1h", _since_iso)
+                logger.info("%s: %d Candles geladen", sym, len(df))
                 sym_btc_df = None if sym == "BTC/USD" else btc_df
-                bootstrap_from_history(sym, df, self._store, model, btc_df=sym_btc_df)
+                # step=6 für große Datensätze: jede 6. Kerze (≈4h-Äquivalent),
+                # eliminiert ~97% der O(n²)-Iterationen ohne Informationsverlust
+                _step = 6 if len(df) > 5000 else 1
+                bootstrap_from_history(sym, df, self._store, model, btc_df=sym_btc_df, step=_step)
             except Exception as e:
-                logger.warning("Bootstrap fehlgeschlagen %s: %s", sym, e)
+                logger.warning("2J-Bootstrap fehlgeschlagen %s: %s – Fallback 1000 Candles", sym, e)
+                try:
+                    df = self._fetch_ohlcv(sym, "1h", 1000)
+                    sym_btc_df = None if sym == "BTC/USD" else btc_df
+                    bootstrap_from_history(sym, df, self._store, model, btc_df=sym_btc_df)
+                except Exception as e2:
+                    logger.warning("Bootstrap fehlgeschlagen %s: %s", sym, e2)
+
+        # Retrain-Timestamps setzen damit der erste Label-Cycle keinen Sofort-Retrain auslöst
+        if self._trainer:
+            for sym in symbols:
+                self._trainer._last_retrain_ts[sym] = int(time.time())
 
         # Pre-compute rolling btc_corr for all symbols so predict() has real values immediately
         if self._btc_df is not None:
@@ -111,8 +142,11 @@ class MLPredictor:
             label_int  = 1  # hold
 
             if model and model.is_ready():
-                label_int, lgbm_conf = model.predict(feats)
-                lgbm_score = {"sell": -1.0, "hold": 0.0, "buy": 1.0}[LABEL_TO_STR[label_int]] * lgbm_conf
+                label_int, lgbm_conf, lgbm_dir_score = model.predict(feats)
+                # Use buy_prob - sell_prob as directional score (instead of argmax * conf).
+                # This captures LGBM's lean even when argmax is "hold", enabling
+                # blend_scores() to detect agreement with the LLM signal.
+                lgbm_score = lgbm_dir_score
                 ts = int(time.time())
                 if self._trainer:
                     self._trainer.record(symbol, ts, feats, price, label_int)
@@ -151,8 +185,11 @@ class MLPredictor:
                 )
                 return direction
 
-            if lgbm_conf < MIN_CONFIDENCE:
-                logger.info("ML %s: Konfidenz %.2f < %.2f → Fallback", symbol, lgbm_conf, MIN_CONFIDENCE)
+            logger.info(
+                "ML %s: blended_conf=%.2f < %.2f → Fallback (lgbm=%.2f, llm=%s)",
+                symbol, blended_conf, MIN_CONFIDENCE, lgbm_conf,
+                f"{llm_result['confidence']:.2f}" if llm_result else "N/A",
+            )
 
             result = self._rule_based(df)
             logger.info("Fallback %-12s → %s", symbol, result.upper())
