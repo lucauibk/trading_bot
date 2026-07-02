@@ -411,6 +411,11 @@ class GridStrategy(Strategy):
         cid = fill.client_id
         order = state.orders.get(cid)
         if not order:
+            # Fill für einen cid, den ein Grid-Rebuild bereits aus state.orders
+            # entfernt hat (engine._tick: setup_grid läuft vor _sync_orders).
+            # Still verwerfen hieße: Margin abgezogen, Position verwaist
+            # (P0-Fix Review 2026-07-02: ~36 USDT Leck in 15 Tagen).
+            self._handle_orphan_fill(fill, state, ctx)
             return
 
         order["filled"] = True
@@ -423,6 +428,81 @@ class GridStrategy(Strategy):
 
         # Clean up filled order — don't keep it in state.orders forever
         state.orders.pop(cid, None)
+
+    def _handle_orphan_fill(self, fill: Fill, state: _GridState, ctx: MarketContext):
+        """Fill dessen client_id nicht (mehr) in state.orders steht.
+
+        Buy  → Position adoptieren: der Kauf ist real passiert (Paper: Margin
+               abgezogen; Live: Coins im Bestand) — Sell-Order + SL anlegen wie
+               bei einem normalen Buy-Fill, damit das Kapital nicht verwaist.
+        Sell → PnL aus fill.meta rekonstruieren (bought_at/leverage reisen im
+               Order-Meta mit); pre-seeded Orphans sind Non-Events.
+        """
+        meta = fill.meta or {}
+        if fill.side == "buy":
+            lev = float(meta.get("leverage") or self._lev())
+            buy_price = fill.price
+            above = [g for g in state.grid_lines if g > buy_price]
+            if above:
+                sell_price = min(above)
+            else:
+                sell_price = buy_price * (1 + 2 * KRAKEN_FEE * MIN_STEP_FEE_MULTIPLE)
+            if self.p.sl_mode == "floor" and state.floor_sl > 0:
+                sl_price = state.floor_sl
+            else:
+                step_pct = (sell_price - buy_price) / buy_price
+                sl_pct = max(step_pct * self.p.per_pos_sl_step_mult, self.p.per_pos_sl_min_pct)
+                sl_pct = min(sl_pct, self.p.per_pos_sl_max_pct)
+                sl_price = buy_price * (1 - sl_pct)
+            sell_cid = str(uuid.uuid4())
+            state.orders[sell_cid] = {
+                "side": "sell",
+                "price": sell_price,
+                "qty": fill.qty,
+                "filled": False,
+                "bought_at": buy_price,
+                "sl_price": sl_price,
+                "leverage": lev,
+                "trailing_activated": False,
+                "momentum_holds": 0,
+            }
+            state.price_to_id[sell_price] = sell_cid
+            ctx.add_position(Position(
+                symbol=fill.symbol, side="grid",
+                entry_price=buy_price, qty=fill.qty,
+                usdt_value=buy_price * fill.qty,
+                leverage=lev,
+            ))
+            logger.warning("[GRID] Orphan-BUY adoptiert %s @ %.4f qty=%.6f | SL=%.4f -> sell @ %.4f "
+                           "(cid vom Rebuild entfernt)",
+                           fill.symbol, buy_price, fill.qty, sl_price, sell_price)
+        else:
+            if meta.get("pre_seeded"):
+                logger.debug("[GRID] Orphan-SEED-Sell ignoriert %s @ %.4f", fill.symbol, fill.price)
+                return
+            bought_at = meta.get("bought_at")
+            if bought_at is None:
+                logger.warning("[GRID] Orphan-SELL ohne bought_at %s @ %.4f qty=%.6f — "
+                               "PnL nicht rekonstruierbar", fill.symbol, fill.price, fill.qty)
+                return
+            profit = (fill.price - float(bought_at)) * fill.qty
+            fee = (fill.price + float(bought_at)) * fill.qty * KRAKEN_FEE
+            net = profit - fee
+            state.total_profit += net
+            state.trade_count += 1
+            logger.warning("[GRID] Orphan-SELL verbucht %s @ %.4f | bought @ %.4f | net=%.4f",
+                           fill.symbol, fill.price, float(bought_at), net)
+            try:
+                if os.getenv("GRIDBOT_BACKTEST"):
+                    raise ImportError("backtest: dashboard logging disabled")
+                from dashboard.db import log_trade
+                log_trade(fill.symbol, "GRID", float(bought_at), fill.price, net,
+                          "grid_fill", "grid", "paper",
+                          context={"regime": state._last_regime, "orphan": True},
+                          leverage=float(meta.get("leverage") or self._lev()))
+            except Exception:
+                pass
+            ctx.remove_position(fill.symbol, "grid")
 
     def _handle_buy_fill(self, fill: Fill, state: _GridState, ctx: MarketContext):
         buy_price = fill.price

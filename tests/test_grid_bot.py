@@ -353,6 +353,35 @@ class TestGridStrategy:
         assert len(fills) == 1
         assert broker.get_balance() == 100.0, "Seed-Fill darf kein Cash krediteren"
 
+    def test_orphan_buy_fill_is_adopted_not_dropped(self):
+        """P0-Regression (Review 2026-07-02): Buy-Fill für einen cid, den ein
+        Rebuild entfernt hat, darf nicht still verworfen werden (Margin-Leck) —
+        die Position wird adoptiert (Sell + SL angelegt)."""
+        from core.context import MarketContext
+        from core.strategy import Fill
+
+        strategy = self._strategy()
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state.with_position = True
+        strategy.setup_grid("SOL/USD", 100.0, ctx)
+
+        ghost_cid = str(uuid.uuid4())  # nicht in state.orders (Rebuild hat ihn entfernt)
+        fill = Fill(client_id=ghost_cid, symbol="SOL/USD", side="buy",
+                    price=95.0, qty=1.0, fee=0.15, ts=time.time(),
+                    meta={"leverage": 3.0})
+        sells_before = sum(1 for o in state.orders.values()
+                           if o["side"] == "sell" and "bought_at" in o and not o.get("pre_seeded"))
+        strategy.on_fill(fill, ctx)
+        sells_after = sum(1 for o in state.orders.values()
+                          if o["side"] == "sell" and "bought_at" in o and not o.get("pre_seeded"))
+        assert sells_after == sells_before + 1, "Orphan-Buy muss als Position adoptiert werden"
+        adopted = [o for o in state.orders.values()
+                   if o["side"] == "sell" and o.get("bought_at") == 95.0][0]
+        assert adopted["sl_price"] < 95.0
+        assert adopted["price"] > 95.0
+
     def test_compounding_increases_investment(self):
         from core.context import MarketContext
         strategy = self._strategy()
