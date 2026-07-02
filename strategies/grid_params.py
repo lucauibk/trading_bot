@@ -32,6 +32,11 @@ class GridParams:
     range_atr_mult_trending: float = 2.0
     range_atr_mult_volatile: float = 1.5
     min_step_pct: float = 0.0              # 0 = off; else cap levels so step ≥ this (0.6% ≈ 1.9× round-trip fee)
+    # Fee-Floor der Grid-Range: min_range = KRAKEN_FEE × levels × min_step_fee_multiple.
+    # Bindet in der Praxis IMMER (Review 2026-07-02) und pinnt den Step auf
+    # 2 × KRAKEN_FEE × multiple (bei 4.0 → 1.28%) in ALLEN Regimen — der real
+    # wirksame Geometrie-Parameter. Sweep-Achse: {2, 3, 4, 6}.
+    min_step_fee_multiple: float = 4.0
 
     # ── Trend filter (ML-independent) ──────────────────────────────────
     # Default ON: sweep winner 2026-06-12 (results/sweep_20260612_1242) —

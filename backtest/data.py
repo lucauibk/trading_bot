@@ -17,7 +17,8 @@ logger = logging.getLogger("backtest.data")
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "ohlcv_cache.db"
 
-_TIMEFRAME_MS = {"1h": 3600_000, "4h": 4 * 3600_000, "1d": 24 * 3600_000}
+_TIMEFRAME_MS = {"5m": 300_000, "15m": 900_000, "1h": 3600_000,
+                 "4h": 4 * 3600_000, "1d": 24 * 3600_000}
 
 
 def _ensure_table(con: sqlite3.Connection) -> None:

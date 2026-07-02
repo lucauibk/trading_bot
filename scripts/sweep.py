@@ -34,22 +34,27 @@ WARMUP_CANDLES = 60     # run_backtest skips the first 60 candles
 
 
 def build_param_grid() -> list:
-    """~48 configs: every axis orthogonal to one implemented change."""
+    """Ehrlicher Post-Phantom-Sweep (Review 2026-07-02): wenige, orthogonale Achsen.
+
+    - sl_mode: floor vs per_position — der nie sauber OOS-verglichene Kern-Streit
+    - min_step_fee_multiple: der real bindende Geometrie-Parameter (pinnt den Step
+      auf 2×fee×mult in allen Regimen); war nie gesweept
+    Directional bleibt AUS (5 Familien negativ getestet), momentum_hold 0.
+    """
     sl_variants = [
         {"sl_mode": "per_position"},
         {"sl_mode": "floor", "floor_sl_atr_mult": 1.0},
-        {"sl_mode": "floor", "floor_sl_atr_mult": 1.5},
     ]
     grid = []
-    for sl, hold, trend, step, direc in itertools.product(
-        sl_variants, [0, 2], [False, True], [0.0, 0.01], [False, True]
-    ):
+    for sl, step_mult in itertools.product(sl_variants, [2.0, 3.0, 4.0, 6.0]):
         cfg = {
             **sl,
-            "momentum_hold_max": hold,
-            "trend_filter_enabled": trend,
-            "min_step_pct": step,
-            "directional_enabled": direc,
+            "min_step_fee_multiple": step_mult,
+            "momentum_hold_max": 0,
+            "trend_filter_enabled": True,
+            "min_step_pct": 0.006,
+            "max_inventory_notional_mult": 1.5,
+            "directional_enabled": False,
             "leverage": LEVERAGE,
         }
         grid.append(cfg)
@@ -57,14 +62,21 @@ def build_param_grid() -> list:
 
 
 _DFS = {}
+_TIMEFRAME = "1h"
+_REBUILD_EVERY = 1
+
+# Sekunden pro Timeframe (für live-treue Rebuild-Kadenz: live = alle ~15 min)
+_TF_SECONDS = {"5m": 300, "15m": 900, "1h": 3600}
 
 
-def _init_worker(symbols, days):
+def _init_worker(symbols, days, timeframe, rebuild_every):
     os.environ["GRIDBOT_BACKTEST"] = "1"
     logging.disable(logging.ERROR)  # silence per-trade INFO/WARNING spam
-    global _DFS
+    global _DFS, _TIMEFRAME, _REBUILD_EVERY
+    _TIMEFRAME = timeframe
+    _REBUILD_EVERY = rebuild_every
     from backtest.data import load_ohlcv
-    _DFS = {s: load_ohlcv(s, "1h", days) for s in symbols}
+    _DFS = {s: load_ohlcv(s, timeframe, days) for s in symbols}
 
 
 def _run_one(job):
@@ -81,7 +93,8 @@ def _run_one(job):
         params=GridParams.from_dict(params_dict),
     )
     try:
-        m = run_backtest(strategy, df, symbol, initial_balance=INVESTMENT)
+        m = run_backtest(strategy, df, symbol, initial_balance=INVESTMENT,
+                         rebuild_every=_REBUILD_EVERY)
     except Exception as e:
         return {"cfg_id": cfg_id, "symbol": symbol, "phase": phase, "error": str(e)}
     return {
@@ -118,8 +131,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=180)
     parser.add_argument("--train-days", type=int, default=120)
+    parser.add_argument("--timeframe", default="1h", choices=["5m", "15m", "1h"],
+                        help="5m empfohlen: 1h-Close-Fills unterschätzen den Live-Churn massiv")
     parser.add_argument("--jobs", type=int, default=6)
     parser.add_argument("--top", type=int, default=10)
+    parser.add_argument("--top-per-slmode", type=int, default=3,
+                        help="Stratifizierte OOS-Auswahl: garantiert N Configs je sl_mode in der "
+                             "Testphase (der alte Sweep filterte alle floor-Configs vor OOS raus)")
     parser.add_argument("--max-dd", type=float, default=-15.0)
     parser.add_argument("--min-trades", type=int, default=100)
     args = parser.parse_args()
@@ -130,11 +148,16 @@ def main():
     out_dir = ROOT / "results" / datetime.datetime.now().strftime("sweep_%Y%m%d_%H%M")
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    tf_sec = _TF_SECONDS[args.timeframe]
+    # Live rebuildet alle ~15 min (GRID_REBUILD_CYCLES × CHECK_INTERVAL)
+    rebuild_every = max(1, 900 // tf_sec)
+    log.info("Timeframe %s → rebuild_every=%d Candles", args.timeframe, rebuild_every)
+
     # Pre-warm OHLCV cache serially (avoid concurrent Binance fetches)
     from backtest.data import load_ohlcv
     dfs = {}
     for s in SYMBOLS:
-        dfs[s] = load_ohlcv(s, "1h", args.days)
+        dfs[s] = load_ohlcv(s, args.timeframe, args.days)
         log.info("Data %s: %d candles (%s → %s)", s, len(dfs[s]),
                  dfs[s].index[0], dfs[s].index[-1])
 
@@ -142,7 +165,7 @@ def main():
     data_end = min(df.index[-1] for df in dfs.values())
     split_ts = data_start + datetime.timedelta(days=args.train_days)
     # test window starts WARMUP_CANDLES early: run_backtest skips them as indicator warmup
-    test_start = split_ts - datetime.timedelta(hours=WARMUP_CANDLES)
+    test_start = split_ts - datetime.timedelta(seconds=WARMUP_CANDLES * tf_sec)
     log.info("Train: %s → %s | Test (OOS): %s → %s", data_start, split_ts, split_ts, data_end)
 
     grid = build_param_grid()
@@ -154,7 +177,8 @@ def main():
         for i, cfg in enumerate(grid) for sym in SYMBOLS
     ]
 
-    with Pool(args.jobs, initializer=_init_worker, initargs=(SYMBOLS, args.days)) as pool:
+    with Pool(args.jobs, initializer=_init_worker,
+              initargs=(SYMBOLS, args.days, args.timeframe, rebuild_every)) as pool:
         train_results = pool.map(_run_one, train_jobs)
 
         errors = [r for r in train_results if "error" in r]
@@ -174,7 +198,25 @@ def main():
         )
         log.info("%d/%d configs pass constraints (worst_dd > %s%%, trades ≥ %d, no halt)",
                  len(ranked), len(agg), args.max_dd, args.min_trades)
+
+        # Stratifizierte OOS-Auswahl: Top-N GLOBAL plus Top-K je sl_mode.
+        # Der Sweep 2026-06-22 ließ kein einziges floor-Config in die OOS-Phase
+        # (Train-Calmar-Ranking) — der sl_mode-Vergleich war damit in-sample-only.
         top = ranked[: args.top]
+        seen = {cid for cid, _ in top}
+        by_mode: dict = {}
+        for cid, a in ranked:
+            mode = a["params"].get("sl_mode", "?")
+            by_mode.setdefault(mode, [])
+            if len(by_mode[mode]) < args.top_per_slmode:
+                by_mode[mode].append((cid, a))
+        for mode, entries in by_mode.items():
+            for cid, a in entries:
+                if cid not in seen:
+                    top.append((cid, a))
+                    seen.add(cid)
+        log.info("OOS-Phase: %d Configs (stratifiziert: %s)",
+                 len(top), {m: len(v) for m, v in by_mode.items()})
 
         oos_jobs = [
             (cid, agg[cid]["params"], sym, "test", test_start, data_end)
@@ -199,9 +241,10 @@ def main():
             w.writerow({**{k: r[k] for k in w.fieldnames if k != "params"},
                         "params": json.dumps(r["params"])})
 
-    lines = ["# Sweep Report", "",
-             f"Symbole: {', '.join(SYMBOLS)} | {args.days}d "
-             f"(Train {args.train_days}d / Test {args.days - args.train_days}d) | Leverage {LEVERAGE}×", "",
+    lines = ["# Sweep Report (ehrliche Metriken — ohne Phantom-PnL, ab Commit e5170a4)", "",
+             f"Symbole: {', '.join(SYMBOLS)} | {args.days}d @ {args.timeframe} "
+             f"(Train {args.train_days}d / Test {args.days - args.train_days}d) | Leverage {LEVERAGE}× "
+             f"| rebuild_every={rebuild_every}", "",
              "## Top-Configs: Train vs. OOS (Ranking nach OOS-median-Calmar)", "",
              "| # | cfg | OOS Calmar | OOS Ret% | OOS worstDD | Train Calmar | Train Ret% | Params |",
              "|---|-----|-----------|----------|-------------|--------------|------------|--------|"]

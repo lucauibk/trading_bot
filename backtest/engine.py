@@ -33,6 +33,7 @@ def run_backtest(
     df: pd.DataFrame,
     symbol: str,
     initial_balance: float = 1000.0,
+    rebuild_every: int = REBUILD_EVERY,
 ) -> dict:
     """
     Run a backtest on historical OHLCV data.
@@ -78,9 +79,12 @@ def run_backtest(
             lo, hi = state.grid_lines[0], state.grid_lines[-1]
             out_of_range = price < lo * 0.99 or price > hi * 1.01
 
-        # Setup grid on first candle, periodically, or when out of range
+        # Setup grid on first candle, periodically, or when out of range.
+        # rebuild_every in CANDLES: live rebuildet alle ~15min — bei 5m-Candles
+        # also 3, bei 1h-Candles 1 (Review 2026-07-02: der alte Default 60
+        # entsprach bei 1h-Daten 60 STUNDEN, nicht 15 Minuten).
         if hasattr(strategy, "setup_grid") and (
-            i == 60 or (i - 60) % REBUILD_EVERY == 0 or out_of_range
+            i == 60 or (i - 60) % max(1, rebuild_every) == 0 or out_of_range
         ):
             strategy.setup_grid(symbol, price, ctx)
 

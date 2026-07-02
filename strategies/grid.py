@@ -353,7 +353,7 @@ class GridStrategy(Strategy):
         if regime in regime_configs:
             levels = regime_configs[regime]
 
-        min_range = KRAKEN_FEE * levels * MIN_STEP_FEE_MULTIPLE
+        min_range = KRAKEN_FEE * levels * self.p.min_step_fee_multiple
 
         if lower and upper and upper > lower:
             range_pct = (upper - lower) / (2 * price)
@@ -446,7 +446,7 @@ class GridStrategy(Strategy):
             if above:
                 sell_price = min(above)
             else:
-                sell_price = buy_price * (1 + 2 * KRAKEN_FEE * MIN_STEP_FEE_MULTIPLE)
+                sell_price = buy_price * (1 + 2 * KRAKEN_FEE * self.p.min_step_fee_multiple)
             if self.p.sl_mode == "floor" and state.floor_sl > 0:
                 sl_price = state.floor_sl
             else:
