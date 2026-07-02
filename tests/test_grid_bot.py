@@ -382,6 +382,21 @@ class TestGridStrategy:
         assert adopted["sl_price"] < 95.0
         assert adopted["price"] > 95.0
 
+    def test_remove_position_removes_only_one(self):
+        """P1-Regression (Review 2026-07-02): remove_position darf nur EINE
+        Position entfernen, nicht alle einer Seite — sonst zählt der
+        RiskManager (max_open_positions, Korrelations-Bucket) falsch."""
+        from core.context import MarketContext, Position
+        ctx = MarketContext()
+        for ep in (100.0, 98.0, 96.0):
+            ctx.add_position(Position("SOL/USD", "grid", ep, 1.0, ep, 3.0))
+        ctx.remove_position("SOL/USD", "grid", entry_price=98.0, qty=1.0)
+        assert ctx.open_position_count() == 2
+        remaining = {p.entry_price for p in ctx.get_positions("SOL/USD")}
+        assert remaining == {100.0, 96.0}
+        ctx.remove_position("SOL/USD", "grid")  # ohne Match-Hinweis: älteste
+        assert ctx.open_position_count() == 1
+
     def test_compounding_increases_investment(self):
         from core.context import MarketContext
         strategy = self._strategy()

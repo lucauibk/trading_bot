@@ -492,6 +492,8 @@ class GridStrategy(Strategy):
             state.trade_count += 1
             logger.warning("[GRID] Orphan-SELL verbucht %s @ %.4f | bought @ %.4f | net=%.4f",
                            fill.symbol, fill.price, float(bought_at), net)
+            ctx.remove_position(fill.symbol, "grid",
+                                entry_price=float(bought_at), qty=fill.qty)
             try:
                 if os.getenv("GRIDBOT_BACKTEST"):
                     raise ImportError("backtest: dashboard logging disabled")
@@ -502,7 +504,6 @@ class GridStrategy(Strategy):
                           leverage=float(meta.get("leverage") or self._lev()))
             except Exception:
                 pass
-            ctx.remove_position(fill.symbol, "grid")
 
     def _handle_buy_fill(self, fill: Fill, state: _GridState, ctx: MarketContext):
         buy_price = fill.price
@@ -614,7 +615,7 @@ class GridStrategy(Strategy):
 
         self._replenish_after_sell(state, order, buy_price)
 
-        ctx.remove_position(fill.symbol, "grid")
+        ctx.remove_position(fill.symbol, "grid", entry_price=buy_price, qty=qty)
         self._maybe_compound(sell_price, state)
 
     def _replenish_after_sell(self, state: _GridState, order: dict, buy_price: float):
@@ -843,7 +844,7 @@ class GridStrategy(Strategy):
                             self._broker.sl_credit(symbol, credit)
                     except Exception:
                         pass
-                ctx.remove_position(symbol, "grid")
+                ctx.remove_position(symbol, "grid", entry_price=buy_price, qty=qty)
                 # Remove from orders after SL
                 state.orders.pop(cid, None)
                 # Broker-seitige Sell-Limit-Order SOFORT canceln. Bisher passierte

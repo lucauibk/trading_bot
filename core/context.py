@@ -96,11 +96,27 @@ class MarketContext:
         with self._lock:
             self.positions.setdefault(pos.symbol, []).append(pos)
 
-    def remove_position(self, symbol: str, side: str):
+    def remove_position(self, symbol: str, side: str,
+                        entry_price: Optional[float] = None,
+                        qty: Optional[float] = None):
+        """Entfernt GENAU EINE Position (nicht alle einer Seite).
+
+        Vorher wurden nach jedem einzelnen Sell ALLE Grid-Positionen des Symbols
+        gelöscht → open_position_count()/Korrelations-Bucket des RiskManagers
+        zählten Müll (P1-Fix Review 2026-07-02). Match: bevorzugt die Position
+        mit dem nächsten entry_price (und ggf. qty), sonst die älteste der Seite.
+        """
         with self._lock:
-            self.positions[symbol] = [
-                p for p in self.positions.get(symbol, []) if p.side != side
-            ]
+            plist = self.positions.get(symbol, [])
+            candidates = [i for i, p in enumerate(plist) if p.side == side]
+            if not candidates:
+                return
+            if entry_price is not None:
+                candidates.sort(key=lambda i: (
+                    abs(plist[i].entry_price - entry_price),
+                    abs(plist[i].qty - qty) if qty is not None else 0.0,
+                ))
+            self.positions[symbol] = [p for i, p in enumerate(plist) if i != candidates[0]]
 
     def open_position_count(self) -> int:
         with self._lock:
