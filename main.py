@@ -85,15 +85,27 @@ def main():
         except Exception:
             pass
 
+    # Deaktivierte Coins (Dashboard-Toggle ODER persistierter Emergency-Halt)
+    # wirklich ausschließen — vorher bekamen sie trotz enabled=0 das volle
+    # Default-Budget, der Toggle war wirkungslos (P1-Fix Review 2026-07-02).
+    try:
+        from dashboard.db import get_all_coin_settings
+        _settings = {r["symbol"]: r for r in get_all_coin_settings()}
+    except Exception:
+        _settings = {}
+    disabled = [s for s in symbols if s in _settings and not _settings[s]["enabled"]]
+    if disabled:
+        logger.warning("Symbole deaktiviert (Dashboard/Emergency-Halt): %s", disabled)
+        symbols = [s for s in symbols if s not in disabled]
+    if not symbols:
+        logger.error("Alle Symbole deaktiviert — nichts zu handeln. Exit.")
+        return
+
     per_coin = initial_investment / len(symbols)
     overrides = {}
     if paper:
-        try:
-            from dashboard.db import get_all_coin_settings
-            overrides = {r["symbol"]: r["max_investment"]
-                         for r in get_all_coin_settings() if r["enabled"]}
-        except Exception:
-            pass
+        overrides = {sym: r["max_investment"] for sym, r in _settings.items()
+                     if r["enabled"]}
     grids_config = [
         # coin_settings can only reduce budget below per_coin, never exceed the
         # broker's hard per-symbol cash bucket (initial_capital / n_symbols).

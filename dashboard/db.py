@@ -464,6 +464,24 @@ def set_coin_setting(symbol: str, max_investment: float, enabled: int = 1):
     con.close()
 
 
+def set_coin_enabled(symbol: str, enabled: bool):
+    """Setzt nur das enabled-Flag, ohne max_investment zu überschreiben.
+    Wird vom Engine-Emergency-Stop genutzt, um einen Halt über Neustarts
+    hinweg zu persistieren (User re-aktiviert bewusst im Dashboard)."""
+    from datetime import datetime
+    con = get_conn()
+    con.execute(
+        """INSERT INTO coin_settings (symbol, enabled, updated_at)
+           VALUES (?,?,?)
+           ON CONFLICT(symbol) DO UPDATE SET
+               enabled=excluded.enabled,
+               updated_at=excluded.updated_at""",
+        (symbol, 1 if enabled else 0, datetime.utcnow().isoformat())
+    )
+    con.commit()
+    con.close()
+
+
 def get_leverage() -> float:
     con = get_conn()
     row = con.execute("SELECT leverage FROM bot_status WHERE id=1").fetchone()

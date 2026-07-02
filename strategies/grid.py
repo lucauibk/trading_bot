@@ -846,6 +846,15 @@ class GridStrategy(Strategy):
                 ctx.remove_position(symbol, "grid")
                 # Remove from orders after SL
                 state.orders.pop(cid, None)
+                # Broker-seitige Sell-Limit-Order SOFORT canceln. Bisher passierte
+                # das nur indirekt über _sync_orders — das läuft aber während
+                # Freeze/Emergency-Halt nicht: die Order konnte später zusätzlich
+                # füllen → doppelte Gutschrift (P1-Fix Review 2026-07-02).
+                if self._broker is not None:
+                    try:
+                        self._broker.cancel(cid)
+                    except Exception:
+                        pass
 
     def _maybe_open_directional(self, symbol: str, price: float,
                                  state: _GridState, ctx: MarketContext):

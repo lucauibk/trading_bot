@@ -74,6 +74,8 @@ class Engine:
         # always run unconditionally; only out_of_range rebuilds are rate-limited
         # to once per 20 ticks (~5 min).
         self._last_rebuild: Dict[str, int] = {}
+        # Symbole im Emergency-Halt (einmalige Persistenz + Buy-Cancel pro Halt)
+        self._emergency_halted: set = set()
 
     def run(self):
         logger.info("Engine starting | symbols=%s", self.symbols)
@@ -153,8 +155,36 @@ class Engine:
                 continue
 
             state_obj = getattr(self.strategy, "get_state", lambda s: None)(sym)
+
+            # Emergency-Stop: Symbol pausieren, aber NIE die SL-Überwachung —
+            # sonst hält ein gestopptes Symbol offenes Inventar ungeschützt
+            # (P1-Fix Review 2026-07-02). Halt wird in coin_settings persistiert,
+            # damit ein Neustart (total_profit=0) ihn nicht stillschweigend aufhebt.
             if state_obj and state_obj.total_profit <= -(state_obj.investment * EMERGENCY_STOP_PCT):
-                logger.warning("[ENGINE] %s emergency stop (max loss)", sym)
+                if sym not in self._emergency_halted:
+                    self._emergency_halted.add(sym)
+                    logger.warning("[ENGINE] %s emergency stop (max loss) — Symbol pausiert, "
+                                   "SL-Überwachung läuft weiter", sym)
+                    try:
+                        from dashboard.db import set_coin_enabled
+                        set_coin_enabled(sym, False)
+                    except Exception:
+                        pass
+                    # Restliche Buy-Orders am Broker zurückziehen; Sells (Positionen)
+                    # bleiben, damit Exits weiter möglich sind.
+                    try:
+                        for o in self.broker.get_open_orders(sym):
+                            if o.side == "buy":
+                                self.broker.cancel(o.client_id or o.exchange_order_id)
+                                self._active_orders.get(sym, {}).pop(o.client_id, None)
+                    except Exception as e:
+                        logger.warning("[ENGINE] %s Buy-Cancel bei Emergency-Stop: %s", sym, e)
+                if hasattr(self.strategy, "on_tick_safety"):
+                    try:
+                        self.strategy.on_tick_safety(sym, price, self.ctx)
+                    except Exception as e:
+                        logger.warning("on_tick_safety failed %s: %s", sym, e)
+                self._update_dashboard(sym, price)
                 continue
 
             do_recheck = self._loop_count % PREDICTION_RECHECK == 0
