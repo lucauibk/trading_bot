@@ -3,16 +3,32 @@ SQLite-Datenbank für Trade-History und Bot-Status.
 """
 
 import sqlite3
+import threading
 from pathlib import Path
 
 DB_PATH = Path(__file__).parents[1] / "data" / "trades.db"
 
+# Schema-Init nur einmal pro Prozess – nicht bei jeder Connection das komplette
+# executescript (CREATE TABLE + ALTER-Migrationen) laufen lassen (#41).
+_INIT_LOCK = threading.Lock()
+_INITIALIZED_PATH: str = ""
+
 
 def get_conn() -> sqlite3.Connection:
+    global _INITIALIZED_PATH
     DB_PATH.parent.mkdir(exist_ok=True)
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
-    _init(con)
+    # WAL + busy_timeout: Bot- und Dashboard-Prozess schreiben parallel in
+    # dieselbe DB. Ohne WAL/Timeout drohen "database is locked"-Fehler und
+    # stille Write-Verluste bei Schreib-Kollisionen (#41).
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=5000")
+    if _INITIALIZED_PATH != str(DB_PATH):
+        with _INIT_LOCK:
+            if _INITIALIZED_PATH != str(DB_PATH):
+                _init(con)
+                _INITIALIZED_PATH = str(DB_PATH)
     return con
 
 
