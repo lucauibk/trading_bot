@@ -130,6 +130,7 @@ class Engine:
             self._refresh_btc()
         if self._loop_count % FUNDING_REFRESH_CYCLES == 0:
             self._refresh_funding()
+            self._refresh_correlations()
 
         self._check_daily_drawdown()
 
@@ -341,6 +342,33 @@ class Engine:
                     self.ctx.set_funding(sym, info)
         except Exception as e:
             logger.debug("Funding refresh failed: %s", e)
+
+    def _refresh_correlations(self):
+        """Feed the CorrelationTracker so RiskManager.can_open()'s over-concentration
+        bucket (step 5) has real data (#43). Without this the tracker stays empty,
+        high_correlation_symbols() always returns [], and the bucket check is a
+        silent no-op — all highly-correlated alts can open at once.
+
+        30d correlation moves slowly, so this runs on the slow funding cadence and
+        reuses the BTC close already fetched by btc_context (no extra fetch)."""
+        try:
+            risk = getattr(self.strategy, "_risk", None)
+            corr = getattr(risk, "corr", None) if risk is not None else None
+            if corr is None:
+                return
+            from market.btc_context import get_btc_close
+            btc_close = get_btc_close()
+            if btc_close is None or len(btc_close) < 100:
+                return
+            corr.update_btc(btc_close)
+            get_state = getattr(self.strategy, "get_state", lambda s: None)
+            for sym in self.symbols:
+                st = get_state(sym)
+                df = getattr(st, "_last_df", None) if st is not None else None
+                if df is not None and "close" in getattr(df, "columns", []):
+                    corr.update_symbol(sym, df["close"])
+        except Exception as e:
+            logger.debug("Correlation refresh failed: %s", e)
 
     def _check_dashboard_stop(self):
         try:
