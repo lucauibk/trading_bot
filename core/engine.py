@@ -511,6 +511,16 @@ class Engine:
                         unrealized = qty * (price - bought_at)
                         mtm += margin + unrealized
 
+                # Offene Directional-Position ins MTM aufnehmen: Margin (usdt)
+                # + unrealisierter PnL. Ohne das ist der Trade für die Equity
+                # und damit für die Daily-Drawdown-Bremse unsichtbar (#33).
+                d = getattr(state, "_directional", None)
+                if d and d.get("qty"):
+                    lev = d.get("leverage", default_lev) or 1.0
+                    margin = d.get("usdt", d["entry"] * d["qty"] / lev)
+                    unrealized = d["qty"] * (price - d["entry"])
+                    mtm += margin + unrealized
+
             if stale_syms:
                 logger.warning(
                     "_log_equity: stale prices for %s (>%ds) — equity update skipped "

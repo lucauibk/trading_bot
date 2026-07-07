@@ -103,6 +103,9 @@ class _GridState:
         self._directional: dict = {}
         self._directional_needs_recheck = False
         self._directional_sl_ts: float = 0.0
+        # Realisierter Directional-PnL separat: fließt in total_profit
+        # (Anzeige/Emergency-Stop), aber NICHT in die Compounding-Basis.
+        self._directional_profit: float = 0.0
 
         # ATR for trailing stops
         self._atr: float = 0.0
@@ -546,12 +549,16 @@ class GridStrategy(Strategy):
         self._maybe_compound(sell_price, state)
 
     def _maybe_compound(self, price: float, state: _GridState):
-        if state.total_profit <= 0:
+        # Compounding-Basis = nur realisierter GRID-PnL. Directional-PnL wird
+        # separat geführt (state._directional_profit) und vergrößert die
+        # Grid-Positionsgröße nicht (#51).
+        grid_profit = state.total_profit - state._directional_profit
+        if grid_profit <= 0:
             return
         trades_since = state.trade_count - state._last_compound_at
         if trades_since < COMPOUND_EVERY_TRADES:
             return
-        delta = state.total_profit - state._compounded_profit
+        delta = grid_profit - state._compounded_profit
         if delta <= 0:
             return
         max_inv = state._initial_investment * MAX_INVESTMENT_MULT
@@ -559,7 +566,7 @@ class GridStrategy(Strategy):
         state.investment = min(old + delta, max_inv)
         state.usdt_per_grid = state.investment / state.levels
         state._last_compound_at = state.trade_count
-        state._compounded_profit = state.total_profit
+        state._compounded_profit = grid_profit
         logger.info("[COMPOUND] %s %.2f → %.2f USDT", state.symbol, old, state.investment)
 
     def on_tick(self, symbol: str, price: float, ctx: MarketContext) -> List[Order]:
@@ -796,8 +803,26 @@ class GridStrategy(Strategy):
         tp = price + self.p.directional_tp_atr * atr
         sl = price - self.p.directional_sl_atr * atr
 
+        # Margin + Buy-Fee real beim PaperBroker reservieren – sonst ist der
+        # Trade für Equity/Daily-Drawdown unsichtbar und dasselbe Cash kann
+        # von Grid-Buys erneut eingesetzt werden (#33).
+        if self._broker is not None:
+            try:
+                from execution.paper import PaperBroker
+                if isinstance(self._broker, PaperBroker):
+                    buy_fee = price * qty * KRAKEN_FEE
+                    cost = usdt + buy_fee
+                    if cost > self._broker._sym_balance(symbol):
+                        logger.debug("[DIRECTIONAL] %s skipped: insufficient balance %.2f < %.2f",
+                                     symbol, self._broker._sym_balance(symbol), cost)
+                        return
+                    self._broker._deduct(symbol, cost)
+            except Exception as e:
+                logger.error("[DIRECTIONAL] %s Margin-Deduct fehlgeschlagen: %s", symbol, e)
+                return
+
         state._directional = {
-            "entry": price, "qty": qty, "usdt": usdt,
+            "entry": price, "qty": qty, "usdt": usdt, "leverage": lev,
             "tp": tp, "sl": sl, "entry_ts": time.time(),
         }
         logger.info("[DIRECTIONAL] %s BUY @ %.4f | TP=%.4f SL=%.4f | score=%.2f",
@@ -817,8 +842,9 @@ class GridStrategy(Strategy):
 
         do_flip_sell = False
         if signal_down and pnl_pct >= 0:
-            if "signal_down_price" not in d:
-                d["signal_down_price"] = price
+            # Ratchet: Anker steigt mit dem Preis mit, damit eine Rally nach
+            # dem ersten Down-Signal den höheren Gewinn lockt (#51).
+            d["signal_down_price"] = max(d.get("signal_down_price", price), price)
             trail_trigger = d["signal_down_price"] * (1 - DIRECTIONAL_DOWN_TRAIL_PCT)
             if price <= trail_trigger:
                 do_flip_sell = True
@@ -828,12 +854,26 @@ class GridStrategy(Strategy):
         if not (hit_tp or hit_sl or do_flip_sell):
             return
 
-        lev = self._lev()
+        lev = d.get("leverage", self._lev()) or 1.0
         pnl = (price - d["entry"]) * d["qty"]
         fee = (price + d["entry"]) * d["qty"] * KRAKEN_FEE
         net = pnl - fee
         state.total_profit += net
+        state._directional_profit += net
         state.trade_count += 1
+
+        # Margin + PnL an den PaperBroker zurückgeben (Buy-Fee wurde beim
+        # Open abgezogen, hier nur die Sell-Fee) – Gegenstück zum Deduct
+        # in _maybe_open_directional (#33).
+        if self._broker is not None:
+            try:
+                from execution.paper import PaperBroker
+                if isinstance(self._broker, PaperBroker):
+                    sell_fee = price * d["qty"] * KRAKEN_FEE
+                    self._broker.sl_credit(symbol, d["usdt"] + pnl - sell_fee)
+            except Exception as e:
+                logger.error("[DIRECTIONAL] %s Margin-Credit fehlgeschlagen (%.4f USDT): %s",
+                             symbol, d["usdt"], e)
         reason = "TP" if hit_tp else ("SL" if hit_sl else "Signal-Flip")
         logger.info("[DIRECTIONAL] %s SELL @ %.4f | %s | net=%.4f", symbol, price, reason, net)
 
