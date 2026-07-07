@@ -80,7 +80,10 @@ class RiskManager:
         """
         equity = ctx.total_equity
         if equity <= 0:
-            return True, ""
+            # Fail-closed: Equity 0/negativ heißt "noch nicht initialisiert"
+            # (oder Totalverlust) – vorher wurden hier ALLE Checks übersprungen
+            # und Entries liefen ungeprüft durch (#36).
+            return False, "equity_uninitialized"
 
         # 1. Daily drawdown
         if not self.daily_drawdown_ok(equity):

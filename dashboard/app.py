@@ -278,7 +278,7 @@ def api_leverage_get():
 def api_leverage_set():
     from dashboard.db import set_leverage
     data = request.get_json() or {}
-    val = float(data.get("leverage", 1.0))
+    val = max(1.0, min(3.0, float(data.get("leverage", 1.0))))
     set_leverage(val)
     return jsonify({"ok": True, "leverage": val, "msg": f"Hebel auf {val:.1f}× gesetzt"})
 

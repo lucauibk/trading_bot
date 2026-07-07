@@ -150,6 +150,8 @@ class PaperBroker(Broker):
 
                 if order.side == "buy":
                     leverage = float(order.meta.get("leverage", 1.0))
+                    if leverage <= 0:
+                        leverage = 1.0  # Guard: negativer Hebel würde die Balance gutschreiben (#37)
                     # Margin deposit = notional / leverage (e.g. lev=3 → 1/3 of notional)
                     cost = fill_price * order.qty / leverage + fee
                     sym_bal = self._sym_balance(symbol)
@@ -163,6 +165,8 @@ class PaperBroker(Broker):
 
                 else:  # sell
                     leverage   = float(order.meta.get("leverage", 1.0))
+                    if leverage <= 0:
+                        leverage = 1.0
                     pre_seeded = bool(order.meta.get("pre_seeded", False))
                     bought_at  = float(order.meta.get("bought_at", fill_price))
 

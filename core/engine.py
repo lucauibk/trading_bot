@@ -26,6 +26,7 @@ PREDICTION_RECHECK = 5     # every N ticks refresh prediction (~75s)
 GRID_REBUILD_CYCLES = 60   # every N ticks force grid rebuild (~15min)
 BTC_REFRESH_CYCLES = 4     # every N ticks refresh BTC context (~1min)
 FUNDING_REFRESH_CYCLES = 240  # every N ticks refresh funding (~1h)
+CORR_BTC_REFRESH_CYCLES = 240  # every N ticks refresh BTC closes for CorrelationTracker (~1h)
 # Per-symbol kill switch on realized loss. Must be wider than one full
 # floor-SL flush (which can realize several % at once), otherwise a single
 # flush permanently halts the symbol.
@@ -74,6 +75,9 @@ class Engine:
         # always run unconditionally; only out_of_range rebuilds are rate-limited
         # to once per 20 ticks (~5 min).
         self._last_rebuild: Dict[str, int] = {}
+        # Tick des letzten BTC-Close-Refreshs für den CorrelationTracker (#43);
+        # stark negativ initialisiert, damit der erste Aufruf sofort fetcht.
+        self._last_corr_btc_refresh: int = -CORR_BTC_REFRESH_CYCLES
 
     def run(self):
         logger.info("Engine starting | symbols=%s", self.symbols)
@@ -153,17 +157,21 @@ class Engine:
                 continue
 
             state_obj = getattr(self.strategy, "get_state", lambda s: None)(sym)
-            if state_obj and state_obj.total_profit <= -(state_obj.investment * EMERGENCY_STOP_PCT):
+            emergency_stopped = bool(
+                state_obj
+                and state_obj.total_profit <= -(state_obj.investment * EMERGENCY_STOP_PCT)
+            )
+            if emergency_stopped:
                 logger.warning("[ENGINE] %s emergency stop (max loss)", sym)
-                continue
 
             do_recheck = self._loop_count % PREDICTION_RECHECK == 0
             do_rebuild = self._loop_count % GRID_REBUILD_CYCLES == 0
 
-            if do_recheck or do_rebuild:
+            if (do_recheck or do_rebuild) and not emergency_stopped:
                 try:
                     df = fetch_ohlcv(sym, "1h", 500)
                     self.strategy.on_candle(sym, df, self.ctx)
+                    self._update_correlation(sym, df)
                 except Exception as e:
                     logger.warning("on_candle failed %s: %s", sym, e)
 
@@ -173,7 +181,8 @@ class Engine:
                 hi = state_obj.grid_lines[-1]
                 out_of_range = price < lo * 0.98 or price > hi * 1.02
 
-            # Safety ticks (SL/TP) run even during freeze
+            # Safety ticks (SL/TP) run even during freeze AND emergency stop –
+            # offene Positionen brauchen ihr SL/TP-Management weiterhin (#34).
             if hasattr(self.strategy, "on_tick_safety"):
                 try:
                     self.strategy.on_tick_safety(sym, price, self.ctx)
@@ -184,11 +193,17 @@ class Engine:
             # NEW buys, never the processing of resting sell/TP fills.
             self.process_paper_fills(sym, price)
 
-            if not self.ctx.is_frozen():
-                self.strategy.on_tick(sym, price, self.ctx)
-
             # For live mode: reconcile fills from exchange (paper has no reconciler)
             self._reconcile_fills()
+
+            if emergency_stopped:
+                # Nur Neuaufbau/Buys blockieren: kein on_tick, kein Rebuild,
+                # keine neuen Orders – Safety + Fills liefen oben bereits.
+                self._update_dashboard(sym, price)
+                continue
+
+            if not self.ctx.is_frozen():
+                self.strategy.on_tick(sym, price, self.ctx)
 
             # Scheduled rebuild (every 60 ticks) always fires.  out_of_range
             # rebuilds are rate-limited to once per 20 ticks (~5 min) so that
@@ -293,20 +308,13 @@ class Engine:
         if total_equity <= 0:
             return
 
-        total_profit = 0.0
-        for sym in self.symbols:
-            state = getattr(self.strategy, "get_state", lambda s: None)(sym)
-            if state:
-                total_profit += state.total_profit
-
         if hasattr(self.strategy, "_risk") and self.strategy._risk:
             rm = self.strategy._risk
-            # Anchor baseline to configured starting capital so the brake always
-            # measures against what the user deposited, not a mid-session equity.
-            # total_profit is already baked into total_equity (cash balance), so
-            # adding it again would double-count it — just use total_equity.
-            baseline = self._initial_capital if self._initial_capital > 0 else total_equity
-            rm.set_daily_start(baseline)
+            # Live-Equity übergeben: set_daily_start snapshottet sie beim
+            # Tageswechsel als neue Baseline. Vorher wurde konstant das
+            # Initial-Kapital übergeben – der "Daily"-Drawdown maß dann für
+            # immer gegen die Ur-Einzahlung statt gegen den Tagesstart (#48).
+            rm.set_daily_start(total_equity)
             dd_ok = rm.daily_drawdown_ok(total_equity)
             was_frozen = self.ctx.is_frozen()
             self.ctx.set_freeze(not dd_ok)
@@ -333,6 +341,27 @@ class Engine:
                 self.ctx.set_btc(btc)
         except Exception as e:
             logger.debug("BTC context refresh failed: %s", e)
+
+    def _update_correlation(self, symbol: str, df):
+        """Füttert den CorrelationTracker des RiskManagers (#43).
+
+        Vorher wurden update_btc/update_symbol nirgends aufgerufen –
+        der Korrelations-Bucket-Schutz in can_open() war damit tot.
+        Symbol-Closes kommen aus dem ohnehin gefetchten Candle-Frame;
+        BTC-Closes werden auf ~1h-Kadenz separat geholt.
+        """
+        try:
+            rm = getattr(self.strategy, "_risk", None)
+            if rm is None or not hasattr(rm, "corr"):
+                return
+            if self._loop_count - self._last_corr_btc_refresh >= CORR_BTC_REFRESH_CYCLES:
+                from data_fetcher import fetch_ohlcv
+                btc_df = fetch_ohlcv("BTC/USD", "1h", 800)
+                rm.corr.update_btc(btc_df["close"])
+                self._last_corr_btc_refresh = self._loop_count
+            rm.corr.update_symbol(symbol, df["close"])
+        except Exception as e:
+            logger.debug("correlation update failed %s: %s", symbol, e)
 
     def _refresh_funding(self):
         try:

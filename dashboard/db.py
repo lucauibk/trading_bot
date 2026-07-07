@@ -462,7 +462,10 @@ def get_leverage() -> float:
     con = get_conn()
     row = con.execute("SELECT leverage FROM bot_status WHERE id=1").fetchone()
     con.close()
-    return float(row["leverage"]) if row and row["leverage"] else 1.0
+    lev = float(row["leverage"]) if row and row["leverage"] else 1.0
+    # Negative/abwegige Werte (z. B. direkter DB-Write) nie durchreichen –
+    # ein negativer Hebel würde Buys die Balance GUTSCHREIBEN (#37).
+    return lev if 1.0 <= lev <= 10.0 else 1.0
 
 
 def set_leverage(value: float):
