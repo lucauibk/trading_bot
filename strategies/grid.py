@@ -520,35 +520,55 @@ class GridStrategy(Strategy):
 
         if idx is not None and idx < len(state.grid_lines) - 1:
             sell_price = state.grid_lines[idx + 1]
-            if self.p.sl_mode == "floor" and state.floor_sl > 0:
-                # Per-cohort mode: use the floor stamped at seeding time so each
-                # rebuild cohort has its own SL trigger.  A breach then only flushes
-                # that cohort, not all accumulated positions from every rebuild.
-                sl_price = (order.get("cohort_floor", state.floor_sl)
-                            if self.p.floor_sl_per_cohort else state.floor_sl)
-            else:
-                step_pct = (sell_price - buy_price) / buy_price
-                sl_pct = max(step_pct * self.p.per_pos_sl_step_mult, self.p.per_pos_sl_min_pct)
-                # Hard-cap: no per-position SL can be wider than per_pos_sl_max_pct (4%)
-                sl_pct = min(sl_pct, self.p.per_pos_sl_max_pct)
-                sl_price = buy_price * (1 - sl_pct)
+        else:
+            # Buy am obersten Grid-Level oder off-grid (z.B. Replenish an der
+            # höchsten Linie): keine höhere Linie für den Paar-Sell. Fallback
+            # wie in _handle_orphan_fill — sonst entsteht eine Position ohne
+            # Sell UND ohne sl_price, die nie gestoppt wird (#49).
+            sell_price = buy_price * (1 + 2 * KRAKEN_FEE * self.p.min_step_fee_multiple)
+        if self.p.sl_mode == "floor" and state.floor_sl > 0:
+            # Per-cohort mode: use the floor stamped at seeding time so each
+            # rebuild cohort has its own SL trigger.  A breach then only flushes
+            # that cohort, not all accumulated positions from every rebuild.
+            sl_price = (order.get("cohort_floor", state.floor_sl)
+                        if self.p.floor_sl_per_cohort else state.floor_sl)
+        else:
+            step_pct = (sell_price - buy_price) / buy_price
+            sl_pct = max(step_pct * self.p.per_pos_sl_step_mult, self.p.per_pos_sl_min_pct)
+            # Hard-cap: no per-position SL can be wider than per_pos_sl_max_pct (4%)
+            sl_pct = min(sl_pct, self.p.per_pos_sl_max_pct)
+            sl_price = buy_price * (1 - sl_pct)
 
-            sell_cid = str(uuid.uuid4())
-            state.orders[sell_cid] = {
-                "side": "sell",
-                "price": sell_price,
-                "qty": qty,
-                "filled": False,
-                "bought_at": buy_price,
-                "sl_price": sl_price,
-                "leverage": lev,
-                "trailing_activated": False,
-                "momentum_holds": 0,
-                "entry_ts": time.time(),
-            }
-            state.price_to_id[sell_price] = sell_cid
-            logger.info("[GRID] BUY fill %s @ %.4f | SL=%.4f | -> sell @ %.4f",
-                        fill.symbol, buy_price, sl_price, sell_price)
+        # Liegt an diesem Preis noch ein pre-seeded Sell (Platzhalter-Wall),
+        # muss er raus, bevor der echte Positions-Sell eingefügt wird —
+        # sonst emittiert desired_orders BEIDE und es wird doppelt verkauft (#49).
+        old_cid = state.price_to_id.get(sell_price)
+        if old_cid and old_cid in state.orders:
+            old = state.orders[old_cid]
+            if old.get("pre_seeded") and not old.get("filled"):
+                state.orders.pop(old_cid, None)
+                if self._broker is not None:
+                    try:
+                        self._broker.cancel(old_cid)
+                    except Exception as e:
+                        logger.warning("cancel pre-seeded sell %s failed: %s", old_cid, e)
+
+        sell_cid = str(uuid.uuid4())
+        state.orders[sell_cid] = {
+            "side": "sell",
+            "price": sell_price,
+            "qty": qty,
+            "filled": False,
+            "bought_at": buy_price,
+            "sl_price": sl_price,
+            "leverage": lev,
+            "trailing_activated": False,
+            "momentum_holds": 0,
+            "entry_ts": time.time(),
+        }
+        state.price_to_id[sell_price] = sell_cid
+        logger.info("[GRID] BUY fill %s @ %.4f | SL=%.4f | -> sell @ %.4f",
+                    fill.symbol, buy_price, sl_price, sell_price)
 
         ctx.add_position(Position(
             symbol=fill.symbol, side="grid",
@@ -629,9 +649,12 @@ class GridStrategy(Strategy):
         replenish_usdt = state.usdt_per_grid
         if state._direction_score > 0.1:
             try:
-                current_idx = state.grid_lines.index(order["price"])
-                if current_idx < len(state.grid_lines) - 1:
-                    new_buy_price = state.grid_lines[current_idx + 1]
+                # Vom BUY-Preis aus indexieren, nicht vom Sell-Preis (der liegt
+                # schon ein Level über dem Buy) — sonst landet der Replenish
+                # zwei Levels über dem ursprünglichen Buy (#72).
+                buy_idx = state.grid_lines.index(buy_price)
+                if buy_idx < len(state.grid_lines) - 1:
+                    new_buy_price = state.grid_lines[buy_idx + 1]
                 else:
                     new_buy_price = buy_price
             except (ValueError, IndexError):
@@ -801,6 +824,12 @@ class GridStrategy(Strategy):
                 continue
 
             # Momentum-hold: if score is strong bullish, delay SL by one cycle
+            if price > order["sl_price"]:
+                # Preis wieder über dem SL → Grace-Budget regeneriert sich,
+                # sonst stoppt jeder spätere Dip sofort ohne Hold (#63).
+                if order.get("momentum_holds"):
+                    order["momentum_holds"] = 0
+                continue
             if price <= order["sl_price"]:
                 holds = order.get("momentum_holds", 0)
                 if state._direction_score > self.p.momentum_hold_score and holds < self.p.momentum_hold_max:
@@ -844,8 +873,11 @@ class GridStrategy(Strategy):
                             sl_fee = (price + buy_price) * qty * KRAKEN_FEE
                             credit = buy_price * qty / lev + (price - buy_price) * qty - sl_fee
                             self._broker.sl_credit(symbol, credit)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # Geld-Operation: still schlucken hieße, die Margin des
+                        # ursprünglichen Buys geht verloren (#50).
+                        logger.error("[SL] margin credit failed %s: %s",
+                                     symbol, e, exc_info=True)
                 ctx.remove_position(symbol, "grid", entry_price=buy_price, qty=qty)
                 # Remove from orders after SL
                 state.orders.pop(cid, None)
@@ -856,8 +888,8 @@ class GridStrategy(Strategy):
                 if self._broker is not None:
                     try:
                         self._broker.cancel(cid)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("[SL] cancel resting sell %s failed: %s", cid, e)
 
     def _maybe_open_directional(self, symbol: str, price: float,
                                  state: _GridState, ctx: MarketContext):
@@ -1048,7 +1080,7 @@ class GridStrategy(Strategy):
             usdt = allocations.get(gp, state.usdt_per_grid)
             qty = usdt * lev / gp
 
-            if gp < price:
+            if gp < price and i < len(grid_lines) - 1:
                 if buys_ok:
                     buy_order: dict = {"side": "buy", "price": gp, "qty": qty, "filled": False}
                     # In per-cohort floor mode, stamp each buy with the current cohort's
@@ -1060,6 +1092,11 @@ class GridStrategy(Strategy):
                 # else: buy seeding blocked by inventory cap or trend filter.
                 # desired_orders won't emit this level; engine _sync_orders will
                 # cancel any already-resting pending buy order at this price.
+            elif gp < price:
+                # Oberste Grid-Linie unterhalb des Preises (out-of-range up):
+                # keinen Buy seeden — ein Fill hier hätte keine höhere Linie
+                # für den Paar-Sell (#49). Level bleibt leer bis zum Rebuild.
+                pass
             else:
                 # Pre-seed sells above price so grid is two-sided from the start.
                 # bought_at = current price (not a grid line above price) so that:

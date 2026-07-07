@@ -2,7 +2,8 @@
 RiskManager – reads config/config.yaml and enforces all risk rules.
 
 Pre-trade checks via can_open() replace the scattered inline checks in grid_bot.py.
-Daily drawdown is cross-coin, loaded from config.yaml (was hardcoded 8%).
+Daily drawdown is cross-coin, loaded from config.yaml (effektiv 10% laut
+config; der Code-Default 0.03 greift nur ohne config-Eintrag).
 Correlation-aware bucketing prevents 5-alt over-concentration.
 """
 
@@ -80,7 +81,9 @@ class RiskManager:
         """
         equity = ctx.total_equity
         if equity <= 0:
-            return True, ""
+            # Equity not initialized yet (context setup failed or not run) —
+            # deny instead of silently skipping every risk check.
+            return False, "equity_uninitialized"
 
         # 1. Daily drawdown
         if not self.daily_drawdown_ok(equity):

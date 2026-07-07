@@ -638,3 +638,127 @@ class TestBacktestEquity:
                                 ml_enabled=False, params=params)
         metrics = run_backtest(strategy, df, "SOL/USD", initial_balance=100.0)
         assert min(metrics["equity_curve"]) < 100.0
+
+
+# ── P0-Fixes 2026-07-07 (Issues #36, #48, #49, #63, #72) ─────────────────────
+
+class TestP0Fixes:
+
+    def _strategy(self):
+        from strategies.grid import GridStrategy
+        return GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}])
+
+    def _grid(self, price=100.0):
+        from core.context import MarketContext
+        strategy = self._strategy()
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state.with_position = True
+        strategy.setup_grid("SOL/USD", price, ctx)
+        return strategy, ctx, state
+
+    def test_can_open_denies_uninitialized_equity(self):
+        """#36: equity <= 0 muss verweigern, nicht alle Risk-Checks umgehen."""
+        from core.context import MarketContext
+        from risk.correlation import CorrelationTracker
+        from risk.manager import RiskManager
+        rm = RiskManager(CorrelationTracker())
+        ctx = MarketContext()  # total_equity startet bei 0
+        ok, reason = rm.can_open("SOL/USD", 50.0, ctx)
+        assert ok is False
+        assert reason == "equity_uninitialized"
+
+    def test_daily_start_snapshots_on_new_day(self):
+        """#48: Tageswechsel muss die neue Equity snapshotten (kein No-Op)."""
+        from datetime import date, timedelta
+        from risk.correlation import CorrelationTracker
+        from risk.manager import RiskManager
+        rm = RiskManager(CorrelationTracker())
+        rm.set_daily_start(1000.0)
+        rm.set_daily_start(1500.0)  # gleicher Tag → Baseline bleibt
+        assert rm._daily_start == 1000.0
+        rm._daily_date = date.today() - timedelta(days=1)
+        rm.set_daily_start(1500.0)  # Tageswechsel → neue Baseline
+        assert rm._daily_start == 1500.0
+
+    def test_top_level_buy_fill_gets_sell_and_sl(self):
+        """#49.1: Buy am obersten Grid-Level darf keine verwaiste Position
+        ohne Sell/SL erzeugen."""
+        from core.strategy import Fill
+        strategy, ctx, state = self._grid()
+        top = state.grid_lines[-1]
+        cid = str(uuid.uuid4())
+        state.orders[cid] = {"side": "buy", "price": top, "qty": 1.0, "filled": False}
+        fill = Fill(client_id=cid, symbol="SOL/USD", side="buy",
+                    price=top, qty=1.0, fee=0.0, ts=time.time())
+        strategy.on_fill(fill, ctx)
+        sells = [o for o in state.orders.values()
+                 if o["side"] == "sell" and o.get("bought_at") == top
+                 and not o.get("pre_seeded")]
+        assert len(sells) == 1, "Top-Level-Buy muss einen Paar-Sell bekommen"
+        assert sells[0]["sl_price"] > 0
+        assert sells[0]["price"] > top
+
+    def test_buy_fill_replaces_preseeded_sell(self):
+        """#49.2: Replenish-Sell am pre-seeded Boundary-Level darf nicht
+        zusätzlich zum Platzhalter existieren (Over-Sell)."""
+        from core.strategy import Fill
+        strategy, ctx, state = self._grid(price=100.0)
+        # höchster Buy: sein Sell-Level ist die erste Linie über dem Preis,
+        # dort liegt nach setup_grid ein pre-seeded Sell
+        buy_items = [(cid, o) for cid, o in state.orders.items() if o["side"] == "buy"]
+        assert buy_items
+        cid, order = max(buy_items, key=lambda kv: kv[1]["price"])
+        idx = state.grid_lines.index(order["price"])
+        sell_level = state.grid_lines[idx + 1]
+        pre = [o for o in state.orders.values()
+               if o["side"] == "sell" and o["price"] == sell_level and o.get("pre_seeded")]
+        assert len(pre) == 1, "Testaufbau: pre-seeded Sell am Boundary-Level erwartet"
+
+        fill = Fill(client_id=cid, symbol="SOL/USD", side="buy",
+                    price=order["price"], qty=order["qty"], fee=0.0, ts=time.time())
+        strategy.on_fill(fill, ctx)
+
+        sells_at_level = [o for o in state.orders.values()
+                          if o["side"] == "sell" and o["price"] == sell_level
+                          and not o.get("filled")]
+        assert len(sells_at_level) == 1, "es darf nur EIN Sell an diesem Level liegen"
+        assert not sells_at_level[0].get("pre_seeded")
+
+    def test_replenish_lands_one_level_above_buy(self):
+        """#72: bullisher Replenish muss EIN Level über dem Buy landen, nicht zwei."""
+        strategy, ctx, state = self._grid()
+        gl = state.grid_lines
+        buy_price, sell_price = gl[1], gl[2]
+        order = {"side": "sell", "price": sell_price, "qty": 1.0,
+                 "filled": True, "bought_at": buy_price}
+        state._direction_score = 0.5  # bullish → follow trend one level higher
+        before = set(state.orders)
+        strategy._replenish_after_sell(state, order, buy_price)
+        new = [o for c, o in state.orders.items() if c not in before]
+        assert len(new) == 1
+        assert new[0]["price"] == gl[2], "Replenish gehört auf buy_idx+1 (= Sell-Level)"
+
+    def test_momentum_holds_reset_on_recovery(self):
+        """#63: Grace-Budget regeneriert sich, wenn der Preis den SL wieder verlässt."""
+        from core.context import MarketContext
+        from strategies.grid import GridStrategy
+        from strategies.grid_params import GridParams
+        params = GridParams.from_dict({"momentum_hold_max": 2, "momentum_hold_score": 0.2})
+        strategy = GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                                ml_enabled=False, params=params)
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state._direction_score = 0.9
+        cid = str(uuid.uuid4())
+        state.orders[cid] = {
+            "side": "sell", "price": 105.0, "qty": 1.0,
+            "filled": False, "bought_at": 100.0,
+            "sl_price": 95.0, "trailing_activated": False,
+        }
+        strategy._check_position_stops("SOL/USD", 94.0, state, ctx)  # Dip → Hold verbraucht
+        assert state.orders[cid]["momentum_holds"] == 1
+        strategy._check_position_stops("SOL/USD", 96.0, state, ctx)  # Recovery → Reset
+        assert state.orders[cid]["momentum_holds"] == 0

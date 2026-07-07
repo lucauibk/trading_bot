@@ -31,7 +31,15 @@ class PricePredictor:
     def predict(self) -> dict:
         df = self._fetch_ohlcv()
         ind = compute_indicators(df)
-        row = ind.dropna().iloc[-1]
+        # Immer die NEUESTE Candle verwenden: dropna() über das ganze Frame
+        # würde bei einer einzelnen NaN-ATR der letzten Zeile (flache
+        # H=L-Candle) still auf eine ältere Candle zurückfallen → stale
+        # Range/Regime (#75). Indikator-Lücken der letzten Zeile stattdessen
+        # mit dem letzten gültigen Wert forward-fillen.
+        row = ind.ffill().iloc[-1]
+        if row.isna().any():
+            # Echter Warm-up (Indikator noch nie berechnet): altes Verhalten
+            row = ind.dropna().iloc[-1]
 
         regime, low, high = self._determine_regime_and_range(row)
         confidence = self._compute_confidence(row, regime)

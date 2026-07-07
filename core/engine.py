@@ -203,6 +203,11 @@ class Engine:
                 hi = state_obj.grid_lines[-1]
                 out_of_range = price < lo * 0.98 or price > hi * 1.02
 
+            # Paper fills laufen JEDEN Tick, auch während Freeze — ein Freeze
+            # soll neue Buys stoppen, nicht das Erkennen ruhender Sell/TP-Fills
+            # (der Live-Reconciler läuft ebenfalls unbedingt; #46).
+            self.process_paper_fills(sym, price)
+
             # Safety ticks (SL/TP) run even during freeze
             if hasattr(self.strategy, "on_tick_safety"):
                 try:
@@ -263,7 +268,7 @@ class Engine:
         """Process fills from live broker via reconciler. Paper fills handled in _sync_orders."""
         from execution.paper import PaperBroker
         if isinstance(self.broker, PaperBroker):
-            return  # Paper fills are processed in process_paper_fills() inside _sync_orders
+            return  # Paper fills are processed in process_paper_fills() each tick
         if self.reconciler:
             fills = self.reconciler.reconcile()
             for fill in fills:
@@ -281,8 +286,6 @@ class Engine:
                     del self._active_orders[symbol][fill.client_id]
 
     def _sync_orders(self, symbol: str, price: float):
-        self.process_paper_fills(symbol, price)
-
         desired = {o.client_id: o for o in self.strategy.desired_orders(symbol, price, self.ctx)
                    if o.client_id}
         active = self._active_orders.get(symbol, {})
@@ -329,12 +332,12 @@ class Engine:
 
         if hasattr(self.strategy, "_risk") and self.strategy._risk:
             rm = self.strategy._risk
-            # Anchor baseline to configured starting capital so the brake always
-            # measures against what the user deposited, not a mid-session equity.
-            # total_profit is already baked into total_equity (cash balance), so
-            # adding it again would double-count it — just use total_equity.
-            baseline = self._initial_capital if self._initial_capital > 0 else total_equity
-            rm.set_daily_start(baseline)
+            # Pass live equity: RiskManager snapshots it once per day (day-change
+            # branch in set_daily_start), so the brake measures against the
+            # day's starting equity — not the original deposit, which after
+            # compounding would let the bot give back an entire day's gains
+            # plus the threshold before freezing.
+            rm.set_daily_start(total_equity)
             dd_ok = rm.daily_drawdown_ok(total_equity)
             was_frozen = self.ctx.is_frozen()
             self.ctx.set_freeze(not dd_ok)
@@ -346,7 +349,7 @@ class Engine:
                 except Exception:
                     pass
             elif dd_ok and was_frozen:
-                logger.info("Freeze lifted – new trading day")
+                logger.info("Freeze lifted – equity recovered or new trading day")
                 try:
                     from dashboard.db import set_frozen
                     set_frozen(False)
@@ -373,24 +376,28 @@ class Engine:
             logger.debug("Funding refresh failed: %s", e)
 
     def _check_dashboard_stop(self):
+        # DB-Zugriff eng eingrenzen: ein transienter Fehler darf das
+        # Stop-Kommando nicht still verwerfen — nächster Tick versucht
+        # es erneut (#60).
         try:
             from dashboard.db import get_stop_mode, set_stop_mode
             mode = get_stop_mode()
-            if mode == "sell_all":
+            if mode:
                 set_stop_mode(None)
-                logger.info("Dashboard: sell_all – initiating emergency sell")
-                self._emergency_sell_all()
-                self._shutdown.stop()
-            elif mode == "wait_fills":
-                set_stop_mode(None)
-                for sym in self.symbols:
-                    state = getattr(self.strategy, "get_state", lambda s: None)(sym)
-                    if state:
-                        state.with_position = False
-                self._waiting_for_fills = True
-                logger.info("Dashboard: wait_fills – sell-only mode active, will stop when all filled")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("stop-mode read failed (retry next tick): %s", e)
+            return
+        if mode == "sell_all":
+            logger.info("Dashboard: sell_all – initiating emergency sell")
+            self._emergency_sell_all()
+            self._shutdown.stop()
+        elif mode == "wait_fills":
+            for sym in self.symbols:
+                state = getattr(self.strategy, "get_state", lambda s: None)(sym)
+                if state:
+                    state.with_position = False
+            self._waiting_for_fills = True
+            logger.info("Dashboard: wait_fills – sell-only mode active, will stop when all filled")
 
     def _emergency_sell_all(self):
         """Cancel all open orders and close all positions at market."""
@@ -420,12 +427,25 @@ class Engine:
                         from core.strategy import Fill
                         for cid, o in list(state.orders.items()):
                             if o.get("side") == "sell" and not o.get("filled") and "bought_at" in o and not o.get("pre_seeded"):
+                                qty = o["qty"]
+                                bought_at = float(o["bought_at"])
+                                lev = float(o.get("leverage") or 1.0)
+                                fee = price * qty * KRAKEN_FEE
                                 fill = Fill(
                                     client_id=cid,
                                     symbol=sym, side="sell",
-                                    price=price, qty=o["qty"],
-                                    fee=price * o["qty"] * 2 * KRAKEN_FEE,
+                                    price=price, qty=qty,
+                                    fee=fee,
                                     ts=time.time(),
+                                )
+                                # Der Broker sieht diesen synthetischen Fill nie
+                                # (cancel_all oben hat seine Order entfernt) —
+                                # Margin + PnL explizit gutschreiben, sonst ist
+                                # die beim Buy abgezogene Margin weg und die
+                                # finale Equity wird zu niedrig persistiert (#47).
+                                self.broker.sl_credit(
+                                    sym,
+                                    bought_at * qty / lev + (price - bought_at) * qty - fee,
                                 )
                                 self.strategy.on_fill(fill, self.ctx)
             except Exception as e:
@@ -534,16 +554,20 @@ class Engine:
 
             total = balance + mtm
             self.ctx.set_equity(total)
+        except Exception as e:
+            # Sichtbar loggen: ctx.total_equity bleibt stale und genau dieser
+            # Wert treibt die Daily-Drawdown-FREEZE-Entscheidung (#60).
+            logger.warning("_log_equity: equity computation failed – "
+                           "ctx.total_equity stays stale: %s", e, exc_info=True)
+            return
+        try:
             from dashboard.db import log_equity, update_capital, save_paper_balances
             log_equity(total)
             update_capital(total)
             if hasattr(self.broker, "_balances") and self.broker._balances:
-                try:
-                    save_paper_balances(dict(self.broker._balances))
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                save_paper_balances(dict(self.broker._balances))
+        except Exception as e:
+            logger.warning("_log_equity: DB write failed: %s", e)
 
     def _update_prediction_outcomes(self, fetch_ohlcv_fn):
         """Füllt realized_high_6h/low_6h/hit für gereifte Predictions nach (alle ~15min)."""

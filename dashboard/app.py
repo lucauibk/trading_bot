@@ -286,6 +286,9 @@ def api_leverage_set():
     from dashboard.db import set_leverage
     data = request.get_json() or {}
     val = float(data.get("leverage", 1.0))
+    # Clamp: negative/0 Leverage würde im PaperBroker die Buy-Kosten negativ
+    # machen (Balance-Gutschrift beim Kauf, #37).
+    val = max(1.0, min(val, 10.0))
     set_leverage(val)
     return jsonify({"ok": True, "leverage": val, "msg": f"Hebel auf {val:.1f}× gesetzt"})
 
