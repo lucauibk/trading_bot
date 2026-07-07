@@ -559,3 +559,31 @@ class TestBacktestEquity:
                                 ml_enabled=False, params=params)
         metrics = run_backtest(strategy, df, "SOL/USD", initial_balance=100.0)
         assert min(metrics["equity_curve"]) < 100.0
+
+
+# ── Latent correctness traps (#78) ────────────────────────────────────────────
+
+class TestLatentTraps:
+
+    def test_level_allocations_empty_grid_no_zerodiv(self):
+        # #78.1: n == 0 must early-out to {}, not fall into `investment / n`.
+        from strategies.grid import _calc_level_allocations
+        assert _calc_level_allocations([], 100.0, 40.0, 0.5) == {}
+
+    def test_level_allocations_uniform_when_neutral(self):
+        # Non-empty grid, neutral score → uniform split (sanity, unchanged path).
+        from strategies.grid import _calc_level_allocations
+        alloc = _calc_level_allocations([10.0, 11.0], 10.5, 40.0, 0.0)
+        assert alloc == {10.0: 20.0, 11.0: 20.0}
+
+    def test_risk_position_size_no_leverage_param(self):
+        # #78.2: the misleading (silently-ignored) leverage param is gone.
+        import inspect
+        from risk.manager import RiskManager
+        assert "leverage" not in inspect.signature(RiskManager.position_size).parameters
+
+    def test_data_fetcher_get_balance_defaults_usd(self):
+        # #78.3: default currency must be USD (Kraken/USD account), not USDT.
+        import inspect
+        import data_fetcher
+        assert inspect.signature(data_fetcher.get_balance).parameters["currency"].default == "USD"

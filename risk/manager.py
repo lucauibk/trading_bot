@@ -121,9 +121,12 @@ class RiskManager:
         win_rate: float = 0.52,
         win_loss_ratio: float = 1.2,
         realized_vol: float = 0.03,
-        leverage: float = 1.0,
     ) -> float:
-        """Return recommended USDT position size using Fractional Kelly + Vol-targeting."""
+        """Return recommended USDT position size using Fractional Kelly + Vol-targeting.
+
+        Note: no `leverage` parameter. `compute_position_usdt` does not model
+        leverage, so accepting one here would silently discard it and return the
+        same size for any value — a trap for future callers (removed)."""
         return compute_position_usdt(
             equity=equity,
             win_rate=win_rate,
