@@ -559,3 +559,35 @@ class TestBacktestEquity:
                                 ml_enabled=False, params=params)
         metrics = run_backtest(strategy, df, "SOL/USD", initial_balance=100.0)
         assert min(metrics["equity_curve"]) < 100.0
+
+
+# ── cancel_all failure visibility (#61) ───────────────────────────────────────
+
+class TestCancelAllLogging:
+    """cancel_all must not silently swallow cancel failures — a stale live order
+    left on the book after 'stop' can fill unexpectedly."""
+
+    def test_cancel_all_counts_successes_and_logs_failures(self, caplog):
+        import types
+        import logging
+        from execution.kraken import KrakenBroker
+
+        orders = [types.SimpleNamespace(exchange_order_id=oid) for oid in ("a", "b", "c")]
+
+        def cancel_order(oid):
+            if oid == "b":
+                raise RuntimeError("network down")  # not a ccxt err → no retry delay
+            return {}
+
+        fake = types.SimpleNamespace(
+            get_open_orders=lambda s: orders,
+            _ex=types.SimpleNamespace(cancel_order=cancel_order),
+        )
+        with caplog.at_level(logging.WARNING):
+            count = KrakenBroker.cancel_all(fake, "SOL/USD")
+
+        assert count == 2  # a and c cancelled; b failed
+        msgs = " ".join(r.getMessage() for r in caplog.records)
+        assert "cancel failed" in msgs
+        assert "still OPEN" in msgs
+        assert "b" in msgs
