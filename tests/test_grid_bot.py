@@ -559,3 +559,66 @@ class TestBacktestEquity:
                                 ml_enabled=False, params=params)
         metrics = run_backtest(strategy, df, "SOL/USD", initial_balance=100.0)
         assert min(metrics["equity_curve"]) < 100.0
+
+
+# ── Floor-SL paper credit (#39 double-fee, #57 entry-leverage) ────────────────
+
+class TestFloorSLCredit:
+    """The floor-SL exit credits margin+PnL back to the PaperBroker manually
+    (the broker never sees the SL fill). Regression guards for two bugs:
+      #39 — a full round-trip fee was charged, double-counting the buy fee that
+            was already deducted at buy-fill time.
+      #57 — the live dashboard leverage was used to return margin instead of the
+            leverage the position was entered with → balance drift on lev change.
+    """
+
+    def _sl_credit_amount(self, monkeypatch, entry_lev, live_lev):
+        from strategies.grid import GridStrategy, _GridState
+        from strategies.grid_params import GridParams
+        from execution.paper import PaperBroker
+        from core.context import MarketContext
+
+        monkeypatch.setenv("GRIDBOT_BACKTEST", "1")  # skip dashboard logging
+
+        strat = GridStrategy(
+            [{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+            ml_enabled=False,
+            params=GridParams(leverage=live_lev),
+        )
+        broker = PaperBroker(initial_balance=100.0, symbols=["SOL/USD"])
+        strat._broker = broker
+
+        state = _GridState("SOL/USD", 100.0, 6, 0.05)
+        state.orders["sell1"] = {
+            "side": "sell", "price": 110.0, "qty": 1.0, "filled": False,
+            "bought_at": 100.0, "sl_price": 99.0, "leverage": entry_lev,
+            "momentum_holds": 0,
+        }
+        strat._states["SOL/USD"] = state
+
+        captured = {}
+        orig = broker.sl_credit
+        monkeypatch.setattr(
+            broker, "sl_credit",
+            lambda symbol, amount: (captured.__setitem__("amount", amount),
+                                    orig(symbol, amount))[1],
+        )
+
+        # price 98 < sl_price 99 → floor-SL fires
+        strat._check_position_stops("SOL/USD", 98.0, state, MarketContext())
+        return captured.get("amount")
+
+    def test_sl_credit_charges_sell_fee_only(self, monkeypatch):
+        from strategies.grid import KRAKEN_FEE
+        amount = self._sl_credit_amount(monkeypatch, entry_lev=1.0, live_lev=1.0)
+        # margin(100) + pnl(-2) - sell_fee(98 * KRAKEN_FEE); buy fee NOT re-charged
+        expected = 100.0 + (98.0 - 100.0) - 98.0 * KRAKEN_FEE
+        assert amount == pytest.approx(expected)
+        assert amount == pytest.approx(97.8432)
+
+    def test_sl_credit_uses_entry_leverage(self, monkeypatch):
+        from strategies.grid import KRAKEN_FEE
+        # Entered at lev=2, dashboard later switched to lev=1 → still use lev=2.
+        amount = self._sl_credit_amount(monkeypatch, entry_lev=2.0, live_lev=1.0)
+        expected = 100.0 / 2.0 + (98.0 - 100.0) - 98.0 * KRAKEN_FEE
+        assert amount == pytest.approx(expected)

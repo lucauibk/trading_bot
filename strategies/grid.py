@@ -464,7 +464,9 @@ class GridStrategy(Strategy):
         order = state.orders[sell_cid]
         buy_price = order.get("bought_at", sell_price)
         qty = order["qty"]
-        lev = self._lev()
+        # #57: log the leverage the position was entered with, not the live
+        # value (which may have been changed via the dashboard mid-position).
+        lev = order.get("leverage", self._lev())
 
         profit = (sell_price - buy_price) * qty
         fee = (sell_price + buy_price) * qty * KRAKEN_FEE
@@ -728,8 +730,18 @@ class GridStrategy(Strategy):
                     try:
                         from execution.paper import PaperBroker
                         if isinstance(self._broker, PaperBroker):
-                            sl_fee = (price + buy_price) * qty * KRAKEN_FEE
-                            credit = buy_price * qty / lev + (price - buy_price) * qty - sl_fee
+                            # #57: return margin using the leverage the position
+                            # was *entered* with (stored on the order), not the
+                            # possibly-changed live leverage — otherwise the
+                            # margin credited back drifts from what the buy fill
+                            # deducted whenever the user changes leverage.
+                            entry_lev = order.get("leverage", lev)
+                            # #39: only the sell-side fee here. The buy fee was
+                            # already deducted once at buy-fill time
+                            # (paper.py update_price), so charging a round-trip
+                            # fee would double-count the buy fee.
+                            sl_fee = price * qty * KRAKEN_FEE
+                            credit = buy_price * qty / entry_lev + (price - buy_price) * qty - sl_fee
                             self._broker.sl_credit(symbol, credit)
                     except Exception:
                         pass
