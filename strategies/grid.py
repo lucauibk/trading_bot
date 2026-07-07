@@ -435,6 +435,16 @@ class GridStrategy(Strategy):
                 sl_pct = min(sl_pct, self.p.per_pos_sl_max_pct)
                 sl_price = buy_price * (1 - sl_pct)
 
+            # Ein evtl. bereits an diesem Preis liegendes pre-seeded Sell
+            # (Platzhalter ohne echte Position) entfernen, bevor die Map
+            # überschrieben wird — sonst emittiert desired_orders BEIDE Sells
+            # und verkauft die doppelte Menge (#49). Echte Sells (mit Position
+            # dahinter) und Buys am selben Level bleiben unangetastet.
+            stale_cid = state.price_to_id.get(sell_price)
+            stale = state.orders.get(stale_cid) if stale_cid else None
+            if stale and stale.get("pre_seeded") and stale.get("side") == "sell" and not stale.get("filled"):
+                state.orders.pop(stale_cid, None)
+
             sell_cid = str(uuid.uuid4())
             state.orders[sell_cid] = {
                 "side": "sell",
@@ -444,6 +454,7 @@ class GridStrategy(Strategy):
                 "bought_at": buy_price,
                 "sl_price": sl_price,
                 "leverage": lev,
+                "entry_ts": time.time(),
                 "trailing_activated": False,
                 "momentum_holds": 0,
             }
@@ -932,7 +943,11 @@ class GridStrategy(Strategy):
             qty = usdt * lev / gp
 
             if gp < price:
-                if buys_ok:
+                # Oberstes Level nie als Buy seeden (passiert wenn der Preis über
+                # dem gesamten Grid liegt): es gäbe kein Sell-Level darüber →
+                # _handle_buy_fill würde eine Position ohne Sell und ohne SL
+                # erzeugen, die _check_position_stops nie stoppt (#49).
+                if buys_ok and i < len(grid_lines) - 1:
                     buy_order: dict = {"side": "buy", "price": gp, "qty": qty, "filled": False}
                     # In per-cohort floor mode, stamp each buy with the current cohort's
                     # floor so _handle_buy_fill can assign an individual sl_price.
@@ -951,7 +966,7 @@ class GridStrategy(Strategy):
                 sell_qty = usdt * lev / gp
                 state.orders[cid] = {
                     "side": "sell", "price": gp, "qty": sell_qty, "filled": False,
-                    "bought_at": price, "pre_seeded": True,
+                    "bought_at": price, "pre_seeded": True, "entry_ts": time.time(),
                 }
                 state.price_to_id[gp] = cid
 
