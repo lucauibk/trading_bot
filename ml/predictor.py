@@ -34,6 +34,7 @@ class MLPredictor:
         self._retrain_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ml-retrain")
         # Rolling BTC-correlation cache (computed from real OHLCV, refreshed every 2h)
         self._btc_df:      Optional[object]     = None
+        self._btc_df_ts:   float                = 0.0
         self._btc_corr:    Dict[str, float]     = {}
         self._btc_corr_ts: Dict[str, float]     = {}
 
@@ -52,6 +53,7 @@ class MLPredictor:
         try:
             btc_df = self._fetch_ohlcv("BTC/USD", "1h", 1000)
             self._btc_df = btc_df  # keep for rolling btc_corr in predict()
+            self._btc_df_ts = time.time()
             logger.info("BTC/USD OHLCV für btc_corr-Backfill geladen (%d Candles)", len(btc_df))
         except Exception as exc:
             logger.warning("BTC/USD fetch für btc_corr-Backfill fehlgeschlagen: %s – Fallback 0.0", exc)
@@ -169,8 +171,20 @@ class MLPredictor:
             logger.warning("ML Fehler %s: %s", symbol, e)
             return "neutral"
 
+    _BTC_DF_TTL = 2 * 3600  # BTC-Frame im selben 2h-Takt erneuern wie die Korrelation
+
     def _refresh_btc_corr(self, symbol: str) -> None:
         """Compute and cache the rolling 30d BTC-correlation for *symbol* from real OHLCV."""
+        # BTC-Frame mitrefreshen: vorher wurde er nur einmal in initialize()
+        # gesetzt – die Korrelation lief dann gegen einen eingefrorenen
+        # Startup-Frame und fror nach Stunden auf dem Startwert ein (#45).
+        if self._btc_df is None or (time.time() - self._btc_df_ts) > self._BTC_DF_TTL:
+            try:
+                self._btc_df = self._fetch_ohlcv("BTC/USD", "1h", 1000)
+                self._btc_df_ts = time.time()
+                logger.debug("btc_corr: BTC-Frame erneuert (%d Candles)", len(self._btc_df))
+            except Exception as exc:
+                logger.warning("btc_corr: BTC-Frame-Refresh fehlgeschlagen: %s", exc)
         if self._btc_df is None:
             return
         try:

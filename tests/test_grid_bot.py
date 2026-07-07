@@ -135,7 +135,23 @@ class TestMLFeatures:
     def test_market_features_zeros_when_no_data(self):
         from ml.features.market import extract
         feats = extract(None)
-        assert (feats == 0).all()
+        # btc_corr_30d (Index 3) wird unabhängig vom BTC-Kontext berechnet und
+        # behält seinen Default (0.5); alle anderen Features sind 0.
+        assert feats[3] == pytest.approx(0.5)
+        mask = np.ones(len(feats), dtype=bool)
+        mask[3] = False
+        assert (feats[mask] == 0).all()
+
+    def test_market_features_dominance_always_zero(self):
+        """btc_dominance ist train/live symmetrisch 0 (kein historisches Archiv, #44)."""
+        from core.context import BTCContext
+        from ml.features.market import extract, FEATURE_NAMES
+        btc = BTCContext(trend="up", return_1h=0.01, return_4h=0.02,
+                         return_24h=0.05, realized_vol_7d=0.4, dominance=0.55)
+        feats = extract(btc, btc_corr=0.7)
+        dom_idx = FEATURE_NAMES.index("btc_dominance")
+        assert feats[dom_idx] == 0.0
+        assert feats[0] == pytest.approx(0.01)
 
     def test_seasonality_features_cyclic(self):
         from ml.features.seasonality import extract

@@ -79,6 +79,12 @@ def _init_db():
             updated_ts  REAL
         )
     """)
+    # Migration: oi_series persistieren, damit Cache-Hits echte OI-Deltas
+    # liefern statt hardcoded 0.0 (#45).
+    try:
+        con.execute("ALTER TABLE funding_cache ADD COLUMN oi_series_json TEXT DEFAULT '[]'")
+    except Exception:
+        pass
     con.commit()
     con.close()
 
@@ -87,7 +93,8 @@ def _load_cache(symbol: str) -> Optional[dict]:
     try:
         con = sqlite3.connect(_DB_PATH)
         row = con.execute(
-            "SELECT * FROM funding_cache WHERE symbol=?", (symbol,)
+            "SELECT symbol, rate, oi_usd, history_json, updated_ts, oi_series_json "
+            "FROM funding_cache WHERE symbol=?", (symbol,)
         ).fetchone()
         con.close()
         if row and time.time() - row[4] < _CACHE_TTL:
@@ -96,18 +103,23 @@ def _load_cache(symbol: str) -> Optional[dict]:
                 "oi_usd": row[2],
                 "history": json.loads(row[3] or "[]"),
                 "ts": row[4],
+                "oi_series": json.loads(row[5] or "[]"),
             }
     except Exception:
         pass
     return None
 
 
-def _save_cache(symbol: str, rate: float, oi_usd: float, history: list):
+def _save_cache(symbol: str, rate: float, oi_usd: float, history: list,
+                oi_series: Optional[list] = None):
     try:
         con = sqlite3.connect(_DB_PATH)
         con.execute(
-            "INSERT OR REPLACE INTO funding_cache VALUES (?,?,?,?,?)",
-            (symbol, rate, oi_usd, json.dumps(history), time.time()),
+            "INSERT OR REPLACE INTO funding_cache "
+            "(symbol, rate, oi_usd, history_json, updated_ts, oi_series_json) "
+            "VALUES (?,?,?,?,?,?)",
+            (symbol, rate, oi_usd, json.dumps(history), time.time(),
+             json.dumps(oi_series or [])),
         )
         con.commit()
         con.close()
@@ -146,15 +158,26 @@ def _fetch_from_binance(spot_symbol: str) -> Optional[dict]:
         return None
 
 
+def _oi_changes(oi_series: list) -> tuple:
+    """(oi_change_1h, oi_change_24h) aus einer stündlichen OI-Serie."""
+    oi_change_1h = 0.0
+    oi_change_24h = 0.0
+    if oi_series and len(oi_series) >= 2:
+        oi_change_1h = (oi_series[-1] - oi_series[-2]) / max(abs(oi_series[-2]), 1)
+    if oi_series and len(oi_series) >= 24:
+        oi_change_24h = (oi_series[-1] - oi_series[-24]) / max(abs(oi_series[-24]), 1)
+    return oi_change_1h, oi_change_24h
+
+
 def get_funding(spot_symbol: str) -> Optional[FundingInfo]:
     """Return FundingInfo for a spot symbol, using cache when fresh."""
     _init_db()
 
     cached = _load_cache(spot_symbol)
     if cached:
-        history = cached["history"]
         rate = cached["rate"]
-        oi_usd = cached["oi_usd"]
+        history = cached["history"]
+        oi_series = cached.get("oi_series", [])
     else:
         data = _fetch_from_binance(spot_symbol)
         if data is None:
@@ -163,42 +186,27 @@ def get_funding(spot_symbol: str) -> Optional[FundingInfo]:
         oi_usd = data["oi_usd"]
         history = data.get("history", [rate])
         oi_series = data.get("oi_series", [])
+        _save_cache(spot_symbol, rate, oi_usd, history, oi_series)
 
-        # Compute OI change
-        _save_cache(spot_symbol, rate, oi_usd, history)
+    # Derived metrics – identisch für Fresh-Fetch und Cache-Hit. Vorher
+    # hardcodete der Cache-Pfad oi_change_1h/24h auf 0.0, wodurch beide
+    # OI-Features für den Rest der Cache-TTL konstant 0 waren (#45).
+    if len(history) >= 3:
+        arr = np.array(history)
+        z = float((rate - arr.mean()) / (arr.std() + 1e-9))
+    else:
+        z = 0.0
 
-        # Compute z-score
-        if len(history) >= 3:
-            arr = np.array(history)
-            z = float((rate - arr.mean()) / (arr.std() + 1e-9))
-        else:
-            z = 0.0
+    oi_change_1h, oi_change_24h = _oi_changes(oi_series)
 
-        oi_change_1h = 0.0
-        oi_change_24h = 0.0
-        if oi_series and len(oi_series) >= 2:
-            oi_change_1h = (oi_series[-1] - oi_series[-2]) / max(abs(oi_series[-2]), 1)
-        if oi_series and len(oi_series) >= 24:
-            oi_change_24h = (oi_series[-1] - oi_series[-24]) / max(abs(oi_series[-24]), 1)
-
-        info = FundingInfo(
-            symbol=spot_symbol,
-            rate=rate,
-            rate_z7d=z,
-            oi_change_1h=oi_change_1h,
-            oi_change_24h=oi_change_24h,
-        )
-        logger.info("Funding %-12s rate=%+.4f%% z=%.2f OI_chg1h=%+.1f%%",
-                    spot_symbol, rate * 100, z, oi_change_1h * 100)
-        return info
-
-    # From cache – recompute derived metrics
-    arr = np.array(history) if history else np.array([rate])
-    z = float((rate - arr.mean()) / (arr.std() + 1e-9))
-    return FundingInfo(
+    info = FundingInfo(
         symbol=spot_symbol,
         rate=rate,
         rate_z7d=z,
-        oi_change_1h=0.0,
-        oi_change_24h=0.0,
+        oi_change_1h=oi_change_1h,
+        oi_change_24h=oi_change_24h,
     )
+    if not cached:
+        logger.info("Funding %-12s rate=%+.4f%% z=%.2f OI_chg1h=%+.1f%%",
+                    spot_symbol, rate * 100, z, oi_change_1h * 100)
+    return info

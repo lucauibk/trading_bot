@@ -39,18 +39,54 @@ def _compute_rolling_btc_corr(df: pd.DataFrame, btc_df: pd.DataFrame, window: in
     return corr.reindex(df.index)
 
 
-def _extract_training_features(df: pd.DataFrame, window: pd.DataFrame, btc_corr: float = 0.0) -> np.ndarray:
+def _compute_btc_return_series(df: pd.DataFrame, btc_df: pd.DataFrame):
+    """
+    Aligned per-step BTC returns (1h/4h/24h) reindexed on the symbol index.
+    Ergibt echte historische Markt-Features im Training statt konstant 0 (#44).
+    """
+    btc_close = btc_df["close"].reindex(df.index, method="ffill")
+    return {
+        "r1":  btc_close.pct_change(1),
+        "r4":  btc_close.pct_change(4),
+        "r24": btc_close.pct_change(24),
+    }
+
+
+def _btc_context_at(btc_rets: Optional[dict], i: int):
+    """Baut einen BTCContext-Snapshot für Trainings-Schritt i (oder None)."""
+    if btc_rets is None:
+        return None
+    try:
+        r1  = float(btc_rets["r1"].iloc[i])
+        r4  = float(btc_rets["r4"].iloc[i])
+        r24 = float(btc_rets["r24"].iloc[i])
+    except (IndexError, KeyError):
+        return None
+    if any(v != v for v in (r1, r4, r24)):  # NaN
+        return None
+    from core.context import BTCContext
+    # dominance historisch nicht verfügbar → 0 (live symmetrisch genullt,
+    # siehe ml/features/market.py). trend/vol werden von market.extract
+    # nicht als Features genutzt.
+    return BTCContext(trend="", return_1h=r1, return_4h=r4, return_24h=r24,
+                      realized_vol_7d=0.0, dominance=0.0)
+
+
+def _extract_training_features(df: pd.DataFrame, window: pd.DataFrame, btc_corr: float = 0.0,
+                               btc_ctx=None) -> np.ndarray:
     """
     Extract 34-feature vector for a training window.
     htf(4) and seasonality(5) are computable from OHLCV + timestamp.
-    market(5) uses aligned BTC returns from the same df (historical backfill).
+    market(5): btc_return_1h/4h/24h + btc_corr kommen aus dem alignten btc_df
+    des Callers (echte historische Werte); btc_dominance ist in Training UND
+    Live 0 (kein historisches Dominance-Archiv → Symmetrie statt Skew, #44).
     perp(4) defaults to 0 (no historical funding-rate archive available).
     btc_corr: rolling 30d BTC-correlation passed from bootstrap/refresh caller.
     Falls back to 16-feature technical-only on any error.
     """
     try:
         dt = window.index[-1].to_pydatetime() if hasattr(window.index[-1], "to_pydatetime") else None
-        feats = extract_all_features(window, funding=None, btc=None, btc_corr=btc_corr, dt=dt)
+        feats = extract_all_features(window, funding=None, btc=btc_ctx, btc_corr=btc_corr, dt=dt)
         return feats
     except Exception:
         return extract_features(window)
@@ -112,11 +148,13 @@ def bootstrap_from_history(
     min_window = 60
     xs, ys = [], []
 
-    # Pre-compute rolling BTC-correlation series if BTC data is available
+    # Pre-compute rolling BTC-correlation + aligned BTC returns if BTC data is available
     btc_corr_series = None
+    btc_rets = None
     if btc_df is not None and len(btc_df) >= 60:
         try:
             btc_corr_series = _compute_rolling_btc_corr(df, btc_df)
+            btc_rets = _compute_btc_return_series(df, btc_df)
         except Exception as exc:
             logger.warning("btc_corr pre-compute failed for %s: %s", symbol, exc)
 
@@ -129,7 +167,8 @@ def bootstrap_from_history(
             if not (isinstance(val, float) and val != val):  # not NaN
                 btc_corr = float(np.clip(val, -1.0, 1.0))
         try:
-            feats = _extract_training_features(df, window, btc_corr=btc_corr)
+            feats = _extract_training_features(df, window, btc_corr=btc_corr,
+                                               btc_ctx=_btc_context_at(btc_rets, i))
             atr_pct = _get_atr_pct(df, i)
             label = _compute_label_triple_barrier(df, i, atr_pct)
             xs.append(feats)
@@ -171,9 +210,11 @@ def refresh_from_recent_history(
     xs, ys = [], []
 
     btc_corr_series = None
+    btc_rets = None
     if btc_df is not None and len(btc_df) >= 60:
         try:
             btc_corr_series = _compute_rolling_btc_corr(df, btc_df)
+            btc_rets = _compute_btc_return_series(df, btc_df)
         except Exception as exc:
             logger.warning("btc_corr pre-compute failed for %s (refresh): %s", symbol, exc)
 
@@ -185,7 +226,8 @@ def refresh_from_recent_history(
             if not (isinstance(val, float) and val != val):
                 btc_corr = float(np.clip(val, -1.0, 1.0))
         try:
-            feats = _extract_training_features(df, window, btc_corr=btc_corr)
+            feats = _extract_training_features(df, window, btc_corr=btc_corr,
+                                               btc_ctx=_btc_context_at(btc_rets, i))
             atr_pct = _get_atr_pct(df, i)
             label = _compute_label_triple_barrier(df, i, atr_pct)
             xs.append(feats)

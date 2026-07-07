@@ -30,7 +30,10 @@ def extract(btc: Optional[BTCContext], btc_corr: float = 0.5) -> np.ndarray:
         np.clip(btc.return_4h, -0.20, 0.20),
         np.clip(btc.return_24h, -0.40, 0.40),
         np.clip(btc_corr, -1.0, 1.0),
-        np.clip(btc.dominance, 0.0, 1.0),
+        # btc_dominance: im Training konstant 0 (kein historisches Dominance-
+        # Archiv) – live symmetrisch ebenfalls 0, sonst lernt das Modell
+        # "immer 0" und sieht live Nicht-Null-Werte (Train/Serve-Skew, #44).
+        0.0,
     ], dtype=np.float32)
 
     return np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)

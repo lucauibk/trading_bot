@@ -16,11 +16,13 @@ logger = logging.getLogger("ml.model")
 MODEL_DIR = Path("data/models")
 
 LABEL_TO_STR = {0: "sell", 1: "hold", 2: "buy"}
-MIN_OOS_F1   = 0.33   # Modell wird nur gespeichert wenn OOS-F1 ≥ dieser Wert (Baseline: ~0.33 random)
-# NOTE: Raised from 0.30 → 0.40 (ML-Rehab). 3-class random baseline ≈ 0.33;
-# 0.40 ensures only above-random models are deployed. Models that fall below
-# this gate keep the grid running normally — they just don't open directional
-# trades (directional_score_min = 0.75 enforces this independently).
+MIN_OOS_F1   = 0.33   # Modell wird nur gespeichert wenn OOS-F1 ≥ dieser Wert
+# NOTE: 0.33 ≈ 3-Klassen-Random-Baseline (bewusst so gesetzt, d67be55): das Gate
+# filtert nur klar unterdurchschnittliche Modelle. Modelle darunter lassen das
+# Grid normal weiterlaufen — sie öffnen nur keine Directional Trades
+# (directional_score_min erzwingt das unabhängig). Zusätzlich verhindert der
+# Rollback-Guard in train(), dass ein besseres deploytes Modell durch ein
+# deutlich schlechteres ersetzt wird.
 
 
 class TradingModel:
@@ -73,6 +75,18 @@ class TradingModel:
         if oos_f1 < MIN_OOS_F1:
             logger.warning(
                 "OOS F1 %.3f < %.2f für %s – Modell verworfen", oos_f1, MIN_OOS_F1, self.symbol
+            )
+            return
+
+        # Rollback-Guard (#35): ein bereits deploytes, deutlich besseres Modell
+        # nie durch ein schlechteres ersetzen. Galt bisher nur im täglichen
+        # refresh_from_recent_history-Pfad – der Online-Retrain aus predict()
+        # (label_and_maybe_retrain → _maybe_retrain → train) konnte ein
+        # F1=0.55-Modell still durch ein F1=0.34-Modell überschreiben.
+        if self._clf is not None and oos_f1 < self._last_oos_f1 - 0.05:
+            logger.warning(
+                "OOS F1 %.3f deutlich unter deployter F1 %.3f für %s – Retrain verworfen, altes Modell bleibt",
+                oos_f1, self._last_oos_f1, self.symbol,
             )
             return
 
