@@ -559,3 +559,63 @@ class TestBacktestEquity:
                                 ml_enabled=False, params=params)
         metrics = run_backtest(strategy, df, "SOL/USD", initial_balance=100.0)
         assert min(metrics["equity_curve"]) < 100.0
+
+
+# ── Emergency-stop keeps SL/TP alive (#34) ────────────────────────────────────
+
+class TestEmergencyStopSL:
+    """A symbol past its per-coin realized-loss cap must still receive
+    on_tick_safety (SL/TP) while new-order paths are blocked — like the freeze.
+    Previously the engine `continue`d before on_tick_safety, orphaning positions.
+    """
+
+    def _run_one_tick(self, monkeypatch, total_profit):
+        import types
+        from core.engine import Engine
+        from execution.paper import PaperBroker
+        from core.context import MarketContext
+
+        calls = {"safety": 0, "on_tick": 0, "sync": 0}
+        state = types.SimpleNamespace(total_profit=total_profit,
+                                      investment=100.0, grid_lines=[])
+
+        class FakeStrategy:
+            _broker = None
+            def get_state(self, s): return state
+            def on_tick_safety(self, s, p, ctx): calls["safety"] += 1
+            def on_tick(self, s, p, ctx): calls["on_tick"] += 1
+            def on_candle(self, s, df, ctx): pass
+
+        broker = PaperBroker(initial_balance=100.0, symbols=["SOL/USD"])
+        eng = Engine(FakeStrategy(), broker, ["SOL/USD"],
+                     ctx=MarketContext(), initial_capital=100.0)
+
+        # Neutralize everything except the per-symbol gating under test.
+        for name in ("_check_dashboard_stop", "_check_daily_drawdown",
+                     "_reconcile_fills", "_log_equity"):
+            monkeypatch.setattr(eng, name, lambda *a, **k: None)
+        monkeypatch.setattr(eng, "_update_dashboard", lambda s, p: None)
+        monkeypatch.setattr(eng, "_update_prediction_outcomes", lambda f: None)
+        monkeypatch.setattr(eng, "_sync_orders",
+                            lambda s, p: calls.__setitem__("sync", calls["sync"] + 1))
+
+        import data_fetcher
+        monkeypatch.setattr(data_fetcher, "fetch_ticker", lambda s: {"last": 100.0})
+        monkeypatch.setattr(data_fetcher, "fetch_ohlcv", lambda *a, **k: None)
+        import core.engine as ce
+        monkeypatch.setattr(ce.time, "sleep", lambda *a, **k: None)
+
+        eng._loop_count = 1  # off every cadence (recheck/rebuild/btc/funding)
+        eng._tick()
+        return calls
+
+    def test_healthy_symbol_trades_normally(self, monkeypatch):
+        calls = self._run_one_tick(monkeypatch, total_profit=0.0)
+        assert calls == {"safety": 1, "on_tick": 1, "sync": 1}
+
+    def test_emergency_stopped_keeps_sl_blocks_orders(self, monkeypatch):
+        # -12% of investment 100 = -12 → total_profit -20 trips the emergency stop.
+        calls = self._run_one_tick(monkeypatch, total_profit=-20.0)
+        assert calls["safety"] == 1   # SL/TP still runs (was 0 before the fix)
+        assert calls["on_tick"] == 0  # no new buys
+        assert calls["sync"] == 0     # no new orders submitted

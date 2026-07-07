@@ -74,6 +74,8 @@ class Engine:
         # always run unconditionally; only out_of_range rebuilds are rate-limited
         # to once per 20 ticks (~5 min).
         self._last_rebuild: Dict[str, int] = {}
+        # Symbols currently in per-coin emergency stop (log-once + resume tracking).
+        self._emergency_logged: set = set()
 
     def run(self):
         logger.info("Engine starting | symbols=%s", self.symbols)
@@ -153,9 +155,25 @@ class Engine:
                 continue
 
             state_obj = getattr(self.strategy, "get_state", lambda s: None)(sym)
-            if state_obj and state_obj.total_profit <= -(state_obj.investment * EMERGENCY_STOP_PCT):
-                logger.warning("[ENGINE] %s emergency stop (max loss)", sym)
-                continue
+            # Emergency stop (#34): a symbol past its per-coin realized-loss cap
+            # must stop OPENING new risk — but its open positions still need SL/TP
+            # protection. Previously this `continue`d before on_tick_safety, so
+            # existing positions were left without a stop-loss and the unrealized
+            # loss could grow unbounded. Now we treat it exactly like the daily
+            # freeze: block new orders (on_tick + _sync_orders) below, but keep
+            # running on_tick_safety and the dashboard update.
+            emergency_stopped = bool(
+                state_obj
+                and state_obj.total_profit <= -(state_obj.investment * EMERGENCY_STOP_PCT)
+            )
+            if emergency_stopped and sym not in self._emergency_logged:
+                logger.warning(
+                    "[ENGINE] %s emergency stop (max loss) — new buys halted, "
+                    "SL/TP still active", sym)
+                self._emergency_logged.add(sym)
+            elif not emergency_stopped and sym in self._emergency_logged:
+                # Realized PnL recovered above the cap → allow trading again.
+                self._emergency_logged.discard(sym)
 
             do_recheck = self._loop_count % PREDICTION_RECHECK == 0
             do_rebuild = self._loop_count % GRID_REBUILD_CYCLES == 0
@@ -180,7 +198,7 @@ class Engine:
                 except Exception as e:
                     logger.warning("on_tick_safety failed %s: %s", sym, e)
 
-            if not self.ctx.is_frozen():
+            if not self.ctx.is_frozen() and not emergency_stopped:
                 self.strategy.on_tick(sym, price, self.ctx)
 
             # For live mode: reconcile fills from exchange (paper has no reconciler)
@@ -206,7 +224,7 @@ class Engine:
                 self.strategy.setup_grid(sym, price, self.ctx)
                 self._last_rebuild[sym] = self._loop_count
 
-            if not self.ctx.is_frozen():
+            if not self.ctx.is_frozen() and not emergency_stopped:
                 self._sync_orders(sym, price)
 
             self._update_dashboard(sym, price)
