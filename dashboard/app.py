@@ -301,7 +301,7 @@ def api_capital_get():
 
 @app.route("/api/capital", methods=["POST"])
 def api_capital_set():
-    from dashboard.db import set_initial_capital
+    from dashboard.db import set_initial_capital, clear_paper_balances
     data = request.get_json() or {}
     try:
         val = float(data.get("initial_capital", 0))
@@ -310,8 +310,13 @@ def api_capital_set():
     if val < 10:
         return jsonify({"ok": False, "msg": "Minimum 10 USDT"})
     set_initial_capital(val)
+    # Gespeicherte Paper-Balances verwerfen: sonst überschreibt der
+    # Balance-Restore beim nächsten Start das neue Kapital mit den alten
+    # Session-Balances und die Änderung wirkt nie.
+    clear_paper_balances()
     return jsonify({"ok": True, "initial_capital": val,
-                    "msg": f"Startkapital auf {val:.0f} USDT gesetzt (wirkt beim nächsten Bot-Start)"})
+                    "msg": f"Startkapital auf {val:.0f} USDT gesetzt, "
+                           f"Paper-Balances zurückgesetzt (wirkt beim nächsten Bot-Start)"})
 
 
 @app.route("/api/coin-settings", methods=["GET"])

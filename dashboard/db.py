@@ -596,6 +596,16 @@ def save_paper_balances(balances: dict) -> None:
     con.close()
 
 
+def clear_paper_balances() -> None:
+    """Gespeicherte Paper-Balances verwerfen — nächster Start beginnt frisch
+    mit dem konfigurierten Startkapital (nötig nach Kapital-Änderung, sonst
+    überschreibt der Balance-Restore in main.py das neue Kapital)."""
+    con = get_conn()
+    con.execute("UPDATE bot_status SET paper_balances=NULL WHERE id=1")
+    con.commit()
+    con.close()
+
+
 def load_paper_balances():
     import json
     con = get_conn()
