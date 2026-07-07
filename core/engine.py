@@ -180,6 +180,10 @@ class Engine:
                 except Exception as e:
                     logger.warning("on_tick_safety failed %s: %s", sym, e)
 
+            # Fills (paper + live) run unconditionally – a freeze must only block
+            # NEW buys, never the processing of resting sell/TP fills.
+            self.process_paper_fills(sym, price)
+
             if not self.ctx.is_frozen():
                 self.strategy.on_tick(sym, price, self.ctx)
 
@@ -230,10 +234,10 @@ class Engine:
                 self._shutdown.stop()
 
     def _reconcile_fills(self):
-        """Process fills from live broker via reconciler. Paper fills handled in _sync_orders."""
+        """Process fills from live broker via reconciler. Paper fills handled in process_paper_fills."""
         from execution.paper import PaperBroker
         if isinstance(self.broker, PaperBroker):
-            return  # Paper fills are processed in process_paper_fills() inside _sync_orders
+            return  # Paper fills are processed in process_paper_fills() in the tick loop
         if self.reconciler:
             fills = self.reconciler.reconcile()
             for fill in fills:
@@ -251,8 +255,6 @@ class Engine:
                     del self._active_orders[symbol][fill.client_id]
 
     def _sync_orders(self, symbol: str, price: float):
-        self.process_paper_fills(symbol, price)
-
         desired = {o.client_id: o for o in self.strategy.desired_orders(symbol, price, self.ctx)
                    if o.client_id}
         active = self._active_orders.get(symbol, {})
@@ -390,14 +392,31 @@ class Engine:
                         from core.strategy import Fill
                         for cid, o in list(state.orders.items()):
                             if o.get("side") == "sell" and not o.get("filled") and "bought_at" in o and not o.get("pre_seeded"):
+                                buy_price = o["bought_at"]
+                                qty = o["qty"]
+                                lev = o.get("leverage", 1.0) or 1.0
                                 fill = Fill(
                                     client_id=cid,
                                     symbol=sym, side="sell",
-                                    price=price, qty=o["qty"],
-                                    fee=price * o["qty"] * 2 * KRAKEN_FEE,
+                                    price=price, qty=qty,
+                                    fee=price * qty * KRAKEN_FEE,
                                     ts=time.time(),
                                 )
                                 self.strategy.on_fill(fill, self.ctx)
+                                # on_fill macht nur Strategy-Buchhaltung – die beim
+                                # Buy abgezogene Margin + PnL müssen dem Broker
+                                # explizit gutgeschrieben werden (update_price wird
+                                # hier umgangen). Nur Sell-Fee: Buy-Fee wurde beim
+                                # Buy-Fill bereits abgezogen.
+                                try:
+                                    sell_fee = price * qty * KRAKEN_FEE
+                                    credit = buy_price * qty / lev + (price - buy_price) * qty - sell_fee
+                                    self.broker.sl_credit(sym, credit)
+                                except Exception as e:
+                                    logger.error(
+                                        "[EMERGENCY] %s Broker-Credit fehlgeschlagen (%.4f USDT): %s",
+                                        sym, buy_price * qty / lev, e,
+                                    )
             except Exception as e:
                 logger.error("Emergency sell failed %s: %s", sym, e)
 

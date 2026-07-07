@@ -44,11 +44,14 @@ class PaperBroker(Broker):
         if symbols:
             per_coin = initial_balance / len(symbols)
             self._balances: Dict[str, float] = {s: per_coin for s in symbols}
+            # Fallback-Pool startet leer: das gesamte Kapital steckt in den
+            # Symbol-Buckets. Unbekannte Symbole haben damit kein Budget
+            # (Buys werden abgelehnt), Credits landen aber sichtbar hier.
+            self._balance: float = 0.0
         else:
             self._balances = {}
-
-        # Fallback single-pool (used when symbol not in _balances)
-        self._balance: float = initial_balance
+            # Fallback single-pool (used when symbol not in _balances)
+            self._balance = initial_balance
 
         self._orders:          Dict[str, BrokerOrder] = {}
         self._fill_callbacks:  list                   = []
@@ -217,10 +220,8 @@ class PaperBroker(Broker):
         logger.debug("[PAPER] SL credit %.4f for %s", amount, symbol)
 
     def get_balance(self, currency: str = "USD") -> float:
-        """Total cash across all symbol buckets."""
-        if self._balances:
-            return sum(self._balances.values())
-        return self._balance
+        """Total cash across all symbol buckets plus the fallback pool."""
+        return sum(self._balances.values()) + self._balance
 
     def round_qty(self, symbol: str, qty: float) -> float:
         return round(qty, 6)

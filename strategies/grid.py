@@ -728,11 +728,16 @@ class GridStrategy(Strategy):
                     try:
                         from execution.paper import PaperBroker
                         if isinstance(self._broker, PaperBroker):
-                            sl_fee = (price + buy_price) * qty * KRAKEN_FEE
+                            # Nur Sell-Fee: die Buy-Fee wurde bereits beim
+                            # Buy-Fill vom Broker abgezogen (paper.py).
+                            sl_fee = price * qty * KRAKEN_FEE
                             credit = buy_price * qty / lev + (price - buy_price) * qty - sl_fee
                             self._broker.sl_credit(symbol, credit)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.error(
+                            "[SL] %s Margin-Credit fehlgeschlagen (%.4f USDT verloren?): %s",
+                            symbol, buy_price * qty / lev, e,
+                        )
                 ctx.remove_position(symbol, "grid")
                 # Remove from orders after SL
                 state.orders.pop(cid, None)
