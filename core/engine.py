@@ -80,18 +80,30 @@ class Engine:
     def run(self):
         logger.info("Engine starting | symbols=%s", self.symbols)
 
-        # Clear any stale stop_mode from previous session before first tick
+        # Clear any stale stop_mode + frozen flag from previous session before
+        # first tick (the freeze decision is re-derived from live equity below)
         try:
-            from dashboard.db import set_stop_mode
+            from dashboard.db import set_stop_mode, set_frozen
             set_stop_mode(None)
+            set_frozen(False)
         except Exception:
             pass
 
         self.strategy.init(self.symbols, self.ctx)
 
-        # Initialise equity so daily-drawdown brake has a valid baseline
-        if self._initial_capital > 0:
-            self.ctx.set_equity(self._initial_capital)
+        # Initialise equity so daily-drawdown brake has a valid baseline.
+        # Die ECHTE (ggf. restaurierte) Broker-Balance nehmen, nicht das
+        # konfigurierte Initial-Kapital: nach einem Neustart mit historischen
+        # Verlusten würde die Verankerung an initial_capital den Alt-Verlust
+        # als "Tagesverlust" werten und sofort die DD-Bremse auslösen (#42).
+        # Offene Positionen existieren zu diesem Zeitpunkt nicht (Paper-State
+        # wird nicht über Neustarts persistiert) → Balance = volle Equity.
+        try:
+            balance = float(self.broker.get_balance("USD"))
+        except Exception as e:
+            logger.warning("startup balance read failed: %s", e)
+            balance = 0.0
+        self.ctx.set_equity(balance if balance > 0 else self._initial_capital)
 
         self._refresh_btc()
         self._refresh_funding()
