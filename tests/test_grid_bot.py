@@ -559,3 +559,43 @@ class TestBacktestEquity:
                                 ml_enabled=False, params=params)
         metrics = run_backtest(strategy, df, "SOL/USD", initial_balance=100.0)
         assert min(metrics["equity_curve"]) < 100.0
+
+
+# ── Live reconciler robustness (#76) ──────────────────────────────────────────
+
+class TestReconcileFeeNone:
+    """reconcile_fills must not drop the whole batch when one ccxt trade has
+    fee=None (the key exists but is None, so t.get('fee', {}) returns None)."""
+
+    def _fills(self, trades):
+        import types
+        from execution.kraken import KrakenBroker
+        fake = types.SimpleNamespace(
+            _ex=types.SimpleNamespace(fetch_my_trades=lambda *a, **k: trades),
+            _client_to_exchange={},
+        )
+        return KrakenBroker.reconcile_fills(fake, 0.0)
+
+    def test_fee_none_does_not_drop_batch(self):
+        trades = [
+            {"order": "o1", "symbol": "SOL/USD", "side": "buy", "price": 100.0,
+             "amount": 1.0, "fee": {"cost": 0.16}, "timestamp": 1000, "id": "t1"},
+            {"order": "o2", "symbol": "SOL/USD", "side": "sell", "price": 110.0,
+             "amount": 1.0, "fee": None, "timestamp": 2000, "id": "t2"},  # fee=None
+        ]
+        fills = self._fills(trades)
+        assert len(fills) == 2
+        assert fills[0].fee == pytest.approx(0.16)
+        assert fills[1].fee == 0.0
+
+    def test_one_malformed_trade_skipped_others_survive(self):
+        trades = [
+            {"order": "o1", "symbol": "SOL/USD", "side": "buy", "price": 100.0,
+             "amount": 1.0, "fee": {"cost": 0.1}, "timestamp": 1000, "id": "t1"},
+            {"order": "bad", "id": "t2"},  # missing price/symbol → skipped
+            {"order": "o3", "symbol": "ETH/USD", "side": "sell", "price": 3000.0,
+             "amount": 0.5, "fee": {"cost": 2.4}, "timestamp": 3000, "id": "t3"},
+        ]
+        fills = self._fills(trades)
+        assert len(fills) == 2
+        assert {f.symbol for f in fills} == {"SOL/USD", "ETH/USD"}
