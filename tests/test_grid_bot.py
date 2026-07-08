@@ -559,3 +559,54 @@ class TestBacktestEquity:
                                 ml_enabled=False, params=params)
         metrics = run_backtest(strategy, df, "SOL/USD", initial_balance=100.0)
         assert min(metrics["equity_curve"]) < 100.0
+
+
+# ── Hot-path retrain rollback (#35) ───────────────────────────────────────────
+
+class TestHotPathRetrainRollback:
+    """The per-tick online retrain must not replace a good model with a
+    materially worse one — same rollback guard the daily refresh already has. #35.
+    """
+
+    def _make(self, new_f1):
+        import threading
+        from ml.trainer import ModelTrainer, RETRAIN_EVERY_N
+
+        class _FakeStore:
+            def count_new_labeled_since(self, ts):
+                return RETRAIN_EVERY_N
+            def get_labeled(self, symbol):
+                return (np.zeros((120, 34), dtype=np.float32),
+                        np.zeros(120, dtype=np.int32))
+
+        class _FakeModel:
+            MIN_SAMPLES = 100
+            def __init__(self):
+                self._last_oos_f1 = 0.55
+                self._clf = "OLD_CLF"
+                self._n_samples = 200
+                self._lock = threading.Lock()
+                self.saves = 0
+            def train(self, X, y):  # simulate a successful (gate-passing) retrain
+                self._clf = "NEW_CLF"
+                self._n_samples = len(X)
+                self._last_oos_f1 = new_f1
+                self.saves += 1
+            def _save(self):
+                self.saves += 1
+
+        model = _FakeModel()
+        return ModelTrainer(_FakeStore(), {"SOL/USD": model}), model
+
+    def test_worse_model_rolled_back(self):
+        trainer, model = self._make(new_f1=0.34)  # 0.55 → 0.34, drop > 0.05
+        trainer._maybe_retrain("SOL/USD")
+        assert model._clf == "OLD_CLF"        # restored
+        assert model._last_oos_f1 == 0.55
+        assert model._n_samples == 200
+
+    def test_similar_model_kept(self):
+        trainer, model = self._make(new_f1=0.53)  # within 0.05 → keep
+        trainer._maybe_retrain("SOL/USD")
+        assert model._clf == "NEW_CLF"
+        assert model._last_oos_f1 == 0.53
