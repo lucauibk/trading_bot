@@ -151,6 +151,27 @@ class TestMLFeatures:
         assert feats.shape[0] == 4
         assert not np.isnan(feats).any()
 
+    def test_predict_maps_proba_index_to_real_class_label(self):
+        # Regression for #88: when a class is absent from training, clf.classes_
+        # is not [0,1,2]. predict() must translate the positional argmax back to
+        # the real class label, not return the column index.
+        from ml.model import TradingModel
+
+        class _StubClf:
+            classes_ = np.array([0, 2])  # class 1 (hold) never seen in training
+
+            def predict_proba(self, x):
+                # highest proba is column 1 -> real class 2 (buy), not label 1 (hold)
+                return np.array([[0.2, 0.8]])
+
+        m = TradingModel("TEST/USD")
+        m._clf = _StubClf()
+        m._n_samples = m.MIN_SAMPLES
+        m._feature_names = []  # skip feature-count check
+        label, conf = m.predict(np.zeros(34, dtype=np.float32))
+        assert label == 2  # buy, not the positional index 1 (hold)
+        assert conf == 0.8
+
 
 # ── Backtest Metrics ─────────────────────────────────────────────────────────
 
