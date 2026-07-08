@@ -575,3 +575,254 @@ class TestBacktestEquity:
                                 ml_enabled=False, params=params)
         metrics = run_backtest(strategy, df, "SOL/USD", initial_balance=100.0)
         assert min(metrics["equity_curve"]) < 100.0
+
+
+# ── Regressionstests für Issue-Fixes (#33-#53) ────────────────────────────────
+
+class TestIssueFixes:
+    """Regressionstests für die 2026-07-Fix-Runde. Ein Test pro Kern-Fix."""
+
+    def _floor_strategy(self, **overrides):
+        from strategies.grid import GridStrategy
+        from strategies.grid_params import GridParams
+        params = GridParams.from_dict({"sl_mode": "floor", "leverage": 1.0,
+                                       "momentum_hold_max": 0, **overrides})
+        return GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                            ml_enabled=False, params=params)
+
+    def _setup(self, strategy, price=100.0, atr=2.0):
+        from core.context import MarketContext
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state._atr = atr
+        state.with_position = True
+        strategy.setup_grid("SOL/USD", price, ctx)
+        return ctx, state
+
+    # #39 — SL-Credit zieht nur die Sell-Fee ab (Buy-Fee bereits beim Buy gebucht)
+    def test_sl_credit_charges_only_sell_fee(self):
+        from core.strategy import Fill
+        from execution.paper import PaperBroker
+        from strategies.grid import KRAKEN_FEE
+        strategy = self._floor_strategy(floor_sl_atr_mult=1.0)
+        ctx, state = self._setup(strategy)
+        broker = PaperBroker(initial_balance=1000.0, symbols=["SOL/USD"])
+        credits = []
+        broker.sl_credit = lambda sym, amt: credits.append(amt)
+        strategy._broker = broker
+
+        cid, order = [(c, o) for c, o in state.orders.items() if o["side"] == "buy"][0]
+        fill = Fill(client_id=cid, symbol="SOL/USD", side="buy",
+                    price=order["price"], qty=order["qty"], fee=0.0, ts=time.time())
+        strategy.on_fill(fill, ctx)
+
+        tick = state.floor_sl - 0.01
+        buy_price, qty = order["price"], order["qty"]
+        strategy.on_tick("SOL/USD", tick, ctx)
+        assert credits, "SL muss den Broker-Credit auslösen"
+        expected = buy_price * qty / 1.0 + (tick - buy_price) * qty - tick * qty * KRAKEN_FEE
+        assert credits[0] == pytest.approx(expected)
+
+    # #46 — Paper-Fills werden auch während eines Daily-Drawdown-Freeze verarbeitet
+    def test_paper_fills_processed_during_freeze(self, monkeypatch, tmp_path):
+        import dashboard.db as db
+        import data_fetcher
+        import market.btc_context as btc_ctx_mod
+        import market.perp as perp_mod
+        from core.context import MarketContext
+        from core.engine import Engine
+        from execution.paper import PaperBroker
+
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "trades.db")
+        monkeypatch.setattr(db, "_INITIALIZED_PATH", "")
+        monkeypatch.setattr(data_fetcher, "fetch_ticker", lambda sym: {"last": 110.0})
+
+        def _no_net(*a, **k):
+            raise RuntimeError("no network in test")
+        monkeypatch.setattr(data_fetcher, "fetch_ohlcv", _no_net)
+        monkeypatch.setattr(btc_ctx_mod, "get_btc_context", lambda force_refresh=True: None)
+        monkeypatch.setattr(perp_mod, "get_funding", lambda s: None)
+
+        class FakeStrategy:
+            name = "fake"
+            def __init__(self):
+                self.fills = []
+                self._broker = None
+            def init(self, symbols, ctx): pass
+            def on_candle(self, sym, df, ctx): pass
+            def on_tick(self, sym, price, ctx):
+                raise AssertionError("on_tick darf im Freeze nicht laufen")
+            def on_fill(self, fill, ctx):
+                self.fills.append(fill)
+            def desired_orders(self, sym, price, ctx):
+                return []
+            def get_state(self, sym):
+                return None
+
+        broker = PaperBroker(initial_balance=1000.0, symbols=["SOL/USD"])
+        broker.place_limit("SOL/USD", "sell", 105.0, 1.0, client_id="s1",
+                           meta={"bought_at": 100.0, "leverage": 1.0})
+        broker.update_price("SOL/USD", 100.0)  # Tick vorschieben (kein Same-Tick-Fill)
+
+        strategy = FakeStrategy()
+        ctx = MarketContext()
+        ctx.set_equity(1000.0)
+        ctx.set_freeze(True)
+        engine = Engine(strategy, broker, ["SOL/USD"], ctx, initial_capital=1000.0)
+        engine._tick()
+
+        assert len(strategy.fills) == 1, "Sell-Fill muss trotz Freeze verarbeitet werden"
+        assert strategy.fills[0].side == "sell"
+
+    # #48 — Tageswechsel re-ankert die Daily-Baseline auf die aktuelle Equity
+    def test_daily_baseline_reanchors_on_day_change(self):
+        from datetime import date, timedelta
+        from risk.correlation import CorrelationTracker
+        from risk.manager import RiskManager
+        rm = RiskManager(CorrelationTracker())
+        rm.set_daily_start(1000.0)
+        assert rm._daily_start == 1000.0
+        rm.set_daily_start(900.0)          # gleicher Tag: kein Re-Anker
+        assert rm._daily_start == 1000.0
+        rm._daily_date = date.today() - timedelta(days=1)
+        rm.set_daily_start(900.0)          # neuer Tag: Live-Equity wird Baseline
+        assert rm._daily_start == 900.0
+        assert rm._daily_date == date.today()
+
+    # #36 — equity <= 0 wird fail-closed abgelehnt statt alle Checks zu überspringen
+    def test_can_open_denies_on_zero_equity(self):
+        from core.context import MarketContext
+        from risk.correlation import CorrelationTracker
+        from risk.manager import RiskManager
+        rm = RiskManager(CorrelationTracker())
+        ctx = MarketContext()  # total_equity = 0.0
+        ok, reason = rm.can_open("SOL/USD", 50.0, ctx)
+        assert ok is False
+        assert reason == "equity_uninitialized"
+
+    # #49a — Preis über dem gesamten Grid: oberstes Level bekommt keinen Buy-Seed
+    def test_no_buy_seeded_at_topmost_level(self):
+        strategy = self._floor_strategy()
+        ctx, state = self._setup(strategy, price=100.0)
+        # Gap-Über-Grid-Szenario: Grid explizit unter dem Preis aufbauen
+        strategy.setup_grid("SOL/USD", 100.0, ctx, lower=50.0, upper=90.0)
+        top = state.grid_lines[-1]
+        top_buys = [o for o in state.orders.values()
+                    if o["side"] == "buy" and o["price"] == top]
+        assert top_buys == [], "Oberstes Level darf nie als Buy geseedet werden"
+        # Alle anderen Levels unterhalb sind weiterhin Buys
+        other_buys = [o for o in state.orders.values() if o["side"] == "buy"]
+        assert len(other_buys) == len(state.grid_lines) - 1
+
+    # #49b — Replenish-Sell ersetzt pre-seeded Sell am selben Preis (kein Doppel-Sell)
+    def test_replenish_sell_replaces_preseeded(self):
+        from core.strategy import Fill
+        strategy = self._floor_strategy()
+        ctx, state = self._setup(strategy, price=100.0)
+        # Buy direkt unter dem Preis: dessen Sell-Ziel (Level darüber) trägt ein pre-seeded Sell
+        buys = sorted(
+            ((c, o) for c, o in state.orders.items() if o["side"] == "buy"),
+            key=lambda t: t[1]["price"], reverse=True,
+        )
+        cid, order = buys[0]
+        idx = state.grid_lines.index(order["price"])
+        sell_price = state.grid_lines[idx + 1]
+        pre = [o for o in state.orders.values()
+               if o["side"] == "sell" and o["price"] == sell_price and o.get("pre_seeded")]
+        assert pre, "Testaufbau: am Ziel-Level muss ein pre-seeded Sell liegen"
+
+        fill = Fill(client_id=cid, symbol="SOL/USD", side="buy",
+                    price=order["price"], qty=order["qty"], fee=0.0, ts=time.time())
+        strategy.on_fill(fill, ctx)
+
+        sells_at_price = [o for o in state.orders.values()
+                          if o["side"] == "sell" and o["price"] == sell_price and not o.get("filled")]
+        assert len(sells_at_price) == 1, "Nur EIN Sell pro Level (kein Over-Sell)"
+        assert not sells_at_price[0].get("pre_seeded")
+        # #52 — echte Grid-Sells tragen entry_ts für holding_seconds
+        assert sells_at_price[0].get("entry_ts", 0) > 0
+
+    # #51b — Trail-Lock-Anker ratcht mit steigendem Preis hoch
+    def test_directional_trail_anchor_ratchets_up(self):
+        strategy = self._floor_strategy()
+        ctx, state = self._setup(strategy)
+        state._directional = {
+            "entry": 100.0, "qty": 1.0, "usdt": 100.0, "leverage": 1.0,
+            "tp": 200.0, "sl": 50.0, "entry_ts": time.time(),
+        }
+        state._direction_score = -0.5  # ML:DOWN, Position im Plus → Trail-Lock
+        strategy._check_directional("SOL/USD", 110.0, state, ctx)
+        assert state._directional["signal_down_price"] == 110.0
+        strategy._check_directional("SOL/USD", 120.0, state, ctx)
+        assert state._directional["signal_down_price"] == 120.0, "Anker muss hochratchen"
+
+    # #33/#51a — Directional bucht Margin beim Broker + PnL läuft in separaten Akku
+    def test_directional_close_credits_broker_and_tracks_profit(self):
+        from execution.paper import PaperBroker
+        from strategies.grid import KRAKEN_FEE
+        strategy = self._floor_strategy()
+        ctx, state = self._setup(strategy)
+        broker = PaperBroker(initial_balance=1000.0, symbols=["SOL/USD"])
+        credits = []
+        broker.sl_credit = lambda sym, amt: credits.append(amt)
+        strategy._broker = broker
+        state._directional = {
+            "entry": 100.0, "qty": 1.0, "usdt": 100.0, "leverage": 1.0,
+            "tp": 110.0, "sl": 90.0, "entry_ts": time.time(),
+        }
+        state._direction_score = 0.5
+        strategy._check_directional("SOL/USD", 112.0, state, ctx)  # TP-Hit
+        assert state._directional == {}
+        assert credits, "Close muss Margin + PnL an den Broker zurückgeben"
+        expected = 100.0 + (112.0 - 100.0) * 1.0 - 112.0 * 1.0 * KRAKEN_FEE
+        assert credits[0] == pytest.approx(expected)
+        assert state._directional_profit == pytest.approx(state.total_profit)
+
+    # #53c — get_balance zählt den Fallback-Pool mit
+    def test_get_balance_includes_fallback_pool(self):
+        from execution.paper import PaperBroker
+        broker = PaperBroker(initial_balance=1000.0, symbols=["SOL/USD"])
+        assert broker.get_balance() == pytest.approx(1000.0)
+        broker._credit("UNKNOWN/USD", 50.0)  # landet im Fallback-Pool
+        assert broker.get_balance() == pytest.approx(1050.0)
+
+    # #37 — negativer Leverage-Wert in der DB wird nie durchgereicht
+    def test_get_leverage_rejects_negative(self, monkeypatch, tmp_path):
+        import dashboard.db as db
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "trades.db")
+        monkeypatch.setattr(db, "_INITIALIZED_PATH", "")
+        con = db.get_conn()
+        con.execute("UPDATE bot_status SET leverage=-2.0 WHERE id=1")
+        con.commit()
+        con.close()
+        assert db.get_leverage() == 1.0
+
+    # #41 — WAL + busy_timeout aktiv
+    def test_db_uses_wal_and_busy_timeout(self, monkeypatch, tmp_path):
+        import dashboard.db as db
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "trades.db")
+        monkeypatch.setattr(db, "_INITIALIZED_PATH", "")
+        con = db.get_conn()
+        assert con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert con.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+        con.close()
+
+    # #35 — train() ersetzt kein deutlich besseres deploytes Modell
+    def test_train_keeps_better_deployed_model(self, monkeypatch, tmp_path):
+        import ml.model as model_mod
+        monkeypatch.setattr(model_mod, "MODEL_DIR", tmp_path)
+        monkeypatch.setattr(model_mod, "MIN_OOS_F1", 0.0)  # absolutes Gate neutralisieren
+        model = model_mod.TradingModel("TEST/USD")
+        sentinel = object()
+        model._clf = sentinel
+        model._last_oos_f1 = 0.99  # deploytes Modell ist (fiktiv) exzellent
+
+        rng = np.random.default_rng(42)
+        X = rng.normal(size=(150, 5)).astype(np.float32)
+        y = rng.integers(0, 3, size=150).astype(np.int32)  # Random-Labels → F1 ≈ 0.33
+        model.train(X, y)
+
+        assert model._clf is sentinel, "Schlechteres Retrain darf das Modell nicht ersetzen"
+        assert model._last_oos_f1 == 0.99
+        assert not (tmp_path / "TEST_USD.joblib").exists()

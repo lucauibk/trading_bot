@@ -13,7 +13,7 @@ cd "$ROOT"
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 
 echo -e "${GREEN}[test]${NC} Starte Test-Suite..."
-"$PYTHON" -m pytest tests/ "$@"
+"$PYTHON" -m pytest tests/ price_predictor/tests/ "$@"
 EXIT=$?
 
 if [ $EXIT -eq 0 ]; then
