@@ -17,7 +17,7 @@ FEATURE_NAMES = [
 ]
 
 
-def extract(btc: Optional[BTCContext], btc_corr: float = 0.5) -> np.ndarray:
+def extract(btc: Optional[BTCContext], btc_corr: float = 0.0) -> np.ndarray:
     """Extract 5 market context features."""
     if btc is None:
         # btc_corr_30d is computed independently from OHLCV — preserve it even without BTC context.

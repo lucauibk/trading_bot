@@ -27,7 +27,7 @@ def extract_all(
     df_1h: pd.DataFrame,
     funding: Optional[FundingInfo] = None,
     btc: Optional[BTCContext] = None,
-    btc_corr: float = 0.5,
+    btc_corr: float = 0.0,
     dt: Optional[datetime] = None,
 ) -> np.ndarray:
     """
