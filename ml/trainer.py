@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 
 from .data_store import MLDataStore
-from .features import extract_features
 from .features.combined import extract_all as extract_all_features
 from .model import TradingModel
 
@@ -39,21 +38,28 @@ def _compute_rolling_btc_corr(df: pd.DataFrame, btc_df: pd.DataFrame, window: in
     return corr.reindex(df.index)
 
 
-def _extract_training_features(df: pd.DataFrame, window: pd.DataFrame, btc_corr: float = 0.0) -> np.ndarray:
+def _extract_training_features(df: pd.DataFrame, window: pd.DataFrame,
+                               btc_corr: float = 0.0) -> Optional[np.ndarray]:
     """
-    Extract 34-feature vector for a training window.
+    Extract the 34-feature vector for a training window.
     htf(4) and seasonality(5) are computable from OHLCV + timestamp.
     market(5) uses aligned BTC returns from the same df (historical backfill).
     perp(4) defaults to 0 (no historical funding-rate archive available).
     btc_corr: rolling 30d BTC-correlation passed from bootstrap/refresh caller.
-    Falls back to 16-feature technical-only on any error.
+
+    Returns None (and logs the cause) if extraction fails, so the caller can skip
+    the sample. We deliberately do NOT fall back to a 16-feature technical vector:
+    that silently violates the 34-feature contract (CLAUDE.md) and yields either an
+    np.array(dtype) crash on mixed dims or a 16-feature model that TradingModel._load()
+    later discards as stale — leaving the bot with no usable model and no error (#55).
     """
     try:
         dt = window.index[-1].to_pydatetime() if hasattr(window.index[-1], "to_pydatetime") else None
-        feats = extract_all_features(window, funding=None, btc=None, btc_corr=btc_corr, dt=dt)
-        return feats
+        return extract_all_features(window, funding=None, btc=None, btc_corr=btc_corr, dt=dt)
     except Exception:
-        return extract_features(window)
+        logger.debug("34-feature extraction failed for a training sample – skipping",
+                     exc_info=True)
+        return None
 
 
 def _compute_label_triple_barrier(
@@ -111,6 +117,7 @@ def bootstrap_from_history(
     """
     min_window = 60
     xs, ys = [], []
+    skipped_feat = 0
 
     # Pre-compute rolling BTC-correlation series if BTC data is available
     btc_corr_series = None
@@ -130,6 +137,9 @@ def bootstrap_from_history(
                 btc_corr = float(np.clip(val, -1.0, 1.0))
         try:
             feats = _extract_training_features(df, window, btc_corr=btc_corr)
+            if feats is None:            # 34-feature extraction failed → skip, keep dims uniform
+                skipped_feat += 1
+                continue
             atr_pct = _get_atr_pct(df, i)
             label = _compute_label_triple_barrier(df, i, atr_pct)
             xs.append(feats)
@@ -142,6 +152,10 @@ def bootstrap_from_history(
             store.set_label(symbol, ts, label)
         except Exception:
             continue
+
+    if skipped_feat:
+        logger.warning("Bootstrap %s: %d Samples wegen fehlgeschlagener 34-Feature-"
+                       "Extraktion übersprungen (Traceback auf DEBUG)", symbol, skipped_feat)
 
     if len(xs) < model.MIN_SAMPLES:
         logger.warning("Bootstrap %s: nur %d Samples (min %d)", symbol, len(xs), model.MIN_SAMPLES)
@@ -169,6 +183,7 @@ def refresh_from_recent_history(
     """
     min_window = 60
     xs, ys = [], []
+    skipped_feat = 0
 
     btc_corr_series = None
     if btc_df is not None and len(btc_df) >= 60:
@@ -186,12 +201,19 @@ def refresh_from_recent_history(
                 btc_corr = float(np.clip(val, -1.0, 1.0))
         try:
             feats = _extract_training_features(df, window, btc_corr=btc_corr)
+            if feats is None:            # 34-feature extraction failed → skip, keep dims uniform
+                skipped_feat += 1
+                continue
             atr_pct = _get_atr_pct(df, i)
             label = _compute_label_triple_barrier(df, i, atr_pct)
             xs.append(feats)
             ys.append(label)
         except Exception:
             continue
+
+    if skipped_feat:
+        logger.warning("Refresh %s: %d Samples wegen fehlgeschlagener 34-Feature-"
+                       "Extraktion übersprungen (Traceback auf DEBUG)", symbol, skipped_feat)
 
     if len(xs) < model.MIN_SAMPLES:
         logger.warning("Refresh %s: nur %d Samples – übersprungen", symbol, len(xs))
