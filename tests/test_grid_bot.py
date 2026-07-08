@@ -559,3 +559,69 @@ class TestBacktestEquity:
                                 ml_enabled=False, params=params)
         metrics = run_backtest(strategy, df, "SOL/USD", initial_balance=100.0)
         assert min(metrics["equity_curve"]) < 100.0
+
+
+# ── Engine equity staleness (#89) ─────────────────────────────────────────────
+
+class TestEquityStaleGuard:
+    """A permanently-failing ticker must NOT freeze the whole equity curve /
+    daily-drawdown brake forever. Brief staleness is skipped (sleep-wake guard,
+    #20); persistent staleness falls back to last-good prices (#89).
+    """
+
+    class _FakeState:
+        def __init__(self):
+            # one open (unfilled) grid sell with a known entry → deterministic MTM
+            self.orders = {
+                "s1": {"side": "sell", "filled": False, "bought_at": 90.0,
+                       "qty": 1.0, "leverage": 1.0},
+            }
+            self.total_profit = 0.0
+
+    class _FakeStrategy:
+        def __init__(self, state):
+            self._state = state
+        def get_state(self, sym):
+            return self._state
+
+    class _FakeBroker:
+        def get_balance(self, currency="USD"):
+            return 500.0
+
+    def _engine(self):
+        from core.engine import Engine
+        from core.context import MarketContext
+        state = self._FakeState()
+        eng = Engine(self._FakeStrategy(state), self._FakeBroker(),
+                     ["SOL/USD"], ctx=MarketContext())
+        # last-good price 100 → MTM = margin(90) + unrealized(1*(100-90)) = 100
+        eng._last_prices = {"SOL/USD": 100.0}
+        return eng
+
+    def test_brief_staleness_skips_equity_update(self):
+        eng = self._engine()
+        eng.ctx.set_equity(999.0)  # sentinel
+        eng._last_price_ts = {"SOL/USD": time.time() - 10_000}  # very stale
+        eng._log_equity()
+        # within grace → skipped, sentinel retained (no false drawdown trigger)
+        assert eng.ctx.total_equity == 999.0
+        assert eng._equity_stale_since is not None
+
+    def test_persistent_staleness_falls_back_to_last_good_price(self):
+        from core.engine import STALE_EQUITY_GRACE_SECONDS
+        eng = self._engine()
+        eng.ctx.set_equity(999.0)  # sentinel
+        eng._last_price_ts = {"SOL/USD": time.time() - 10_000}
+        # pretend staleness began well before the grace window
+        eng._equity_stale_since = time.time() - (STALE_EQUITY_GRACE_SECONDS + 30)
+        eng._log_equity()
+        # grace expired → equity logged with last-good price: 500 balance + 100 MTM
+        assert eng.ctx.total_equity == pytest.approx(600.0)
+
+    def test_fresh_prices_reset_stale_marker(self):
+        eng = self._engine()
+        eng._equity_stale_since = time.time() - 5.0  # was stale
+        eng._last_price_ts = {"SOL/USD": time.time()}  # now fresh
+        eng._log_equity()
+        assert eng._equity_stale_since is None
+        assert eng.ctx.total_equity == pytest.approx(600.0)
