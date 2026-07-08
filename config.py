@@ -5,6 +5,7 @@ load_dotenv()
 
 # ── Exchange ──────────────────────────────────────────────────────────────────
 EXCHANGE_ID = "kraken"
+KRAKEN_FEE = 0.0016  # 0.16% Maker-Fee – einzige Quelle, überall von hier importieren (#53)
 API_KEY = os.getenv("KRAKEN_API_KEY") or os.getenv("BINANCE_API_KEY", "")
 API_SECRET = os.getenv("KRAKEN_API_SECRET") or os.getenv("BINANCE_API_SECRET", "")
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"

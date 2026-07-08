@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from config import KRAKEN_FEE  # Single-Source (#53)
 from core.context import MarketContext
 from core.lifecycle import ShutdownFlag
 from core.strategy import Strategy
@@ -27,6 +28,8 @@ GRID_REBUILD_CYCLES = 60   # every N ticks force grid rebuild (~15min)
 BTC_REFRESH_CYCLES = 4     # every N ticks refresh BTC context (~1min)
 FUNDING_REFRESH_CYCLES = 240  # every N ticks refresh funding (~1h)
 CORR_BTC_REFRESH_CYCLES = 240  # every N ticks refresh BTC closes for CorrelationTracker (~1h)
+REBUILD_COOLDOWN_TICKS = 40    # out_of_range-Rebuilds höchstens alle N Ticks (~10 min, #32)
+OUT_OF_RANGE_BAND = 0.02       # Preis muss ±2% außerhalb der Grid-Kanten liegen (#32)
 # Per-symbol kill switch on realized loss. Must be wider than one full
 # floor-SL flush (which can realize several % at once), otherwise a single
 # flush permanently halts the symbol.
@@ -73,7 +76,7 @@ class Engine:
         # Rebuild cooldown: prevents out_of_range events from back-to-back grid
         # rebuilds when price hovers near the edge.  Scheduled rebuilds (do_rebuild)
         # always run unconditionally; only out_of_range rebuilds are rate-limited
-        # to once per 20 ticks (~5 min).
+        # to once per REBUILD_COOLDOWN_TICKS (40 Ticks ≈ 10 min).
         self._last_rebuild: Dict[str, int] = {}
         # Tick des letzten BTC-Close-Refreshs für den CorrelationTracker (#43);
         # stark negativ initialisiert, damit der erste Aufruf sofort fetcht.
@@ -179,7 +182,8 @@ class Engine:
             if state_obj and state_obj.grid_lines:
                 lo = state_obj.grid_lines[0]
                 hi = state_obj.grid_lines[-1]
-                out_of_range = price < lo * 0.98 or price > hi * 1.02
+                out_of_range = (price < lo * (1 - OUT_OF_RANGE_BAND)
+                                or price > hi * (1 + OUT_OF_RANGE_BAND))
 
             # Safety ticks (SL/TP) run even during freeze AND emergency stop –
             # offene Positionen brauchen ihr SL/TP-Management weiterhin (#34).
@@ -205,12 +209,13 @@ class Engine:
             if not self.ctx.is_frozen():
                 self.strategy.on_tick(sym, price, self.ctx)
 
-            # Scheduled rebuild (every 60 ticks) always fires.  out_of_range
-            # rebuilds are rate-limited to once per 20 ticks (~5 min) so that
-            # price hovering near the grid edge does not cause a rebuild storm.
+            # Scheduled rebuild (every GRID_REBUILD_CYCLES ticks) always fires.
+            # out_of_range rebuilds are rate-limited to once per
+            # REBUILD_COOLDOWN_TICKS (40 Ticks ≈ 10 min) so that price hovering
+            # near the grid edge does not cause a rebuild storm (#32).
             rebuild_allowed = do_rebuild or (
                 out_of_range and
-                self._loop_count - self._last_rebuild.get(sym, 0) >= 40
+                self._loop_count - self._last_rebuild.get(sym, 0) >= REBUILD_COOLDOWN_TICKS
             )
             if rebuild_allowed and hasattr(self.strategy, "setup_grid"):
                 # Note: setup_grid runs even during a daily-drawdown freeze because
@@ -591,6 +596,3 @@ class Engine:
             set_status(running=False, mode="stopped", strategy="grid")
         except Exception:
             pass
-
-
-KRAKEN_FEE = 0.0016  # used in emergency sell fee calculation

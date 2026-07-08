@@ -140,7 +140,9 @@ def analyse(symbol: str, indicators: dict) -> Optional[dict]:
         # Markdown-Codeblocks entfernen falls vorhanden
         if "```" in raw:
             raw = raw.split("```")[-2] if raw.count("```") >= 2 else raw
-            raw = raw.lstrip("json").strip()
+            # removeprefix, NICHT lstrip: lstrip("json") entfernt jeden führenden
+            # Lauf der Zeichen j/s/o/n und kann gültiges JSON verstümmeln (#53)
+            raw = raw.strip().removeprefix("json").strip()
         data = json.loads(raw)
 
         direction  = data.get("direction", "neutral")

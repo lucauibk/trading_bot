@@ -2,8 +2,9 @@
 RiskManager – reads config/config.yaml and enforces all risk rules.
 
 Pre-trade checks via can_open() replace the scattered inline checks in grid_bot.py.
-Daily drawdown is cross-coin, loaded from config.yaml (was hardcoded 8%).
-Correlation-aware bucketing prevents 5-alt over-concentration.
+Daily drawdown is cross-coin, loaded from config.yaml (aktuell 10%, bewusste
+Entscheidung dd0531b – config.yaml ist führend). Correlation-aware bucketing
+prevents 5-alt over-concentration.
 """
 
 import logging
@@ -36,7 +37,10 @@ class RiskManager:
 
     def __init__(self, correlation: CorrelationTracker):
         cfg = _load_risk_config()
-        self.max_daily_drawdown: float = cfg.get("max_daily_drawdown", 0.03)
+        # config.yaml ist führend (aktuell 0.10, bewusste Entscheidung dd0531b);
+        # Default hier nur Fallback falls die yaml fehlt – gleicher Wert, damit
+        # Code-Default und Config nicht divergieren (#40).
+        self.max_daily_drawdown: float = cfg.get("max_daily_drawdown", 0.10)
         self.max_position_size: float = cfg.get("max_position_size", 0.10)
         self.max_open_positions: int = cfg.get("max_open_positions", 5)
         self.max_portfolio_risk: float = cfg.get("max_portfolio_risk", 0.05)
@@ -124,9 +128,12 @@ class RiskManager:
         win_rate: float = 0.52,
         win_loss_ratio: float = 1.2,
         realized_vol: float = 0.03,
-        leverage: float = 1.0,
     ) -> float:
-        """Return recommended USDT position size using Fractional Kelly + Vol-targeting."""
+        """Return recommended USDT position size using Fractional Kelly + Vol-targeting.
+
+        Bewusst OHNE leverage-Parameter: compute_position_usdt kennt keinen
+        Hebel, ein früherer leverage-Arg wurde still verworfen (#53).
+        """
         return compute_position_usdt(
             equity=equity,
             win_rate=win_rate,

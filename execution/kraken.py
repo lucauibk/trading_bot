@@ -22,7 +22,8 @@ from execution.broker import Broker, BrokerOrder
 
 logger = logging.getLogger(__name__)
 
-KRAKEN_FEE = 0.0016
+from config import KRAKEN_FEE  # Single-Source (#53)
+
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 1.5  # seconds
 

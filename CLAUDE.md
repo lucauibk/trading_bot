@@ -11,7 +11,7 @@ Directional Trades.
 - LightGBM (34 Features) + Claude Haiku Blended-Richtungsvorhersage
 - Directional Trades bei starkem UP-Signal (20% des Investments, Leverage aus DB)
 - Floor-Stop-Loss (SL unter Gridboden) → verhindert Kaskaden-Dumps
-- Cross-Coin Daily-Drawdown-Bremse (-3%)
+- Cross-Coin Daily-Drawdown-Bremse (-10%, config.yaml max_daily_drawdown)
 - Compounding mit Investment-Cap (3× Initial)
 
 ---

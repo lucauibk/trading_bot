@@ -28,7 +28,8 @@ from execution.broker import Broker, BrokerOrder
 
 logger = logging.getLogger(__name__)
 
-KRAKEN_FEE   = 0.0016   # 0.16% maker fee
+from config import KRAKEN_FEE  # 0.16% maker fee – Single-Source (#53)
+
 SLIPPAGE_BPS = 3        # 3 basis points slippage
 
 

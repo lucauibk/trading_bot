@@ -98,12 +98,14 @@ def notify_error(message: str):
     _send(f"⚠️ <b>Bot-Fehler</b>\n{message}")
 
 
-def notify_startup(capital: float):
+def notify_startup(capital: float, symbols: list = None, strategy: str = "Grid + ML"):
+    """Startup-Nachricht mit den echten Runtime-Symbolen (config.yaml), nicht
+    dem stalen config.SYMBOLS, und der tatsächlichen Strategie (#53)."""
     mode = "Paper Trading" if config.PAPER_TRADING else "LIVE Trading"
     _send(
         f"🤖 <b>Trading Bot gestartet</b>\n"
         f"Modus:    {mode}\n"
         f"Kapital:  {capital:.2f} USDT\n"
-        f"Symbole:  {', '.join(config.SYMBOLS)}\n"
-        f"Strategie: EMA {config.EMA_FAST}/{config.EMA_SLOW} + RSI"
+        f"Symbole:  {', '.join(symbols) if symbols else '–'}\n"
+        f"Strategie: {strategy}"
     )
