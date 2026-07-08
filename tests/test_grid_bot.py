@@ -559,3 +559,39 @@ class TestBacktestEquity:
                                 ml_enabled=False, params=params)
         metrics = run_backtest(strategy, df, "SOL/USD", initial_balance=100.0)
         assert min(metrics["equity_curve"]) < 100.0
+
+
+# ── Trainer stale-candle labeling (#91) ───────────────────────────────────────
+
+class TestTrainerStaleCandleLabel:
+    """A sample whose timestamp predates the labeling window must NOT be labeled
+    from the clamped first candle (get_indexer nearest never returns -1). #91.
+    """
+
+    def _trainer(self, monkeypatch, tmp_path):
+        import ml.data_store as data_store
+        monkeypatch.setattr(data_store, "DB_PATH", tmp_path / "ml_training.db")
+        from ml.data_store import MLDataStore
+        from ml.trainer import ModelTrainer
+        store = MLDataStore()
+        return ModelTrainer(store, {}), store
+
+    def test_out_of_window_sample_not_labeled(self, monkeypatch, tmp_path):
+        trainer, store = self._trainer(monkeypatch, tmp_path)
+        df = _make_df(60)  # hourly candles starting 2024-01-01
+        df.index = df.index.tz_localize("UTC")  # match production UTC-aware index
+        sym = "SOL/USD"
+        feats = np.zeros(34, dtype=np.float32)
+
+        in_window_ts  = int(df.index[20].timestamp())
+        out_window_ts = int(df.index[0].timestamp()) - 100 * 24 * 3600  # 100 days earlier
+
+        store.store(sym, in_window_ts,  feats, 100.0, 1)
+        store.store(sym, out_window_ts, feats, 100.0, 1)
+
+        trainer.label_and_maybe_retrain(sym, df)
+
+        # in-window sample got labeled; out-of-window one was skipped (still NULL)
+        unlabeled_ts = {ts for _, ts, _ in store.get_unlabeled_before(int(time.time()))}
+        assert out_window_ts in unlabeled_ts, "stale sample must NOT be mislabeled"
+        assert in_window_ts not in unlabeled_ts, "in-window sample should be labeled"
