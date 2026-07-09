@@ -114,7 +114,7 @@ def aggregate(results: list) -> dict:
     return agg
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=180)
     parser.add_argument("--train-days", type=int, default=120)
@@ -122,7 +122,22 @@ def main():
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--max-dd", type=float, default=-15.0)
     parser.add_argument("--min-trades", type=int, default=100)
+    # nightly_tune.run_sweep() invokes this per symbol with --symbol; without this
+    # argument argparse aborted every nightly sweep with SystemExit(2) (#101).
+    parser.add_argument("--symbol", type=str, default=None,
+                        help="Restrict the sweep to a single symbol (default: all SYMBOLS)")
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
+
+    global SYMBOLS
+    if args.symbol:
+        if args.symbol not in SYMBOLS:
+            parser.error(f"unknown --symbol {args.symbol!r}; known: {', '.join(SYMBOLS)}")
+        SYMBOLS = [args.symbol]
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     log = logging.getLogger("sweep")
