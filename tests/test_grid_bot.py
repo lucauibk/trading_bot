@@ -152,6 +152,34 @@ class TestMLFeatures:
         assert not np.isnan(feats).any()
 
 
+# ── ML Model predict() label mapping ─────────────────────────────────────────
+
+class TestModelPredictLabelMapping:
+
+    def test_predict_translates_proba_index_to_class_label(self):
+        """Regression for #88: when a class is missing from training, clf.classes_
+        is e.g. [0, 2] and proba.argmax() is a column index, not the real label.
+        predict() must map the index through classes_ to the true label."""
+        from ml.model import TradingModel
+
+        class _FakeCLF:
+            # 'hold' (1) never appeared in training → only sell(0) and buy(2).
+            classes_ = np.array([0, 2])
+
+            def predict_proba(self, X):
+                # column 1 (argmax) → classes_[1] == 2 (buy), NOT index 1 (hold)
+                return np.array([[0.2, 0.8]])
+
+        m = TradingModel("TESTLABEL/USD")
+        m._clf = _FakeCLF()
+        m._n_samples = TradingModel.MIN_SAMPLES
+        m._feature_names = [f"f{i}" for i in range(3)]
+
+        label, conf = m.predict(np.zeros(3, dtype=float))
+        assert label == 2          # buy — not the column index 1 (=hold)
+        assert conf == pytest.approx(0.8)
+
+
 # ── Backtest Metrics ─────────────────────────────────────────────────────────
 
 class TestBacktestMetrics:

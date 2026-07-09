@@ -139,8 +139,13 @@ class TradingModel:
             except Exception as e:
                 logger.warning("predict_proba failed for %s: %s", self.symbol, e)
                 return 1, 0.0
-            label = int(proba.argmax())
-            confidence = float(proba.max())
+            # proba columns are ordered by clf.classes_, NOT guaranteed [0,1,2].
+            # If a class was absent from training (e.g. a low-vol symbol never hit
+            # a triple-barrier sell), classes_ may be e.g. [0,2] and the argmax
+            # column index would map to the wrong label. Translate index → label.
+            idx = int(proba.argmax())
+            label = int(self._clf.classes_[idx])
+            confidence = float(proba[idx])
             return label, confidence
 
     def is_ready(self) -> bool:
