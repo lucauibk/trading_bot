@@ -728,7 +728,10 @@ class GridStrategy(Strategy):
                     try:
                         from execution.paper import PaperBroker
                         if isinstance(self._broker, PaperBroker):
-                            sl_fee = (price + buy_price) * qty * KRAKEN_FEE
+                            # Only the sell-leg fee is charged here: the buy fee was
+                            # already deducted on the original buy fill (paper.py:151).
+                            # This mirrors the normal sell credit (paper.py:172-173).
+                            sl_fee = price * qty * KRAKEN_FEE
                             credit = buy_price * qty / lev + (price - buy_price) * qty - sl_fee
                             self._broker.sl_credit(symbol, credit)
                     except Exception:

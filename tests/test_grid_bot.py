@@ -434,6 +434,41 @@ class TestFloorSL:
         assert remaining == []
         assert state.total_profit < 0
 
+    def test_floor_sl_credit_charges_sell_fee_only(self):
+        """Regression for #39: the floor-SL paper credit must subtract only the
+        sell-leg fee. The buy fee was already deducted on the buy fill, so charging
+        a full round-trip fee here undercredits the balance by exactly one buy fee."""
+        from execution.paper import PaperBroker
+        from strategies.grid import KRAKEN_FEE
+
+        strategy = self._strategy(floor_sl_atr_mult=1.0, momentum_hold_max=0)
+        ctx, state = self._setup(strategy)
+
+        broker = PaperBroker(initial_balance=1000.0)
+        strategy._broker = broker
+        recorded = []
+        broker.sl_credit = lambda symbol, amount: recorded.append(amount)  # spy
+
+        buy_price, sl_price, qty = 100.0, 95.0, 1.0
+        cid = str(uuid.uuid4())
+        state.orders[cid] = {
+            "side": "sell", "price": 105.0, "qty": qty,
+            "filled": False, "bought_at": buy_price,
+            "sl_price": sl_price, "trailing_activated": False,
+            "leverage": 1.0,
+        }
+
+        trigger = 94.0  # below sl_price → floor-SL fires
+        strategy.on_tick("SOL/USD", trigger, ctx)
+
+        assert recorded, "floor-SL should have credited the paper broker"
+        # margin_return + pnl - sell_fee, lev=1
+        expected = buy_price * qty / 1.0 + (trigger - buy_price) * qty - trigger * qty * KRAKEN_FEE
+        assert recorded[0] == pytest.approx(expected)
+        # Guard against the double-fee regression (buggy value was one buy-fee lower).
+        buggy = buy_price * qty / 1.0 + (trigger - buy_price) * qty - (trigger + buy_price) * qty * KRAKEN_FEE
+        assert recorded[0] > buggy
+
     def test_rebuild_never_lowers_sl(self):
         from core.strategy import Fill
         strategy = self._strategy(floor_sl_atr_mult=1.0)
