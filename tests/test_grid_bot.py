@@ -135,7 +135,14 @@ class TestMLFeatures:
     def test_market_features_zeros_when_no_data(self):
         from ml.features.market import extract
         feats = extract(None)
-        assert (feats == 0).all()
+        # btc_corr_30d (index 3) is computed independently from OHLCV, so it is
+        # preserved even without BTC context and defaults to the neutral 0.5 prior.
+        # All other market features are zero when BTC context is unavailable.
+        assert feats[0] == 0 and feats[1] == 0 and feats[2] == 0 and feats[4] == 0
+        assert feats[3] == 0.5
+        # An explicitly-passed correlation must be preserved through the no-context path.
+        feats_corr = extract(None, btc_corr=-0.3)
+        assert abs(feats_corr[3] - (-0.3)) < 1e-6
 
     def test_seasonality_features_cyclic(self):
         from ml.features.seasonality import extract
