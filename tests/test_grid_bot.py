@@ -387,6 +387,20 @@ class TestFloorSL:
         strategy.setup_grid("SOL/USD", price, ctx)
         return ctx, state
 
+    def test_directional_sl_fires_on_safety_tick(self):
+        """Regression for #104: an open directional position must be stopped out via
+        on_tick_safety (the freeze/emergency safety path), not only via on_tick."""
+        strategy = self._strategy(floor_sl_atr_mult=1.0)
+        ctx, state = self._setup(strategy)
+        state._directional = {
+            "entry": 100.0, "qty": 1.0, "usdt": 20.0,
+            "tp": 110.0, "sl": 97.0, "entry_ts": time.time(),
+        }
+        # Price breaks the directional SL. on_tick_safety is what runs during a
+        # daily-drawdown freeze; the directional must still exit.
+        strategy.on_tick_safety("SOL/USD", 96.0, ctx)
+        assert state._directional == {}, "directional SL must fire on the safety tick"
+
     def test_buy_fill_uses_floor_sl(self):
         from core.strategy import Fill
         strategy = self._strategy(floor_sl_atr_mult=1.0)

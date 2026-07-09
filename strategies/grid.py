@@ -569,6 +569,11 @@ class GridStrategy(Strategy):
         state = self._states.get(symbol)
         if state:
             self._check_position_stops(symbol, price, state, ctx)
+            # Directional exits (SL/TP/signal-flip) must also run during a freeze —
+            # otherwise an open directional long can blow through its stop-loss while
+            # the market dumps. _check_directional only ever *closes* a position, never
+            # opens one, so it is safe on the freeze path (#104).
+            self._check_directional(symbol, price, state, ctx)
 
     def _update_trailing_stops(self, symbol: str, price: float, state: _GridState):
         atr = state._atr
