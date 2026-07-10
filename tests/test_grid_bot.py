@@ -715,6 +715,28 @@ class TestBacktestEquity:
         assert min(metrics["equity_curve"]) < 100.0
 
 
+# ── Trainer 34-feature contract (#55) ─────────────────────────────────────────
+
+class TestTrainerFeatureContract:
+    """_extract_training_features must return None on failure (caller skips the
+    sample) rather than silently falling back to a 16-feature vector. #55.
+    """
+
+    def test_returns_none_on_extraction_failure(self, monkeypatch):
+        import ml.trainer as trainer
+        def _boom(*a, **k):
+            raise ValueError("simulated 34-feature extraction failure")
+        monkeypatch.setattr(trainer, "extract_all_features", _boom)
+        df = _make_df(60)
+        out = trainer._extract_training_features(df, df, btc_corr=0.0)
+        assert out is None  # NOT a 16-element fallback vector
+
+    def test_returns_34_vector_on_success(self):
+        import ml.trainer as trainer
+        df = _make_df(120)
+        out = trainer._extract_training_features(df, df, btc_corr=0.3)
+        assert out is not None
+        assert out.shape == (34,)
 # ── Trainer stale-candle labeling (#91) ───────────────────────────────────────
 
 class TestTrainerStaleCandleLabel:
