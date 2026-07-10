@@ -152,6 +152,45 @@ class TestMLFeatures:
         assert not np.isnan(feats).any()
 
 
+# ── ML Model predict() label mapping ─────────────────────────────────────────
+
+class TestModelPredictLabelMapping:
+
+    class _StubClf:
+        """Mimics a classifier whose classes_ is a sparse subset (no class 1)."""
+        def __init__(self, classes, proba_row):
+            self.classes_ = np.array(classes)
+            self._proba_row = np.array(proba_row, dtype=float)
+
+        def predict_proba(self, X):
+            return np.array([self._proba_row])
+
+    def _model(self, clf):
+        from ml.model import TradingModel
+        m = TradingModel("TEST/USD")
+        m._clf = clf
+        m._n_samples = m.MIN_SAMPLES          # make is_ready() True
+        m._feature_names = []                 # skip feature-count check
+        return m
+
+    def test_predict_translates_proba_index_to_class_label(self):
+        # classes_ = [0, 2] (class 1/hold never seen in training).
+        # Highest proba is column index 1 → real label must be 2 (buy), not 1 (hold).
+        clf = self._StubClf(classes=[0, 2], proba_row=[0.3, 0.7])
+        m = self._model(clf)
+        label, conf = m.predict(np.zeros(34, dtype=np.float32))
+        assert label == 2                     # buy, via classes_[1]
+        assert conf == pytest.approx(0.7)
+
+    def test_predict_full_classes_unchanged(self):
+        # classes_ = [0, 1, 2]: index and label coincide → no regression.
+        clf = self._StubClf(classes=[0, 1, 2], proba_row=[0.1, 0.2, 0.7])
+        m = self._model(clf)
+        label, conf = m.predict(np.zeros(34, dtype=np.float32))
+        assert label == 2
+        assert conf == pytest.approx(0.7)
+
+
 # ── Backtest Metrics ─────────────────────────────────────────────────────────
 
 class TestBacktestMetrics:
