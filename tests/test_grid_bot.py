@@ -152,6 +152,29 @@ class TestMLFeatures:
         assert not np.isnan(feats).any()
 
 
+# ── Sweep CLI (#101) ─────────────────────────────────────────────────────────
+
+class TestSweepCLI:
+    """Regression for #101: sweep.py must accept the --symbol arg that
+    nightly_tune passes, instead of exiting 2 on an unrecognized option."""
+
+    def _run(self, *cli_args):
+        import subprocess, sys, pathlib
+        root = pathlib.Path(__file__).resolve().parents[1]
+        return subprocess.run(
+            [sys.executable, "scripts/sweep.py", *cli_args],
+            cwd=root, capture_output=True, text=True, timeout=60,
+        )
+
+    def test_symbol_arg_is_recognized(self):
+        # An invalid symbol reaches parser.error (arg IS recognized), and the
+        # message must be our value-validation, NOT argparse's "unrecognized".
+        r = self._run("--symbol", "FOO/USD")
+        assert r.returncode == 2
+        assert "unrecognized arguments" not in r.stderr
+        assert "not in" in r.stderr and "FOO/USD" in r.stderr
+
+
 # ── Backtest Metrics ─────────────────────────────────────────────────────────
 
 class TestBacktestMetrics:

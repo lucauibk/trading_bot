@@ -122,7 +122,23 @@ def main():
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--max-dd", type=float, default=-15.0)
     parser.add_argument("--min-trades", type=int, default=100)
+    parser.add_argument(
+        "--symbol", type=str, default=None,
+        help="Restrict the sweep to a single symbol (default: all SYMBOLS). "
+             "Used by nightly_tune's per-symbol loop.",
+    )
     args = parser.parse_args()
+
+    # Optional single-symbol filter. nightly_tune.run_sweep() drives one
+    # subprocess per symbol with --symbol; without this argument argparse
+    # exited with code 2 and the whole nightly sweep silently produced no
+    # winner (#101).
+    if args.symbol:
+        if args.symbol not in SYMBOLS:
+            parser.error(f"--symbol {args.symbol!r} not in {SYMBOLS}")
+        symbols = [args.symbol]
+    else:
+        symbols = list(SYMBOLS)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     log = logging.getLogger("sweep")
@@ -133,7 +149,7 @@ def main():
     # Pre-warm OHLCV cache serially (avoid concurrent Binance fetches)
     from backtest.data import load_ohlcv
     dfs = {}
-    for s in SYMBOLS:
+    for s in symbols:
         dfs[s] = load_ohlcv(s, "1h", args.days)
         log.info("Data %s: %d candles (%s → %s)", s, len(dfs[s]),
                  dfs[s].index[0], dfs[s].index[-1])
@@ -147,14 +163,14 @@ def main():
 
     grid = build_param_grid()
     log.info("Param grid: %d configs × %d symbols = %d train runs",
-             len(grid), len(SYMBOLS), len(grid) * len(SYMBOLS))
+             len(grid), len(symbols), len(grid) * len(symbols))
 
     train_jobs = [
         (i, cfg, sym, "train", data_start, split_ts)
-        for i, cfg in enumerate(grid) for sym in SYMBOLS
+        for i, cfg in enumerate(grid) for sym in symbols
     ]
 
-    with Pool(args.jobs, initializer=_init_worker, initargs=(SYMBOLS, args.days)) as pool:
+    with Pool(args.jobs, initializer=_init_worker, initargs=(symbols, args.days)) as pool:
         train_results = pool.map(_run_one, train_jobs)
 
         errors = [r for r in train_results if "error" in r]
@@ -168,7 +184,7 @@ def main():
                 if a["worst_dd"] > args.max_dd
                 and a["total_trades"] >= args.min_trades
                 and not a["any_halted"]
-                and a["n_symbols"] == len(SYMBOLS)
+                and a["n_symbols"] == len(symbols)
             ),
             key=lambda kv: kv[1]["median_calmar"], reverse=True,
         )
@@ -178,7 +194,7 @@ def main():
 
         oos_jobs = [
             (cid, agg[cid]["params"], sym, "test", test_start, data_end)
-            for cid, _ in top for sym in SYMBOLS
+            for cid, _ in top for sym in symbols
         ]
         oos_results = pool.map(_run_one, oos_jobs)
 
@@ -200,7 +216,7 @@ def main():
                         "params": json.dumps(r["params"])})
 
     lines = ["# Sweep Report", "",
-             f"Symbole: {', '.join(SYMBOLS)} | {args.days}d "
+             f"Symbole: {', '.join(symbols)} | {args.days}d "
              f"(Train {args.train_days}d / Test {args.days - args.train_days}d) | Leverage {LEVERAGE}×", "",
              "## Top-Configs: Train vs. OOS (Ranking nach OOS-median-Calmar)", "",
              "| # | cfg | OOS Calmar | OOS Ret% | OOS worstDD | Train Calmar | Train Ret% | Params |",
