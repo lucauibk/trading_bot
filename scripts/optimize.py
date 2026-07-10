@@ -13,6 +13,7 @@ Verwendung:
 
 import argparse
 import json
+import logging
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -383,6 +384,26 @@ def _parse_logs_for_errors(log_path, days: int = 7) -> dict:
     return result
 
 
+def equity_max_drawdown(con) -> "float | None":
+    """Max drawdown (a negative fraction, e.g. -0.12) from the equity curve.
+
+    Returns None when the curve is empty or too short to be meaningful.
+
+    NOTE: the equity table schema is (id, timestamp, capital) — the value column is
+    `capital`, not `equity` (see dashboard/db.py). Querying the wrong column name
+    raised OperationalError which the caller's broad except swallowed, silently
+    disabling the Max-Drawdown live-readiness gate (#102).
+    """
+    eq_df = pd.read_sql(
+        "SELECT timestamp, capital FROM equity ORDER BY timestamp",
+        con, parse_dates=["timestamp"],
+    )
+    if eq_df.empty or len(eq_df) <= 5:
+        return None
+    peak = eq_df["capital"].expanding().max()
+    return float(((eq_df["capital"] - peak) / peak).min())
+
+
 def cmd_ready_for_live(days: int):
     _divider("READY FOR LIVE – Bereitschafts-Check")
     print(f"  Analyse-Zeitraum: letzte {days} Tage | Grenzwerte: "
@@ -471,14 +492,9 @@ def cmd_ready_for_live(days: int):
 
     # ── 6. Max Drawdown aus equity-Tabelle ───────────────────────────────────
     try:
-        eq_df = pd.read_sql(
-            "SELECT timestamp, equity FROM equity ORDER BY timestamp",
-            con, parse_dates=["timestamp"]
-        )
-        if not eq_df.empty and len(eq_df) > 5:
-            peak = eq_df["equity"].expanding().max()
-            drawdown = ((eq_df["equity"] - peak) / peak).min()
-            abs_dd   = abs(float(drawdown))
+        drawdown = equity_max_drawdown(con)
+        if drawdown is not None:
+            abs_dd = abs(drawdown)
             if abs_dd <= MAX_DRAWDOWN:
                 checks.append((_GO, "Max Drawdown",
                                 f"Max DD = {abs_dd*100:.1f}% (Limit: {MAX_DRAWDOWN*100:.0f}%)", None))
@@ -492,7 +508,11 @@ def cmd_ready_for_live(days: int):
                                 "PER_POS_SL_PCT / MAX_LOSS_PCT senken; /optimizer Lose-Rate prüfen"))
         else:
             warnings.append("Equity-Tabelle leer oder zu wenig Punkte – Drawdown nicht berechenbar")
-    except Exception:
+    except Exception as e:
+        # Log the real cause with a traceback so a future schema mismatch (like the
+        # `equity` vs `capital` bug that silently disabled this gate) surfaces (#102).
+        logging.getLogger("optimize").warning(
+            "Equity-Drawdown-Check fehlgeschlagen: %s", e, exc_info=True)
         warnings.append("Equity-Tabelle nicht auswertbar")
 
     # ── 7. Regime-Abdeckung ───────────────────────────────────────────────────

@@ -182,6 +182,41 @@ class TestMLFeatures:
         assert conf == 0.8
 
 
+# ── optimize.py ready-for-live drawdown gate ─────────────────────────────────
+
+class TestReadyForLiveDrawdown:
+
+    def test_equity_max_drawdown_reads_capital_column(self):
+        """Regression for #102: the equity table's value column is `capital`, not
+        `equity`. The drawdown helper must read it and compute a real drawdown."""
+        import sqlite3
+        from scripts.optimize import equity_max_drawdown
+
+        con = sqlite3.connect(":memory:")
+        # Mirror dashboard/db.py equity schema exactly.
+        con.execute("CREATE TABLE equity (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "timestamp TEXT, capital REAL)")
+        curve = [1000, 1100, 1200, 900, 950, 1000, 1050]  # peak 1200 → trough 900 = -25%
+        for i, cap in enumerate(curve):
+            con.execute("INSERT INTO equity (timestamp, capital) VALUES (?, ?)",
+                        (f"2026-07-0{i+1}T00:00:00", cap))
+        con.commit()
+
+        dd = equity_max_drawdown(con)
+        assert dd is not None, "drawdown must be computable from the `capital` column"
+        assert dd == pytest.approx((900 - 1200) / 1200)  # -0.25
+
+    def test_equity_max_drawdown_none_when_short(self):
+        import sqlite3
+        from scripts.optimize import equity_max_drawdown
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE equity (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "timestamp TEXT, capital REAL)")
+        con.execute("INSERT INTO equity (timestamp, capital) VALUES ('2026-07-01', 1000)")
+        con.commit()
+        assert equity_max_drawdown(con) is None
+
+
 # ── Backtest Metrics ─────────────────────────────────────────────────────────
 
 class TestBacktestMetrics:
