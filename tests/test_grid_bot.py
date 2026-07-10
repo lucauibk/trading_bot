@@ -259,6 +259,39 @@ class TestPredictErrorPathClearsScore:
         assert p.get_score("SOL/USD") == 0.0     # expired, not frozen at 0.9
 
 
+# ── Directional confidence gating ─────────────────────────────────────────────
+
+class TestDirectionalConfidence:
+
+    def test_hold_confidence_zeroed_for_direction(self):
+        """Regression for #103: a confident LightGBM 'hold' must not contribute to
+        directional confidence."""
+        from ml.predictor import directional_lgbm_conf
+        assert directional_lgbm_conf(1, 0.9) == 0.0   # hold → no directional confidence
+        assert directional_lgbm_conf(2, 0.9) == 0.9   # buy  → unchanged
+        assert directional_lgbm_conf(0, 0.9) == 0.9   # sell → unchanged
+
+    def test_confident_hold_plus_llm_up_stays_below_gate(self):
+        """End-to-end numeric check from the issue: LGBM confidently 'hold' (score 0,
+        conf 0.9) + LLM 'up' (conf 0.65) must NOT clear MIN_CONFIDENCE once the hold
+        confidence is zeroed."""
+        from ml.predictor import directional_lgbm_conf, MIN_CONFIDENCE
+        from ml.llm_analyst import blend_scores
+
+        lgbm_conf = 0.9
+        lgbm_score = 0.0  # hold
+        llm_result = {"score": 0.65, "confidence": 0.65}
+
+        # Buggy path (full hold confidence) would clear the gate:
+        _, buggy_conf = blend_scores(lgbm_score, lgbm_conf, llm_result)
+        assert buggy_conf >= MIN_CONFIDENCE
+
+        # Fixed path (direction-aware confidence) stays below the gate:
+        conf_dir = directional_lgbm_conf(1, lgbm_conf)
+        _, fixed_conf = blend_scores(lgbm_score, conf_dir, llm_result)
+        assert fixed_conf < MIN_CONFIDENCE
+
+
 # ── Backtest Metrics ─────────────────────────────────────────────────────────
 
 class TestBacktestMetrics:
