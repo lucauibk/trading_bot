@@ -136,14 +136,24 @@ class KrakenBroker(Broker):
             return False
 
     def cancel_all(self, symbol: str) -> int:
+        """Cancel all open orders for a symbol. Returns the count successfully
+        cancelled. Any failure is logged loudly (was silently swallowed): a stale
+        order left on the book during a graceful shutdown / rebuild can fill
+        unexpectedly after "stop", so operators must see it."""
         open_orders = self.get_open_orders(symbol)
         count = 0
+        failed: List[str] = []
         for o in open_orders:
             try:
                 _with_retry(self._ex.cancel_order, o.exchange_order_id)
                 count += 1
-            except Exception:
-                pass
+            except Exception as e:
+                failed.append(o.exchange_order_id)
+                logger.warning("cancel_all: cancel failed for %s (%s): %s",
+                               symbol, o.exchange_order_id, e)
+        if failed:
+            logger.error("cancel_all %s: %d/%d orders still OPEN after cancel: %s",
+                         symbol, len(failed), len(open_orders), failed)
         return count
 
     def place_market(self, symbol: str, side: str, qty: float) -> Optional[BrokerOrder]:
