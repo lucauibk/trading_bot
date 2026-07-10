@@ -217,6 +217,26 @@ class TestReadyForLiveDrawdown:
         assert equity_max_drawdown(con) is None
 
 
+# ── sweep.py CLI ──────────────────────────────────────────────────────────────
+
+class TestSweepCLI:
+
+    def test_parser_accepts_symbol(self):
+        """Regression for #101: nightly_tune passes --symbol; sweep.py's parser must
+        accept it (previously it aborted with SystemExit(2), killing every nightly
+        sweep)."""
+        from scripts.sweep import build_parser
+        args = build_parser().parse_args(
+            ["--symbol", "SOL/USD", "--days", "180", "--train-days", "120", "--jobs", "4"])
+        assert args.symbol == "SOL/USD"
+        assert args.days == 180 and args.train_days == 120 and args.jobs == 4
+
+    def test_parser_symbol_optional(self):
+        from scripts.sweep import build_parser
+        args = build_parser().parse_args([])
+        assert args.symbol is None
+
+
 # ── Backtest Metrics ─────────────────────────────────────────────────────────
 
 class TestBacktestMetrics:
