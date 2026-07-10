@@ -43,7 +43,11 @@ def _calc_level_allocations(grid_lines: list, current_price: float,
                              investment: float, direction_score: float) -> dict:
     """Non-uniform budget allocation: bullish → more on lower buy levels (DCA into dips)."""
     n = len(grid_lines)
-    if not ADAPTIVE_SIZING or abs(direction_score) < 0.05 or n == 0:
+    if n == 0:
+        # Defensive early-out: no grid lines → nothing to allocate. Must come
+        # first, otherwise the `investment / n` uniform path below divides by 0.
+        return {}
+    if not ADAPTIVE_SIZING or abs(direction_score) < 0.05:
         base = investment / n
         return {p: base for p in grid_lines}
 
