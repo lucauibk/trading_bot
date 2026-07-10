@@ -43,7 +43,11 @@ def _calc_level_allocations(grid_lines: list, current_price: float,
                              investment: float, direction_score: float) -> dict:
     """Non-uniform budget allocation: bullish → more on lower buy levels (DCA into dips)."""
     n = len(grid_lines)
-    if not ADAPTIVE_SIZING or abs(direction_score) < 0.05 or n == 0:
+    if n == 0:
+        # Defensive early-out: no grid lines → nothing to allocate. Must come
+        # first, otherwise the `investment / n` uniform path below divides by 0.
+        return {}
+    if not ADAPTIVE_SIZING or abs(direction_score) < 0.05:
         base = investment / n
         return {p: base for p in grid_lines}
 
@@ -571,6 +575,11 @@ class GridStrategy(Strategy):
         state = self._states.get(symbol)
         if state:
             self._check_position_stops(symbol, price, state, ctx)
+            # Directional exits (SL/TP/signal-flip) must also run during a freeze —
+            # otherwise an open directional long can blow through its stop-loss while
+            # the market dumps. _check_directional only ever *closes* a position, never
+            # opens one, so it is safe on the freeze path (#104).
+            self._check_directional(symbol, price, state, ctx)
 
     def _update_trailing_stops(self, symbol: str, price: float, state: _GridState):
         atr = state._atr
@@ -894,6 +903,11 @@ class GridStrategy(Strategy):
         state.grid_lower = lower
         if self.p.sl_mode == "floor":
             atr = state._atr if state._atr > 0 else price * 0.02
+            # NOTE (#62): the floor VALUE deliberately tracks the (possibly lower)
+            # new grid bottom. It is NOT ratcheted upward — a global ratchet would
+            # place new buy cohorts under an old, higher floor and stop them out on
+            # fill. Only *open* positions' sl_price is ratcheted (never lowered),
+            # done below at the open_positions loop.
             state.floor_sl = max(lower - self.p.floor_sl_atr_mult * atr, 0.0)
 
         # Adaptive sizing: more budget on lower levels when bullish
