@@ -167,6 +167,11 @@ class MLPredictor:
 
         except Exception as e:
             logger.warning("ML Fehler %s: %s", symbol, e)
+            # Neutralize the cached score so a failed predict expires the coin's
+            # conviction instead of freezing the last successful one. get_score()
+            # feeds adaptive/directional sizing (grid.py:269) — leaving a stale
+            # +0.9 here would size directional trades on a phantom signal (#117).
+            self._last_scores[symbol] = 0.0
             return "neutral"
 
     def _refresh_btc_corr(self, symbol: str) -> None:
