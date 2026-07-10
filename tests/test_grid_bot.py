@@ -152,6 +152,28 @@ class TestMLFeatures:
         assert not np.isnan(feats).any()
 
 
+# ── MLPredictor error path (#117) ────────────────────────────────────────────
+
+class TestPredictErrorPathClearsScore:
+    """Regression for #117: a failed predict() must expire the cached score,
+    not leave a stale conviction that adaptive/directional sizing reads."""
+
+    def test_failed_predict_resets_stale_score(self, tmp_path, monkeypatch):
+        import ml.data_store as ds
+        monkeypatch.setattr(ds, "DB_PATH", tmp_path / "ml.db")   # no repo side effects
+        from ml.predictor import MLPredictor
+
+        def boom(*a, **k):
+            raise RuntimeError("fetch down")
+
+        p = MLPredictor(fetch_ohlcv_fn=boom)
+        p._last_scores["SOL/USD"] = 0.9          # last successful strong-up conviction
+        result = p.predict("SOL/USD")            # now fails → except path
+
+        assert result == "neutral"
+        assert p.get_score("SOL/USD") == 0.0     # expired, not frozen at 0.9
+
+
 # ── Backtest Metrics ─────────────────────────────────────────────────────────
 
 class TestBacktestMetrics:
