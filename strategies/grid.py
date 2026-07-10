@@ -464,7 +464,10 @@ class GridStrategy(Strategy):
         order = state.orders[sell_cid]
         buy_price = order.get("bought_at", sell_price)
         qty = order["qty"]
-        lev = self._lev()
+        # Entry leverage stamped at buy-fill time; the broker credits margin from
+        # the order's own meta, so this is used only for the logged leverage field —
+        # keep it consistent with the entry rather than the (possibly changed) live value.
+        lev = order.get("leverage", self._lev())
 
         profit = (sell_price - buy_price) * qty
         fee = (sell_price + buy_price) * qty * KRAKEN_FEE
@@ -734,7 +737,13 @@ class GridStrategy(Strategy):
                             # buy fee a second time (mirrors the normal sell credit
                             # in paper.py:173, which nets only the sell-leg fee).
                             sl_fee = price * qty * KRAKEN_FEE
-                            credit = buy_price * qty / lev + (price - buy_price) * qty - sl_fee
+                            # Use the ENTRY leverage stamped on the order, not the
+                            # live dashboard value: qty was sized with the entry
+                            # leverage, so buy_price*qty/entry_lev is the margin
+                            # actually deposited. Using a changed live leverage
+                            # here returns the wrong margin and drifts the balance.
+                            entry_lev = order.get("leverage", lev)
+                            credit = buy_price * qty / entry_lev + (price - buy_price) * qty - sl_fee
                             self._broker.sl_credit(symbol, credit)
                     except Exception:
                         pass

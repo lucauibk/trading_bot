@@ -157,13 +157,11 @@ class TestMLFeatures:
 class TestFloorSLCredit:
     """Regression for #39: floor-SL must not double-charge the buy fee."""
 
-    def _run_sl(self, monkeypatch):
-        import os
+    def _run_sl(self, monkeypatch, live_lev=1.0, entry_lev=1.0, qty=1.0):
         from execution.paper import PaperBroker
-        from strategies.grid import GridStrategy, _GridState
+        from strategies.grid import GridStrategy, _GridState, KRAKEN_FEE
         from strategies.grid_params import GridParams
         from core.context import MarketContext
-        from strategies.grid import KRAKEN_FEE
 
         # Skip dashboard logging inside the SL path.
         monkeypatch.setenv("GRIDBOT_BACKTEST", "1")
@@ -175,14 +173,15 @@ class TestFloorSLCredit:
                 captured["amount"] = amount
                 super().sl_credit(symbol, amount)
 
+        # params.leverage pins the LIVE leverage returned by _lev().
         strat = GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 8}],
-                             ml_enabled=False, params=GridParams(leverage=1.0))
+                             ml_enabled=False, params=GridParams(leverage=live_lev))
         strat._broker = SpyBroker(initial_balance=1000.0)
 
         state = _GridState("SOL/USD", 100.0, 8, 0.05)
         state.orders["s1"] = {
             "side": "sell", "sl_price": 95.0, "bought_at": 100.0,
-            "qty": 1.0, "filled": False,
+            "qty": qty, "filled": False, "leverage": entry_lev,
         }
 
         ctx = MarketContext()
@@ -191,7 +190,7 @@ class TestFloorSLCredit:
         return captured, KRAKEN_FEE
 
     def test_floor_sl_credit_charges_sell_fee_only(self, monkeypatch):
-        captured, fee = self._run_sl(monkeypatch)
+        captured, fee = self._run_sl(monkeypatch, live_lev=1.0, entry_lev=1.0)
         assert "amount" in captured, "SL did not fire / credit"
         buy_price, price, qty, lev = 100.0, 94.0, 1.0, 1.0
         margin_return = buy_price * qty / lev
@@ -202,6 +201,19 @@ class TestFloorSLCredit:
         # Guard against the old round-trip formula (would subtract an extra buy fee).
         round_trip = margin_return + pnl - (price + buy_price) * qty * fee
         assert captured["amount"] != pytest.approx(round_trip)
+
+    def test_sl_credit_uses_entry_leverage_not_live(self, monkeypatch):
+        # #57: qty was sized with entry_lev=2; user then raised live leverage to 5.
+        # Margin returned must divide by the ENTRY leverage (2), not the live one (5).
+        entry_lev, live_lev, qty = 2.0, 5.0, 2.0
+        captured, fee = self._run_sl(monkeypatch, live_lev=live_lev,
+                                     entry_lev=entry_lev, qty=qty)
+        assert "amount" in captured, "SL did not fire / credit"
+        buy_price, price = 100.0, 94.0
+        expected = buy_price * qty / entry_lev + (price - buy_price) * qty - price * qty * fee
+        wrong_live = buy_price * qty / live_lev + (price - buy_price) * qty - price * qty * fee
+        assert captured["amount"] == pytest.approx(expected)
+        assert captured["amount"] != pytest.approx(wrong_live)
 
 
 # ── Backtest Metrics ─────────────────────────────────────────────────────────
