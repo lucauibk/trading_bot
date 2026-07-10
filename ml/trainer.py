@@ -305,9 +305,32 @@ class ModelTrainer:
             X, y  = self.store.get_labeled(symbol)
             model = self.models.get(symbol)
             if model and len(X) >= model.MIN_SAMPLES:
+                # Rollback guard (mirrors refresh_from_recent_history): the hot-path
+                # retrain must not replace a good model with a materially worse one.
+                # train() only enforces the absolute MIN_OOS_F1 gate, so a 0.34 model
+                # could silently overwrite a deployed 0.55 model. Preserve the current
+                # model and restore it if the new OOS-F1 drops by more than 0.05. (#35)
+                old_f1        = model._last_oos_f1
+                old_clf       = model._clf
+                old_n_samples = model._n_samples
+
                 model.train(X, y)
                 self._last_retrain_ts[symbol] = int(time.time())
-                logger.info("Retrain %s: %d Samples gesamt", symbol, len(X))
+                new_f1 = model._last_oos_f1
+
+                if old_clf is not None and new_f1 < old_f1 - 0.05:
+                    logger.warning(
+                        "[ML RETRAIN] %s: F1 %.3f → %.3f – rolling back to previous model",
+                        symbol, old_f1, new_f1,
+                    )
+                    with model._lock:
+                        model._clf         = old_clf
+                        model._n_samples   = old_n_samples
+                        model._last_oos_f1 = old_f1
+                    model._save()
+                else:
+                    logger.info("Retrain %s: %d Samples gesamt (F1 %.3f → %.3f)",
+                                symbol, len(X), old_f1, new_f1)
             elif model:
                 logger.debug(
                     "Retrain %s übersprungen: nur %d saubere 34-Feature-Samples (min %d)",
