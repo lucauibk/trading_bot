@@ -134,8 +134,17 @@ class TestMLFeatures:
 
     def test_market_features_zeros_when_no_data(self):
         from ml.features.market import extract
-        feats = extract(None)
+        # btc_corr_30d (index 3) is computed independently from OHLCV and is
+        # preserved even without BTC context — pass a neutral 0.0 to get all-zeros.
+        feats = extract(None, btc_corr=0.0)
         assert (feats == 0).all()
+
+    def test_market_features_preserve_btc_corr_when_no_btc(self):
+        from ml.features.market import extract
+        # Without BTC context, only btc_corr_30d survives (default 0.5).
+        feats = extract(None)
+        assert feats[3] == 0.5
+        assert (np.delete(feats, 3) == 0).all()
 
     def test_seasonality_features_cyclic(self):
         from ml.features.seasonality import extract
@@ -150,6 +159,137 @@ class TestMLFeatures:
         feats = extract(df)
         assert feats.shape[0] == 4
         assert not np.isnan(feats).any()
+
+    def test_predict_maps_proba_index_to_real_class_label(self):
+        # Regression for #88: when a class is absent from training, clf.classes_
+        # is not [0,1,2]. predict() must translate the positional argmax back to
+        # the real class label, not return the column index.
+        from ml.model import TradingModel
+
+        class _StubClf:
+            classes_ = np.array([0, 2])  # class 1 (hold) never seen in training
+
+            def predict_proba(self, x):
+                # highest proba is column 1 -> real class 2 (buy), not label 1 (hold)
+                return np.array([[0.2, 0.8]])
+
+        m = TradingModel("TEST/USD")
+        m._clf = _StubClf()
+        m._n_samples = m.MIN_SAMPLES
+        m._feature_names = []  # skip feature-count check
+        label, conf = m.predict(np.zeros(34, dtype=np.float32))
+        assert label == 2  # buy, not the positional index 1 (hold)
+        assert conf == 0.8
+
+
+# ── optimize.py ready-for-live drawdown gate ─────────────────────────────────
+
+class TestReadyForLiveDrawdown:
+
+    def test_equity_max_drawdown_reads_capital_column(self):
+        """Regression for #102: the equity table's value column is `capital`, not
+        `equity`. The drawdown helper must read it and compute a real drawdown."""
+        import sqlite3
+        from scripts.optimize import equity_max_drawdown
+
+        con = sqlite3.connect(":memory:")
+        # Mirror dashboard/db.py equity schema exactly.
+        con.execute("CREATE TABLE equity (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "timestamp TEXT, capital REAL)")
+        curve = [1000, 1100, 1200, 900, 950, 1000, 1050]  # peak 1200 → trough 900 = -25%
+        for i, cap in enumerate(curve):
+            con.execute("INSERT INTO equity (timestamp, capital) VALUES (?, ?)",
+                        (f"2026-07-0{i+1}T00:00:00", cap))
+        con.commit()
+
+        dd = equity_max_drawdown(con)
+        assert dd is not None, "drawdown must be computable from the `capital` column"
+        assert dd == pytest.approx((900 - 1200) / 1200)  # -0.25
+
+    def test_equity_max_drawdown_none_when_short(self):
+        import sqlite3
+        from scripts.optimize import equity_max_drawdown
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE equity (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "timestamp TEXT, capital REAL)")
+        con.execute("INSERT INTO equity (timestamp, capital) VALUES ('2026-07-01', 1000)")
+        con.commit()
+        assert equity_max_drawdown(con) is None
+
+
+# ── sweep.py CLI ──────────────────────────────────────────────────────────────
+
+class TestSweepCLI:
+
+    def test_parser_accepts_symbol(self):
+        """Regression for #101: nightly_tune passes --symbol; sweep.py's parser must
+        accept it (previously it aborted with SystemExit(2), killing every nightly
+        sweep)."""
+        from scripts.sweep import build_parser
+        args = build_parser().parse_args(
+            ["--symbol", "SOL/USD", "--days", "180", "--train-days", "120", "--jobs", "4"])
+        assert args.symbol == "SOL/USD"
+        assert args.days == 180 and args.train_days == 120 and args.jobs == 4
+
+    def test_parser_symbol_optional(self):
+        from scripts.sweep import build_parser
+        args = build_parser().parse_args([])
+        assert args.symbol is None
+
+
+# ── MLPredictor error path (#117) ────────────────────────────────────────────
+
+class TestPredictErrorPathClearsScore:
+    """Regression for #117: a failed predict() must expire the cached score,
+    not leave a stale conviction that adaptive/directional sizing reads."""
+
+    def test_failed_predict_resets_stale_score(self, tmp_path, monkeypatch):
+        import ml.data_store as ds
+        monkeypatch.setattr(ds, "DB_PATH", tmp_path / "ml.db")   # no repo side effects
+        from ml.predictor import MLPredictor
+
+        def boom(*a, **k):
+            raise RuntimeError("fetch down")
+
+        p = MLPredictor(fetch_ohlcv_fn=boom)
+        p._last_scores["SOL/USD"] = 0.9          # last successful strong-up conviction
+        result = p.predict("SOL/USD")            # now fails → except path
+
+        assert result == "neutral"
+        assert p.get_score("SOL/USD") == 0.0     # expired, not frozen at 0.9
+
+
+# ── Directional confidence gating ─────────────────────────────────────────────
+
+class TestDirectionalConfidence:
+
+    def test_hold_confidence_zeroed_for_direction(self):
+        """Regression for #103: a confident LightGBM 'hold' must not contribute to
+        directional confidence."""
+        from ml.predictor import directional_lgbm_conf
+        assert directional_lgbm_conf(1, 0.9) == 0.0   # hold → no directional confidence
+        assert directional_lgbm_conf(2, 0.9) == 0.9   # buy  → unchanged
+        assert directional_lgbm_conf(0, 0.9) == 0.9   # sell → unchanged
+
+    def test_confident_hold_plus_llm_up_stays_below_gate(self):
+        """End-to-end numeric check from the issue: LGBM confidently 'hold' (score 0,
+        conf 0.9) + LLM 'up' (conf 0.65) must NOT clear MIN_CONFIDENCE once the hold
+        confidence is zeroed."""
+        from ml.predictor import directional_lgbm_conf, MIN_CONFIDENCE
+        from ml.llm_analyst import blend_scores
+
+        lgbm_conf = 0.9
+        lgbm_score = 0.0  # hold
+        llm_result = {"score": 0.65, "confidence": 0.65}
+
+        # Buggy path (full hold confidence) would clear the gate:
+        _, buggy_conf = blend_scores(lgbm_score, lgbm_conf, llm_result)
+        assert buggy_conf >= MIN_CONFIDENCE
+
+        # Fixed path (direction-aware confidence) stays below the gate:
+        conf_dir = directional_lgbm_conf(1, lgbm_conf)
+        _, fixed_conf = blend_scores(lgbm_score, conf_dir, llm_result)
+        assert fixed_conf < MIN_CONFIDENCE
 
 
 # ── Backtest Metrics ─────────────────────────────────────────────────────────
@@ -387,6 +527,20 @@ class TestFloorSL:
         strategy.setup_grid("SOL/USD", price, ctx)
         return ctx, state
 
+    def test_directional_sl_fires_on_safety_tick(self):
+        """Regression for #104: an open directional position must be stopped out via
+        on_tick_safety (the freeze/emergency safety path), not only via on_tick."""
+        strategy = self._strategy(floor_sl_atr_mult=1.0)
+        ctx, state = self._setup(strategy)
+        state._directional = {
+            "entry": 100.0, "qty": 1.0, "usdt": 20.0,
+            "tp": 110.0, "sl": 97.0, "entry_ts": time.time(),
+        }
+        # Price breaks the directional SL. on_tick_safety is what runs during a
+        # daily-drawdown freeze; the directional must still exit.
+        strategy.on_tick_safety("SOL/USD", 96.0, ctx)
+        assert state._directional == {}, "directional SL must fire on the safety tick"
+
     def test_buy_fill_uses_floor_sl(self):
         from core.strategy import Fill
         strategy = self._strategy(floor_sl_atr_mult=1.0)
@@ -591,3 +745,128 @@ class TestCancelAllLogging:
         assert "cancel failed" in msgs
         assert "still OPEN" in msgs
         assert "b" in msgs
+# ── Live reconciler robustness (#76) ──────────────────────────────────────────
+
+class TestReconcileFeeNone:
+    """reconcile_fills must not drop the whole batch when one ccxt trade has
+    fee=None (the key exists but is None, so t.get('fee', {}) returns None)."""
+
+    def _fills(self, trades):
+        import types
+        from execution.kraken import KrakenBroker
+        fake = types.SimpleNamespace(
+            _ex=types.SimpleNamespace(fetch_my_trades=lambda *a, **k: trades),
+            _client_to_exchange={},
+        )
+        return KrakenBroker.reconcile_fills(fake, 0.0)
+
+    def test_fee_none_does_not_drop_batch(self):
+        trades = [
+            {"order": "o1", "symbol": "SOL/USD", "side": "buy", "price": 100.0,
+             "amount": 1.0, "fee": {"cost": 0.16}, "timestamp": 1000, "id": "t1"},
+            {"order": "o2", "symbol": "SOL/USD", "side": "sell", "price": 110.0,
+             "amount": 1.0, "fee": None, "timestamp": 2000, "id": "t2"},  # fee=None
+        ]
+        fills = self._fills(trades)
+        assert len(fills) == 2
+        assert fills[0].fee == pytest.approx(0.16)
+        assert fills[1].fee == 0.0
+
+    def test_one_malformed_trade_skipped_others_survive(self):
+        trades = [
+            {"order": "o1", "symbol": "SOL/USD", "side": "buy", "price": 100.0,
+             "amount": 1.0, "fee": {"cost": 0.1}, "timestamp": 1000, "id": "t1"},
+            {"order": "bad", "id": "t2"},  # missing price/symbol → skipped
+            {"order": "o3", "symbol": "ETH/USD", "side": "sell", "price": 3000.0,
+             "amount": 0.5, "fee": {"cost": 2.4}, "timestamp": 3000, "id": "t3"},
+        ]
+        fills = self._fills(trades)
+        assert len(fills) == 2
+        assert {f.symbol for f in fills} == {"SOL/USD", "ETH/USD"}
+# ── Floor-SL paper credit (#39 double-fee, #57 entry-leverage) ────────────────
+
+class TestFloorSLCredit:
+    """The floor-SL exit credits margin+PnL back to the PaperBroker manually
+    (the broker never sees the SL fill). Regression guards for two bugs:
+      #39 — a full round-trip fee was charged, double-counting the buy fee that
+            was already deducted at buy-fill time.
+      #57 — the live dashboard leverage was used to return margin instead of the
+            leverage the position was entered with → balance drift on lev change.
+    """
+
+    def _sl_credit_amount(self, monkeypatch, entry_lev, live_lev):
+        from strategies.grid import GridStrategy, _GridState
+        from strategies.grid_params import GridParams
+        from execution.paper import PaperBroker
+        from core.context import MarketContext
+
+        monkeypatch.setenv("GRIDBOT_BACKTEST", "1")  # skip dashboard logging
+
+        strat = GridStrategy(
+            [{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+            ml_enabled=False,
+            params=GridParams(leverage=live_lev),
+        )
+        broker = PaperBroker(initial_balance=100.0, symbols=["SOL/USD"])
+        strat._broker = broker
+
+        state = _GridState("SOL/USD", 100.0, 6, 0.05)
+        state.orders["sell1"] = {
+            "side": "sell", "price": 110.0, "qty": 1.0, "filled": False,
+            "bought_at": 100.0, "sl_price": 99.0, "leverage": entry_lev,
+            "momentum_holds": 0,
+        }
+        strat._states["SOL/USD"] = state
+
+        captured = {}
+        orig = broker.sl_credit
+        monkeypatch.setattr(
+            broker, "sl_credit",
+            lambda symbol, amount: (captured.__setitem__("amount", amount),
+                                    orig(symbol, amount))[1],
+        )
+
+        # price 98 < sl_price 99 → floor-SL fires
+        strat._check_position_stops("SOL/USD", 98.0, state, MarketContext())
+        return captured.get("amount")
+
+    def test_sl_credit_charges_sell_fee_only(self, monkeypatch):
+        from strategies.grid import KRAKEN_FEE
+        amount = self._sl_credit_amount(monkeypatch, entry_lev=1.0, live_lev=1.0)
+        # margin(100) + pnl(-2) - sell_fee(98 * KRAKEN_FEE); buy fee NOT re-charged
+        expected = 100.0 + (98.0 - 100.0) - 98.0 * KRAKEN_FEE
+        assert amount == pytest.approx(expected)
+        assert amount == pytest.approx(97.8432)
+
+    def test_sl_credit_uses_entry_leverage(self, monkeypatch):
+        from strategies.grid import KRAKEN_FEE
+        # Entered at lev=2, dashboard later switched to lev=1 → still use lev=2.
+        amount = self._sl_credit_amount(monkeypatch, entry_lev=2.0, live_lev=1.0)
+        expected = 100.0 / 2.0 + (98.0 - 100.0) - 98.0 * KRAKEN_FEE
+        assert amount == pytest.approx(expected)
+# ── Latent correctness traps (#78) ────────────────────────────────────────────
+
+class TestLatentTraps:
+
+    def test_level_allocations_empty_grid_no_zerodiv(self):
+        # #78.1: n == 0 must early-out to {}, not fall into `investment / n`.
+        from strategies.grid import _calc_level_allocations
+        assert _calc_level_allocations([], 100.0, 40.0, 0.5) == {}
+
+    def test_level_allocations_uniform_when_neutral(self):
+        # Non-empty grid, neutral score → uniform split (sanity, unchanged path).
+        from strategies.grid import _calc_level_allocations
+        alloc = _calc_level_allocations([10.0, 11.0], 10.5, 40.0, 0.0)
+        assert alloc == {10.0: 20.0, 11.0: 20.0}
+
+    def test_risk_position_size_no_leverage_param(self):
+        # #78.2: the misleading (silently-ignored) leverage param is gone.
+        import inspect
+        from risk.manager import RiskManager
+        assert "leverage" not in inspect.signature(RiskManager.position_size).parameters
+
+    def test_data_fetcher_get_balance_defaults_usd(self):
+        # #78.3: default currency must be USD (Kraken/USD account), not USDT.
+        import inspect
+        import data_fetcher
+        assert inspect.signature(data_fetcher.get_balance).parameters["currency"].default == "USD"

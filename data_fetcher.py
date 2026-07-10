@@ -76,7 +76,10 @@ def fetch_ticker(symbol: str) -> dict:
     return _with_retry(get_public_exchange().fetch_ticker, symbol)
 
 
-def get_balance(currency: str = "USDT") -> float:
+def get_balance(currency: str = "USD") -> float:
+    # Kraken accounts here are USD-quoted (all symbols are */USD); defaulting to
+    # "USDT" returned 0.0 because that wallet is empty. KrakenBroker.get_balance
+    # already defaults to "USD" — keep this consistent.
     try:
         balance = get_exchange().fetch_balance()
         return float(balance["free"].get(currency, 0.0))

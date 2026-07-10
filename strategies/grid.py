@@ -43,7 +43,11 @@ def _calc_level_allocations(grid_lines: list, current_price: float,
                              investment: float, direction_score: float) -> dict:
     """Non-uniform budget allocation: bullish → more on lower buy levels (DCA into dips)."""
     n = len(grid_lines)
-    if not ADAPTIVE_SIZING or abs(direction_score) < 0.05 or n == 0:
+    if n == 0:
+        # Defensive early-out: no grid lines → nothing to allocate. Must come
+        # first, otherwise the `investment / n` uniform path below divides by 0.
+        return {}
+    if not ADAPTIVE_SIZING or abs(direction_score) < 0.05:
         base = investment / n
         return {p: base for p in grid_lines}
 
@@ -464,7 +468,9 @@ class GridStrategy(Strategy):
         order = state.orders[sell_cid]
         buy_price = order.get("bought_at", sell_price)
         qty = order["qty"]
-        lev = self._lev()
+        # #57: log the leverage the position was entered with, not the live
+        # value (which may have been changed via the dashboard mid-position).
+        lev = order.get("leverage", self._lev())
 
         profit = (sell_price - buy_price) * qty
         fee = (sell_price + buy_price) * qty * KRAKEN_FEE
@@ -569,6 +575,11 @@ class GridStrategy(Strategy):
         state = self._states.get(symbol)
         if state:
             self._check_position_stops(symbol, price, state, ctx)
+            # Directional exits (SL/TP/signal-flip) must also run during a freeze —
+            # otherwise an open directional long can blow through its stop-loss while
+            # the market dumps. _check_directional only ever *closes* a position, never
+            # opens one, so it is safe on the freeze path (#104).
+            self._check_directional(symbol, price, state, ctx)
 
     def _update_trailing_stops(self, symbol: str, price: float, state: _GridState):
         atr = state._atr
@@ -728,8 +739,18 @@ class GridStrategy(Strategy):
                     try:
                         from execution.paper import PaperBroker
                         if isinstance(self._broker, PaperBroker):
-                            sl_fee = (price + buy_price) * qty * KRAKEN_FEE
-                            credit = buy_price * qty / lev + (price - buy_price) * qty - sl_fee
+                            # #57: return margin using the leverage the position
+                            # was *entered* with (stored on the order), not the
+                            # possibly-changed live leverage — otherwise the
+                            # margin credited back drifts from what the buy fill
+                            # deducted whenever the user changes leverage.
+                            entry_lev = order.get("leverage", lev)
+                            # #39: only the sell-side fee here. The buy fee was
+                            # already deducted once at buy-fill time
+                            # (paper.py update_price), so charging a round-trip
+                            # fee would double-count the buy fee.
+                            sl_fee = price * qty * KRAKEN_FEE
+                            credit = buy_price * qty / entry_lev + (price - buy_price) * qty - sl_fee
                             self._broker.sl_credit(symbol, credit)
                     except Exception:
                         pass
@@ -882,6 +903,11 @@ class GridStrategy(Strategy):
         state.grid_lower = lower
         if self.p.sl_mode == "floor":
             atr = state._atr if state._atr > 0 else price * 0.02
+            # NOTE (#62): the floor VALUE deliberately tracks the (possibly lower)
+            # new grid bottom. It is NOT ratcheted upward — a global ratchet would
+            # place new buy cohorts under an old, higher floor and stop them out on
+            # fill. Only *open* positions' sl_price is ratcheted (never lowered),
+            # done below at the open_positions loop.
             state.floor_sl = max(lower - self.p.floor_sl_atr_mult * atr, 0.0)
 
         # Adaptive sizing: more budget on lower levels when bullish
