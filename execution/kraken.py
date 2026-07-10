@@ -172,18 +172,28 @@ class KrakenBroker(Broker):
         try:
             trades = _with_retry(self._ex.fetch_my_trades, None, since=since_ms, limit=200)
             for t in trades:
-                exchange_order_id = t.get("order", "")
-                client_id = exchange_to_client.get(exchange_order_id, "")
-                fills.append(Fill(
-                    client_id=client_id,
-                    symbol=t["symbol"],
-                    side=t["side"],
-                    price=float(t["price"]),
-                    qty=float(t["amount"]),
-                    fee=float(t.get("fee", {}).get("cost", 0) or 0),
-                    ts=float(t["timestamp"]) / 1000,
-                    exchange_order_id=exchange_order_id,
-                ))
+                # Parse each trade in isolation: a single malformed record (e.g.
+                # ccxt returns fee=None on some venues/paths) must not drop the
+                # whole batch — that would strand every other real fill.
+                try:
+                    exchange_order_id = t.get("order", "")
+                    client_id = exchange_to_client.get(exchange_order_id, "")
+                    # `t.get("fee", {})` does NOT guard against an existing key
+                    # whose value is None — use `(t.get("fee") or {})`.
+                    fee = float((t.get("fee") or {}).get("cost", 0) or 0)
+                    fills.append(Fill(
+                        client_id=client_id,
+                        symbol=t["symbol"],
+                        side=t["side"],
+                        price=float(t["price"]),
+                        qty=float(t["amount"]),
+                        fee=fee,
+                        ts=float(t["timestamp"]) / 1000,
+                        exchange_order_id=exchange_order_id,
+                    ))
+                except Exception as e:
+                    logger.warning("reconcile_fills: skipping malformed trade %s: %s",
+                                   t.get("id", "?"), e)
         except Exception as e:
             logger.warning("reconcile_fills error: %s", e)
         return fills
