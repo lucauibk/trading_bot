@@ -17,6 +17,19 @@ logger = logging.getLogger("ml.predictor")
 MIN_CONFIDENCE  = 0.65  # Gesenkt von 0.80 — bei OOS F1~0.35 ist 0.80 unerreichbar; LLM trägt 45% bei
 RULE_THRESHOLD  = 3     # Score-Schwelle für regelbasiertes Fallback
 
+_HOLD_LABEL = 1  # LABEL_TO_STR: 0=sell, 1=hold, 2=buy
+
+
+def directional_lgbm_conf(label_int: int, lgbm_conf: float) -> float:
+    """Confidence of the LightGBM *direction*, for blending into the directional gate.
+
+    A confident 'hold' prediction is confidence in NO movement — feeding its full
+    class-probability into the directional confidence would let a purely LLM-driven
+    signal clear MIN_CONFIDENCE even while the ML model says 'no direction'. Zero the
+    LightGBM confidence for hold labels so it cannot inflate directional confidence (#103).
+    """
+    return 0.0 if label_int == _HOLD_LABEL else lgbm_conf
+
 
 class MLPredictor:
     """
@@ -129,8 +142,10 @@ class MLPredictor:
             llm_indicators = self._build_llm_indicators(df, symbol)
             llm_result = llm_analyse(symbol, llm_indicators)
 
-            # Blending: LightGBM + Claude Haiku
-            blended_score, blended_conf = blend_scores(lgbm_score, lgbm_conf, llm_result)
+            # Blending: LightGBM + Claude Haiku. Use direction-aware LightGBM
+            # confidence so a confident 'hold' cannot inflate directional confidence (#103).
+            lgbm_conf_dir = directional_lgbm_conf(label_int, lgbm_conf)
+            blended_score, blended_conf = blend_scores(lgbm_score, lgbm_conf_dir, llm_result)
 
             if blended_conf >= MIN_CONFIDENCE:
                 if blended_score > 0.15:
@@ -167,6 +182,11 @@ class MLPredictor:
 
         except Exception as e:
             logger.warning("ML Fehler %s: %s", symbol, e)
+            # Neutralize the cached score so a failed predict expires the coin's
+            # conviction instead of freezing the last successful one. get_score()
+            # feeds adaptive/directional sizing (grid.py:269) — leaving a stale
+            # +0.9 here would size directional trades on a phantom signal (#117).
+            self._last_scores[symbol] = 0.0
             return "neutral"
 
     def _refresh_btc_corr(self, symbol: str) -> None:
