@@ -210,7 +210,12 @@ trading-bot/
 **Standard: `sl_mode = "floor"` (kaskadensicher)**
 - Ein einziger SL-Level unter dem Gridboden (`grid_lower - 1×ATR`)
 - Kein einzelnes Grid-Level kann alleine stoppen → kein Cascade-Dump
-- Bei Grid-Rebuild: Floor-SL wird nie gesenkt (Ratchet in `grid.py:748-752`)
+- Bei Grid-Rebuild: der SL **bereits offener Positionen** wird nie gesenkt
+  (Ratchet in `grid.py:908-911`, nur im globalen Floor-Modus). Der Floor-**Wert**
+  selbst (`state.floor_sl`) folgt dem Preis bei einem Abwärts-Rebuild bewusst nach
+  unten, sodass **neue** Buy-Kohorten in den tieferen Grid nicht sofort unter einem
+  veralteten, höheren Floor ausgestoppt werden. Ein globaler Ratchet auf den
+  Floor-Wert wäre schädlich (neue DCA-Buys würden beim Fill sofort stoppen).
 
 **Fallback `sl_mode = "per_position"` (für Backtests)**
 - SL pro Position = `step_pct × 1.5`, mind. 0.8%, **max. 4%** (Hard-Cap)
