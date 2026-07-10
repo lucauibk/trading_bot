@@ -471,13 +471,17 @@ def cmd_ready_for_live(days: int):
 
     # ── 6. Max Drawdown aus equity-Tabelle ───────────────────────────────────
     try:
+        # The equity table's value column is `capital` (dashboard/db.py:34-38),
+        # not `equity`. Selecting `equity` raised OperationalError, which the
+        # except-branch below silently turned into a warning — so the Max-Drawdown
+        # live-readiness gate never actually evaluated (#102).
         eq_df = pd.read_sql(
-            "SELECT timestamp, equity FROM equity ORDER BY timestamp",
+            "SELECT timestamp, capital FROM equity ORDER BY timestamp",
             con, parse_dates=["timestamp"]
         )
         if not eq_df.empty and len(eq_df) > 5:
-            peak = eq_df["equity"].expanding().max()
-            drawdown = ((eq_df["equity"] - peak) / peak).min()
+            peak = eq_df["capital"].expanding().max()
+            drawdown = ((eq_df["capital"] - peak) / peak).min()
             abs_dd   = abs(float(drawdown))
             if abs_dd <= MAX_DRAWDOWN:
                 checks.append((_GO, "Max Drawdown",
@@ -492,8 +496,10 @@ def cmd_ready_for_live(days: int):
                                 "PER_POS_SL_PCT / MAX_LOSS_PCT senken; /optimizer Lose-Rate prüfen"))
         else:
             warnings.append("Equity-Tabelle leer oder zu wenig Punkte – Drawdown nicht berechenbar")
-    except Exception:
-        warnings.append("Equity-Tabelle nicht auswertbar")
+    except Exception as exc:
+        # Surface the actual error (e.g. a schema/column mismatch) instead of a
+        # generic message, so a broken drawdown gate can't hide silently again.
+        warnings.append(f"Equity-Tabelle nicht auswertbar: {type(exc).__name__}: {exc}")
 
     # ── 7. Regime-Abdeckung ───────────────────────────────────────────────────
     if "regime" in df.columns and df["regime"].notna().any():

@@ -192,6 +192,37 @@ class TestBacktestMetrics:
         assert "profit_factor" in result
 
 
+# ── ready-for-live drawdown gate (#102) ──────────────────────────────────────
+
+class TestReadyForLiveDrawdown:
+    """Regression for #102: the equity value column is `capital`, not `equity`.
+    The old query raised OperationalError, silently disabling the drawdown gate."""
+
+    def test_drawdown_query_uses_capital_column(self, tmp_path, monkeypatch):
+        import dashboard.db as ddb
+        # Point the real schema builder at a throwaway DB.
+        monkeypatch.setattr(ddb, "DB_PATH", tmp_path / "trades.db")
+        con = ddb.get_conn()                       # builds equity(id, timestamp, capital)
+
+        caps = [1000, 1100, 1200, 1050, 900, 950, 1100]   # peak 1200 → trough 900
+        for i, c in enumerate(caps):
+            con.execute("INSERT INTO equity (timestamp, capital) VALUES (?,?)",
+                        (f"2026-07-0{i+1}T00:00:00", c))
+        con.commit()
+
+        # Corrected query (as in optimize.py cmd_ready_for_live) runs and computes DD.
+        eq = pd.read_sql("SELECT timestamp, capital FROM equity ORDER BY timestamp",
+                         con, parse_dates=["timestamp"])
+        peak = eq["capital"].expanding().max()
+        dd = ((eq["capital"] - peak) / peak).min()
+        assert dd == pytest.approx((900 - 1200) / 1200)
+
+        # The old column really doesn't exist → this is why the gate was dead.
+        with pytest.raises(Exception, match="no such column: equity"):
+            pd.read_sql("SELECT timestamp, equity FROM equity", con)
+        con.close()
+
+
 # ── Risk Manager ─────────────────────────────────────────────────────────────
 
 class TestRiskManager:
