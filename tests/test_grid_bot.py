@@ -715,6 +715,58 @@ class TestBacktestEquity:
         assert min(metrics["equity_curve"]) < 100.0
 
 
+# ── Correlation-tracker wiring (#43) ──────────────────────────────────────────
+
+class TestCorrelationWiring:
+    """RiskManager.can_open() step 5 (over-concentration bucket) was dead because
+    CorrelationTracker was never fed. Engine._refresh_correlations() now feeds it.
+    """
+
+    def test_refresh_correlations_populates_tracker(self, monkeypatch):
+        import types
+        import numpy as np
+        import pandas as pd
+        from core.engine import Engine
+        from risk.correlation import CorrelationTracker
+        from risk.manager import RiskManager
+
+        idx = pd.date_range("2024-01-01", periods=300, freq="1h")
+        rng = np.random.RandomState(0)
+        btc = pd.Series(100 + np.cumsum(rng.normal(0, 1.0, 300)), index=idx)
+        # SOL strongly driven by BTC → high positive correlation (tiny idiosyncratic noise)
+        sol = btc * 0.1 + pd.Series(rng.normal(0, 0.003, 300), index=idx)
+
+        corr = CorrelationTracker()
+        risk = RiskManager(corr)
+
+        state = types.SimpleNamespace(_last_df=pd.DataFrame({"close": sol}, index=idx))
+        strat = types.SimpleNamespace(_risk=risk, get_state=lambda s: state)
+        fake_self = types.SimpleNamespace(strategy=strat, symbols=["SOL/USD"])
+
+        monkeypatch.setattr("market.btc_context.get_btc_close", lambda: btc)
+
+        # Call the unbound method with a fake self (avoids full Engine construction).
+        Engine._refresh_correlations(fake_self)
+
+        assert "SOL/USD" in corr._correlations
+        assert corr._correlations["SOL/USD"] > 0.9
+        assert "SOL/USD" in corr.high_correlation_symbols(0.85)
+
+    def test_refresh_correlations_safe_without_btc_close(self, monkeypatch):
+        import types
+        from core.engine import Engine
+        from risk.correlation import CorrelationTracker
+        from risk.manager import RiskManager
+
+        corr = CorrelationTracker()
+        risk = RiskManager(corr)
+        strat = types.SimpleNamespace(_risk=risk, get_state=lambda s: None)
+        fake_self = types.SimpleNamespace(strategy=strat, symbols=["SOL/USD"])
+        monkeypatch.setattr("market.btc_context.get_btc_close", lambda: None)
+
+        # No BTC close available → no-op, must not raise.
+        Engine._refresh_correlations(fake_self)
+        assert corr._correlations == {}
 # ── Emergency-stop keeps SL/TP alive (#34) ────────────────────────────────────
 
 class TestEmergencyStopSL:

@@ -24,6 +24,10 @@ _DOMINANCE_TTL = 3600
 _btc_cache: Optional[BTCContext] = None
 _btc_cache_ts: float = 0.0
 
+# Last BTC close series fetched by get_btc_context — reused by the correlation
+# tracker (#43) so it doesn't have to issue a duplicate BTC/USD OHLCV fetch.
+_btc_close_cache: Optional[pd.Series] = None
+
 _dominance_cache: float = 0.5
 _dominance_cache_ts: float = 0.0
 
@@ -70,6 +74,9 @@ def get_btc_context(force_refresh: bool = False) -> Optional[BTCContext]:
         df = fetch_ohlcv("BTC/USD", "1h", 500)
         close = df["close"]
 
+        global _btc_close_cache
+        _btc_close_cache = close
+
         ema200_4h = _ema(close.resample("4h").last().dropna(), 200).iloc[-1]
         current_4h = close.resample("4h").last().dropna().iloc[-1]
         if current_4h > ema200_4h * 1.01:
@@ -101,3 +108,11 @@ def get_btc_context(force_refresh: bool = False) -> Optional[BTCContext]:
     except Exception as e:
         logger.warning("BTCContext fetch failed: %s", e)
         return _btc_cache  # return stale cache if available
+
+
+def get_btc_close() -> Optional[pd.Series]:
+    """Last BTC/USD 1h close series fetched by get_btc_context (or None).
+
+    Used by the engine to feed the CorrelationTracker without a redundant fetch.
+    """
+    return _btc_close_cache
