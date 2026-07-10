@@ -30,6 +30,13 @@ FUNDING_REFRESH_CYCLES = 240  # every N ticks refresh funding (~1h)
 # floor-SL flush (which can realize several % at once), otherwise a single
 # flush permanently halts the symbol.
 EMERGENCY_STOP_PCT = 0.12
+# How long equity logging may stay skipped because of stale prices before we
+# fall back to last-good prices.  A brief skip protects against the sleep-wake
+# MTM spike (#20); but if a single symbol's ticker fails *permanently* (#26/#89),
+# an unbounded skip would freeze the whole equity curve and the daily-drawdown
+# brake forever.  After this grace window we log equity with the last known
+# price for any still-stale symbol instead of blacking out entirely.
+STALE_EQUITY_GRACE_SECONDS = 4 * CHECK_INTERVAL  # 60 s
 
 
 class Engine:
@@ -67,6 +74,11 @@ class Engine:
         # by the full leveraged MTM delta.  We skip MTM for any symbol whose
         # cached price is older than 2× CHECK_INTERVAL (30 s).
         self._last_price_ts: Dict[str, float] = {}
+        # When equity logging first started being skipped due to stale prices.
+        # None while prices are fresh.  Used to bound the skip (see #89): after
+        # STALE_EQUITY_GRACE_SECONDS we stop skipping and fall back to last-good
+        # prices so a permanently-dead ticker cannot freeze the equity curve.
+        self._equity_stale_since: Optional[float] = None
         # Cache last logged prediction per symbol to avoid writing on every 15s tick
         self._last_logged_pred: Dict[str, str] = {}
         # Rebuild cooldown: prevents out_of_range events from back-to-back grid
@@ -74,6 +86,8 @@ class Engine:
         # always run unconditionally; only out_of_range rebuilds are rate-limited
         # to once per 20 ticks (~5 min).
         self._last_rebuild: Dict[str, int] = {}
+        # Symbols currently in per-coin emergency stop (log-once + resume tracking).
+        self._emergency_logged: set = set()
 
     def run(self):
         logger.info("Engine starting | symbols=%s", self.symbols)
@@ -154,9 +168,25 @@ class Engine:
                 continue
 
             state_obj = getattr(self.strategy, "get_state", lambda s: None)(sym)
-            if state_obj and state_obj.total_profit <= -(state_obj.investment * EMERGENCY_STOP_PCT):
-                logger.warning("[ENGINE] %s emergency stop (max loss)", sym)
-                continue
+            # Emergency stop (#34): a symbol past its per-coin realized-loss cap
+            # must stop OPENING new risk — but its open positions still need SL/TP
+            # protection. Previously this `continue`d before on_tick_safety, so
+            # existing positions were left without a stop-loss and the unrealized
+            # loss could grow unbounded. Now we treat it exactly like the daily
+            # freeze: block new orders (on_tick + _sync_orders) below, but keep
+            # running on_tick_safety and the dashboard update.
+            emergency_stopped = bool(
+                state_obj
+                and state_obj.total_profit <= -(state_obj.investment * EMERGENCY_STOP_PCT)
+            )
+            if emergency_stopped and sym not in self._emergency_logged:
+                logger.warning(
+                    "[ENGINE] %s emergency stop (max loss) — new buys halted, "
+                    "SL/TP still active", sym)
+                self._emergency_logged.add(sym)
+            elif not emergency_stopped and sym in self._emergency_logged:
+                # Realized PnL recovered above the cap → allow trading again.
+                self._emergency_logged.discard(sym)
 
             do_recheck = self._loop_count % PREDICTION_RECHECK == 0
             do_rebuild = self._loop_count % GRID_REBUILD_CYCLES == 0
@@ -181,7 +211,7 @@ class Engine:
                 except Exception as e:
                     logger.warning("on_tick_safety failed %s: %s", sym, e)
 
-            if not self.ctx.is_frozen():
+            if not self.ctx.is_frozen() and not emergency_stopped:
                 self.strategy.on_tick(sym, price, self.ctx)
 
             # For live mode: reconcile fills from exchange (paper has no reconciler)
@@ -207,7 +237,7 @@ class Engine:
                 self.strategy.setup_grid(sym, price, self.ctx)
                 self._last_rebuild[sym] = self._loop_count
 
-            if not self.ctx.is_frozen():
+            if not self.ctx.is_frozen() and not emergency_stopped:
                 self._sync_orders(sym, price)
 
             self._update_dashboard(sym, price)
@@ -502,7 +532,10 @@ class Engine:
                 age = now - self._last_price_ts.get(sym, 0.0)
                 if age > price_age_limit:
                     stale_syms.append(sym)
-                    continue  # skip MTM — price is from before a possible sleep
+                # NOTE: MTM is still computed (using the last-good price) for stale
+                # symbols. Dropping their margin+unrealized would understate equity
+                # by a full position and falsely trip the drawdown brake. Whether we
+                # actually *log* this value is decided by the grace window below.
                 state = getattr(self.strategy, "get_state", lambda s: None)(sym)
                 if state is None:
                     continue
@@ -521,14 +554,27 @@ class Engine:
                         mtm += margin + unrealized
 
             if stale_syms:
+                if self._equity_stale_since is None:
+                    self._equity_stale_since = now
+                stale_for = now - self._equity_stale_since
+                if stale_for < STALE_EQUITY_GRACE_SECONDS:
+                    logger.warning(
+                        "_log_equity: stale prices for %s (>%ds) — equity update skipped "
+                        "(retaining last good value), likely waking from sleep.",
+                        stale_syms, price_age_limit,
+                    )
+                    return  # brief skip: do NOT propagate — a sleep-wake spike would
+                            # otherwise falsely trigger the daily-drawdown FREEZE.
+                # Grace expired: a symbol's ticker is persistently dead (#89). Keep
+                # logging equity using its last-good price rather than freezing the
+                # entire equity curve + drawdown brake indefinitely.
                 logger.warning(
-                    "_log_equity: stale prices for %s (>%ds) — equity update skipped "
-                    "(retaining last good value), likely waking from sleep.",
-                    stale_syms, price_age_limit,
+                    "_log_equity: prices for %s stale for %ds (> grace %ds) — logging "
+                    "equity with last-good prices to avoid a permanent equity freeze.",
+                    stale_syms, int(stale_for), STALE_EQUITY_GRACE_SECONDS,
                 )
-                return  # do NOT propagate a cash-only value — it would falsely
-                        # trigger the daily-drawdown FREEZE in _check_daily_drawdown()
-                        # (ctx.total_equity stays at the last valid full-MTM value).
+            else:
+                self._equity_stale_since = None
 
             total = balance + mtm
             self.ctx.set_equity(total)

@@ -136,14 +136,24 @@ class KrakenBroker(Broker):
             return False
 
     def cancel_all(self, symbol: str) -> int:
+        """Cancel all open orders for a symbol. Returns the count successfully
+        cancelled. Any failure is logged loudly (was silently swallowed): a stale
+        order left on the book during a graceful shutdown / rebuild can fill
+        unexpectedly after "stop", so operators must see it."""
         open_orders = self.get_open_orders(symbol)
         count = 0
+        failed: List[str] = []
         for o in open_orders:
             try:
                 _with_retry(self._ex.cancel_order, o.exchange_order_id)
                 count += 1
-            except Exception:
-                pass
+            except Exception as e:
+                failed.append(o.exchange_order_id)
+                logger.warning("cancel_all: cancel failed for %s (%s): %s",
+                               symbol, o.exchange_order_id, e)
+        if failed:
+            logger.error("cancel_all %s: %d/%d orders still OPEN after cancel: %s",
+                         symbol, len(failed), len(open_orders), failed)
         return count
 
     def place_market(self, symbol: str, side: str, qty: float) -> Optional[BrokerOrder]:
@@ -172,18 +182,28 @@ class KrakenBroker(Broker):
         try:
             trades = _with_retry(self._ex.fetch_my_trades, None, since=since_ms, limit=200)
             for t in trades:
-                exchange_order_id = t.get("order", "")
-                client_id = exchange_to_client.get(exchange_order_id, "")
-                fills.append(Fill(
-                    client_id=client_id,
-                    symbol=t["symbol"],
-                    side=t["side"],
-                    price=float(t["price"]),
-                    qty=float(t["amount"]),
-                    fee=float(t.get("fee", {}).get("cost", 0) or 0),
-                    ts=float(t["timestamp"]) / 1000,
-                    exchange_order_id=exchange_order_id,
-                ))
+                # Parse each trade in isolation: a single malformed record (e.g.
+                # ccxt returns fee=None on some venues/paths) must not drop the
+                # whole batch — that would strand every other real fill.
+                try:
+                    exchange_order_id = t.get("order", "")
+                    client_id = exchange_to_client.get(exchange_order_id, "")
+                    # `t.get("fee", {})` does NOT guard against an existing key
+                    # whose value is None — use `(t.get("fee") or {})`.
+                    fee = float((t.get("fee") or {}).get("cost", 0) or 0)
+                    fills.append(Fill(
+                        client_id=client_id,
+                        symbol=t["symbol"],
+                        side=t["side"],
+                        price=float(t["price"]),
+                        qty=float(t["amount"]),
+                        fee=fee,
+                        ts=float(t["timestamp"]) / 1000,
+                        exchange_order_id=exchange_order_id,
+                    ))
+                except Exception as e:
+                    logger.warning("reconcile_fills: skipping malformed trade %s: %s",
+                                   t.get("id", "?"), e)
         except Exception as e:
             logger.warning("reconcile_fills error: %s", e)
         return fills
