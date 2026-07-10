@@ -278,6 +278,14 @@ class ModelTrainer:
             idx    = int(current_df.index.get_indexer([target], method="nearest")[0])
             if idx < 0 or idx + LOOKFORWARD_H >= len(current_df):
                 continue
+            # get_indexer(method="nearest") always clamps to a valid in-range
+            # index for a non-empty index (it never returns -1), so a sample whose
+            # ts predates the ~120-candle window gets pinned to index 0 and would be
+            # mislabeled from the *first* candle's forward window — and that wrong
+            # label is then persisted permanently. Reject matches that aren't within
+            # one candle (3600s) of the sample's real timestamp. (#91)
+            if abs((current_df.index[idx] - target).total_seconds()) > 3600:
+                continue
             atr_pct = _get_atr_pct(current_df, idx)
             label = _compute_label_triple_barrier(current_df, idx, atr_pct)
             self.store.set_label(symbol, ts, label)
