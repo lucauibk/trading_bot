@@ -17,10 +17,14 @@ FEATURE_NAMES = [
 ]
 
 
-def extract(btc: Optional[BTCContext], btc_corr: float = 0.5) -> np.ndarray:
-    """Extract 5 market context features."""
+def extract(btc: Optional[BTCContext], btc_corr: float = 0.0) -> np.ndarray:
+    """Extract 5 market context features.
+
+    btc_corr_30d is computed independently from OHLCV and preserved even without a
+    BTCContext. The neutral fallback is 0.0 — matching both production callers
+    (ml/predictor.py and ml/trainer.py default to 0.0), not a hardcoded 0.5 guess.
+    """
     if btc is None:
-        # btc_corr_30d is computed independently from OHLCV — preserve it even without BTC context.
         feats = np.zeros(len(FEATURE_NAMES), dtype=np.float32)
         feats[3] = np.clip(btc_corr, -1.0, 1.0)
         return feats
