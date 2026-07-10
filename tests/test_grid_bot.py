@@ -152,6 +152,58 @@ class TestMLFeatures:
         assert not np.isnan(feats).any()
 
 
+# ── Floor / Position Stop-Loss credit ────────────────────────────────────────
+
+class TestFloorSLCredit:
+    """Regression for #39: floor-SL must not double-charge the buy fee."""
+
+    def _run_sl(self, monkeypatch):
+        import os
+        from execution.paper import PaperBroker
+        from strategies.grid import GridStrategy, _GridState
+        from strategies.grid_params import GridParams
+        from core.context import MarketContext
+        from strategies.grid import KRAKEN_FEE
+
+        # Skip dashboard logging inside the SL path.
+        monkeypatch.setenv("GRIDBOT_BACKTEST", "1")
+
+        captured = {}
+
+        class SpyBroker(PaperBroker):
+            def sl_credit(self, symbol, amount):
+                captured["amount"] = amount
+                super().sl_credit(symbol, amount)
+
+        strat = GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 8}],
+                             ml_enabled=False, params=GridParams(leverage=1.0))
+        strat._broker = SpyBroker(initial_balance=1000.0)
+
+        state = _GridState("SOL/USD", 100.0, 8, 0.05)
+        state.orders["s1"] = {
+            "side": "sell", "sl_price": 95.0, "bought_at": 100.0,
+            "qty": 1.0, "filled": False,
+        }
+
+        ctx = MarketContext()
+        ctx.set_equity(1000.0)
+        strat._check_position_stops("SOL/USD", 94.0, state, ctx)
+        return captured, KRAKEN_FEE
+
+    def test_floor_sl_credit_charges_sell_fee_only(self, monkeypatch):
+        captured, fee = self._run_sl(monkeypatch)
+        assert "amount" in captured, "SL did not fire / credit"
+        buy_price, price, qty, lev = 100.0, 94.0, 1.0, 1.0
+        margin_return = buy_price * qty / lev
+        pnl = (price - buy_price) * qty
+        sell_fee = price * qty * fee          # sell-leg fee only
+        expected = margin_return + pnl - sell_fee
+        assert captured["amount"] == pytest.approx(expected)
+        # Guard against the old round-trip formula (would subtract an extra buy fee).
+        round_trip = margin_return + pnl - (price + buy_price) * qty * fee
+        assert captured["amount"] != pytest.approx(round_trip)
+
+
 # ── Backtest Metrics ─────────────────────────────────────────────────────────
 
 class TestBacktestMetrics:
