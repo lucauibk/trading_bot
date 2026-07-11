@@ -28,6 +28,7 @@ GRID_REBUILD_CYCLES = 60   # every N ticks force grid rebuild (~15min)
 BTC_REFRESH_CYCLES = 4     # every N ticks refresh BTC context (~1min)
 FUNDING_REFRESH_CYCLES = 240  # every N ticks refresh funding (~1h)
 CORR_BTC_REFRESH_CYCLES = 240  # every N ticks refresh BTC closes for CorrelationTracker (~1h)
+BTC_REF_SYMBOL = "BTC/USD"     # Referenz-Symbol für Korrelation (CLAUDE.md: kein Symbol-Hardcoding)
 REBUILD_COOLDOWN_TICKS = 40    # out_of_range-Rebuilds höchstens alle N Ticks (~10 min, #32)
 OUT_OF_RANGE_BAND = 0.02       # Preis muss ±2% außerhalb der Grid-Kanten liegen (#32)
 # Per-symbol kill switch on realized loss. Must be wider than one full
@@ -361,7 +362,7 @@ class Engine:
                 return
             if self._loop_count - self._last_corr_btc_refresh >= CORR_BTC_REFRESH_CYCLES:
                 from data_fetcher import fetch_ohlcv
-                btc_df = fetch_ohlcv("BTC/USD", "1h", 800)
+                btc_df = fetch_ohlcv(BTC_REF_SYMBOL, "1h", 800)
                 rm.corr.update_btc(btc_df["close"])
                 self._last_corr_btc_refresh = self._loop_count
             rm.corr.update_symbol(symbol, df["close"])

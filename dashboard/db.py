@@ -19,14 +19,16 @@ def get_conn() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(exist_ok=True)
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
-    # WAL + busy_timeout: Bot- und Dashboard-Prozess schreiben parallel in
-    # dieselbe DB. Ohne WAL/Timeout drohen "database is locked"-Fehler und
-    # stille Write-Verluste bei Schreib-Kollisionen (#41).
-    con.execute("PRAGMA journal_mode=WAL")
+    # busy_timeout ist per-Connection und muss jedes Mal gesetzt werden:
+    # Bot- und Dashboard-Prozess schreiben parallel in dieselbe DB (#41).
     con.execute("PRAGMA busy_timeout=5000")
     if _INITIALIZED_PATH != str(DB_PATH):
         with _INIT_LOCK:
             if _INITIALIZED_PATH != str(DB_PATH):
+                # journal_mode=WAL ist persistent pro DB-Datei – einmal pro
+                # Prozess setzen reicht, jeder weitere Aufruf wäre nur
+                # redundante Header-I/O.
+                con.execute("PRAGMA journal_mode=WAL")
                 _init(con)
                 _INITIALIZED_PATH = str(DB_PATH)
     return con
@@ -474,18 +476,23 @@ def set_coin_setting(symbol: str, max_investment: float, enabled: int = 1):
     con.close()
 
 
+# Gemeinsame Hebel-Grenzen für Writer UND Reader – ein Wert außerhalb
+# (z. B. direkter DB-Write) darf nie durchgereicht werden: ein negativer
+# Hebel würde Buys die Balance GUTSCHREIBEN (#37).
+MIN_LEVERAGE = 1.0
+MAX_LEVERAGE = 3.0
+
+
 def get_leverage() -> float:
     con = get_conn()
     row = con.execute("SELECT leverage FROM bot_status WHERE id=1").fetchone()
     con.close()
     lev = float(row["leverage"]) if row and row["leverage"] else 1.0
-    # Negative/abwegige Werte (z. B. direkter DB-Write) nie durchreichen –
-    # ein negativer Hebel würde Buys die Balance GUTSCHREIBEN (#37).
-    return lev if 1.0 <= lev <= 10.0 else 1.0
+    return lev if MIN_LEVERAGE <= lev <= MAX_LEVERAGE else 1.0
 
 
 def set_leverage(value: float):
-    value = max(1.0, min(3.0, float(value)))
+    value = max(MIN_LEVERAGE, min(MAX_LEVERAGE, float(value)))
     con = get_conn()
     con.execute("UPDATE bot_status SET leverage=? WHERE id=1", (value,))
     con.commit()

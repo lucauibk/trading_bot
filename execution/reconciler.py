@@ -68,6 +68,10 @@ class Reconciler:
         """
         self._fetch = fetch_fills_fn
         self._last_fill_ts = self._load_last_ts()
+        # True bis der erste Retry-Scan die Tabelle leer vorfindet (Altbestand
+        # aus früheren Läufen) – verhindert einen Full-Scan pro Tick auf der
+        # fast immer leeren Dead-Letter-Tabelle.
+        self._has_dead_letters = True
 
     def _load_last_ts(self) -> float:
         try:
@@ -168,6 +172,7 @@ class Reconciler:
             )
             con.commit()
             con.close()
+            self._has_dead_letters = True
             logger.warning(
                 "Reconciler: Fill ohne client_id → Dead-Letter (%s %s %.6f @ %.4f, oid=%s)",
                 fill.symbol, fill.side, fill.qty, fill.price, fill.exchange_order_id,
@@ -177,10 +182,16 @@ class Reconciler:
 
     def _retry_dead_letters(self) -> List[Fill]:
         """Versucht geparkte Fills erneut aufzulösen; Erfolge werden emittiert."""
+        if not self._has_dead_letters:
+            return []
         out: List[Fill] = []
         try:
             con = _get_conn()
             rows = con.execute("SELECT * FROM unresolved_fills").fetchall()
+            if not rows:
+                self._has_dead_letters = False
+                con.close()
+                return []
             for r in rows:
                 row = con.execute(
                     "SELECT client_id FROM open_orders WHERE exchange_order_id=?",
