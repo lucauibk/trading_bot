@@ -424,36 +424,54 @@ class GridStrategy(Strategy):
         except ValueError:
             idx = None
 
+        # Determine the take-profit sell level for this filled buy. Normally the
+        # next grid line above the buy. But a buy can fill at a price that is NOT a
+        # current grid line — a neutral-replenish of a pre-seeded sell (bought_at is
+        # the build-time price), or a buy still resting from before a grid rebuild.
+        # In those cases idx is None (or the buy sits at the top line) and the old
+        # code skipped sell+SL creation entirely, leaving an unsellable, unstopped
+        # position with unbounded downside — defeating the floor-SL design (#127).
+        # Always create a sell carrying both the TP and the SL.
         if idx is not None and idx < len(state.grid_lines) - 1:
             sell_price = state.grid_lines[idx + 1]
-            if self.p.sl_mode == "floor" and state.floor_sl > 0:
-                # Per-cohort mode: use the floor stamped at seeding time so each
-                # rebuild cohort has its own SL trigger.  A breach then only flushes
-                # that cohort, not all accumulated positions from every rebuild.
-                sl_price = (order.get("cohort_floor", state.floor_sl)
-                            if self.p.floor_sl_per_cohort else state.floor_sl)
+        else:
+            above = [gl for gl in state.grid_lines if gl > buy_price]
+            if above:
+                sell_price = min(above)          # snap to nearest grid line above
+            elif len(state.grid_lines) >= 2:
+                grid_step = state.grid_lines[1] - state.grid_lines[0]
+                sell_price = buy_price + grid_step  # synthetic step matching grid spacing
             else:
-                step_pct = (sell_price - buy_price) / buy_price
-                sl_pct = max(step_pct * self.p.per_pos_sl_step_mult, self.p.per_pos_sl_min_pct)
-                # Hard-cap: no per-position SL can be wider than per_pos_sl_max_pct (4%)
-                sl_pct = min(sl_pct, self.p.per_pos_sl_max_pct)
-                sl_price = buy_price * (1 - sl_pct)
+                sell_price = buy_price * (1 + self.p.per_pos_sl_min_pct)
 
-            sell_cid = str(uuid.uuid4())
-            state.orders[sell_cid] = {
-                "side": "sell",
-                "price": sell_price,
-                "qty": qty,
-                "filled": False,
-                "bought_at": buy_price,
-                "sl_price": sl_price,
-                "leverage": lev,
-                "trailing_activated": False,
-                "momentum_holds": 0,
-            }
-            state.price_to_id[sell_price] = sell_cid
-            logger.info("[GRID] BUY fill %s @ %.4f | SL=%.4f | -> sell @ %.4f",
-                        fill.symbol, buy_price, sl_price, sell_price)
+        if self.p.sl_mode == "floor" and state.floor_sl > 0:
+            # Per-cohort mode: use the floor stamped at seeding time so each
+            # rebuild cohort has its own SL trigger.  A breach then only flushes
+            # that cohort, not all accumulated positions from every rebuild.
+            sl_price = (order.get("cohort_floor", state.floor_sl)
+                        if self.p.floor_sl_per_cohort else state.floor_sl)
+        else:
+            step_pct = (sell_price - buy_price) / buy_price
+            sl_pct = max(step_pct * self.p.per_pos_sl_step_mult, self.p.per_pos_sl_min_pct)
+            # Hard-cap: no per-position SL can be wider than per_pos_sl_max_pct (4%)
+            sl_pct = min(sl_pct, self.p.per_pos_sl_max_pct)
+            sl_price = buy_price * (1 - sl_pct)
+
+        sell_cid = str(uuid.uuid4())
+        state.orders[sell_cid] = {
+            "side": "sell",
+            "price": sell_price,
+            "qty": qty,
+            "filled": False,
+            "bought_at": buy_price,
+            "sl_price": sl_price,
+            "leverage": lev,
+            "trailing_activated": False,
+            "momentum_holds": 0,
+        }
+        state.price_to_id[sell_price] = sell_cid
+        logger.info("[GRID] BUY fill %s @ %.4f | SL=%.4f | -> sell @ %.4f",
+                    fill.symbol, buy_price, sl_price, sell_price)
 
         ctx.add_position(Position(
             symbol=fill.symbol, side="grid",

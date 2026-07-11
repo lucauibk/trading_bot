@@ -418,6 +418,59 @@ class TestGridStrategy:
         sells_after = sum(1 for o in state.orders.values() if o["side"] == "sell")
         assert sells_after > sells_before
 
+    def test_nongrid_buy_fill_still_gets_sell_and_sl(self):
+        """Regression for #127: a buy that fills at a price NOT on the current grid
+        (neutral-replenish of a pre-seed sell, or a buy resting from before a
+        rebuild) must still get a take-profit sell carrying an sl_price — otherwise
+        the position is unsellable and unstopped with unbounded downside."""
+        from core.context import MarketContext
+        from core.strategy import Fill
+        strategy = self._strategy()
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        strategy.setup_grid("SOL/USD", 100.0, ctx)
+        state = strategy.get_state("SOL/USD")
+
+        non_grid = state.grid_lines[0] - 0.01  # below every grid line → idx is None
+        assert non_grid not in state.grid_lines
+        cid = str(uuid.uuid4())
+        state.orders[cid] = {"side": "buy", "price": non_grid, "qty": 1.0, "filled": False}
+        sells_before = sum(1 for o in state.orders.values() if o["side"] == "sell")
+
+        strategy.on_fill(Fill(client_id=cid, symbol="SOL/USD", side="buy",
+                              price=non_grid, qty=1.0, fee=0.0, ts=time.time()), ctx)
+
+        new_sells = [o for o in state.orders.values()
+                     if o["side"] == "sell" and o.get("bought_at") == non_grid]
+        assert len(new_sells) == 1, "non-grid buy must still create a sell"
+        s = new_sells[0]
+        assert "sl_price" in s and s["sl_price"] < non_grid  # stop below entry
+        assert s["price"] > non_grid                          # TP above entry
+        assert sum(1 for o in state.orders.values() if o["side"] == "sell") == sells_before + 1
+
+    def test_top_level_buy_fill_still_gets_sell_and_sl(self):
+        """Regression for #127: a buy at the very top grid line (idx == len-1) also
+        used to skip sell/SL creation. It must get a synthetic TP + SL now too."""
+        from core.context import MarketContext
+        from core.strategy import Fill
+        strategy = self._strategy()
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        strategy.setup_grid("SOL/USD", 100.0, ctx)
+        state = strategy.get_state("SOL/USD")
+
+        top = state.grid_lines[-1]
+        cid = str(uuid.uuid4())
+        state.orders[cid] = {"side": "buy", "price": top, "qty": 1.0, "filled": False}
+        strategy.on_fill(Fill(client_id=cid, symbol="SOL/USD", side="buy",
+                              price=top, qty=1.0, fee=0.0, ts=time.time()), ctx)
+
+        new_sells = [o for o in state.orders.values()
+                     if o["side"] == "sell" and o.get("bought_at") == top]
+        assert len(new_sells) == 1
+        assert new_sells[0]["price"] > top
+        assert new_sells[0]["sl_price"] < top
+
     def test_per_position_sl_fires_on_tick(self):
         from core.context import MarketContext
         strategy = self._strategy()
