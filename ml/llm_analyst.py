@@ -196,11 +196,19 @@ def blend_scores(lgbm_score: float, lgbm_confidence: float,
 
     llm_score = llm_result["score"]
     blended   = (1 - LLM_WEIGHT) * lgbm_score + LLM_WEIGHT * llm_score
-    blended_conf = (1 - LLM_WEIGHT) * lgbm_confidence + LLM_WEIGHT * llm_result["confidence"]
+
+    # A confident *neutral* LLM result expresses confidence in NO direction. Feeding
+    # its raw confidence into the directional blend lets a confident-neutral LLM push
+    # a borderline LGBM signal over MIN_CONFIDENCE and open a leveraged directional
+    # trade — the same inflation bug fixed on the LGBM side in #103
+    # (directional_lgbm_conf). Mirror it here: a neutral LLM contributes zero
+    # directional confidence. (#129)
+    llm_conf_dir = 0.0 if llm_result.get("direction") == "neutral" else llm_result["confidence"]
+    blended_conf = (1 - LLM_WEIGHT) * lgbm_confidence + LLM_WEIGHT * llm_conf_dir
 
     logger.debug(
-        "Blend: LGBM=%+.2f (%.2f) + LLM=%+.2f (%.2f) → %+.2f (%.2f)",
-        lgbm_score, lgbm_confidence, llm_score, llm_result["confidence"],
-        blended, blended_conf,
+        "Blend: LGBM=%+.2f (%.2f) + LLM=%+.2f (%.2f, dir=%s) → %+.2f (%.2f)",
+        lgbm_score, lgbm_confidence, llm_score, llm_conf_dir,
+        llm_result.get("direction"), blended, blended_conf,
     )
     return blended, blended_conf

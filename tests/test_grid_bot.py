@@ -291,6 +291,27 @@ class TestDirectionalConfidence:
         _, fixed_conf = blend_scores(lgbm_score, conf_dir, llm_result)
         assert fixed_conf < MIN_CONFIDENCE
 
+    def test_confident_neutral_llm_does_not_inflate_confidence(self):
+        """Regression for #129: a confident-*neutral* LLM must contribute zero
+        directional confidence, mirroring the #103 LGBM fix — otherwise it can push
+        a borderline LGBM signal over MIN_CONFIDENCE and open a leveraged trade."""
+        from ml.predictor import MIN_CONFIDENCE
+        from ml.llm_analyst import blend_scores, LLM_WEIGHT
+
+        lgbm_score, lgbm_conf = 0.50, 0.50  # borderline buy, below the gate alone
+        neutral_llm = {"score": 0.0, "direction": "neutral", "confidence": 0.90}
+        up_llm = {"score": 0.6, "direction": "up", "confidence": 0.90}
+
+        # Neutral LLM: confidence must NOT be inflated by the raw 0.90.
+        _, neutral_conf = blend_scores(lgbm_score, lgbm_conf, neutral_llm)
+        assert neutral_conf == pytest.approx((1 - LLM_WEIGHT) * lgbm_conf)
+        assert neutral_conf < MIN_CONFIDENCE
+
+        # A directional (up) LLM still contributes its full confidence.
+        _, up_conf = blend_scores(lgbm_score, lgbm_conf, up_llm)
+        assert up_conf == pytest.approx(
+            (1 - LLM_WEIGHT) * lgbm_conf + LLM_WEIGHT * 0.90)
+
 
 # ── Backtest Metrics ─────────────────────────────────────────────────────────
 
