@@ -418,6 +418,39 @@ class TestGridStrategy:
         sells_after = sum(1 for o in state.orders.values() if o["side"] == "sell")
         assert sells_after > sells_before
 
+    def test_sell_only_latch_blocks_buys_and_survives_refresh(self):
+        """Regression for #115: after a graceful wait_fills stop, sell_only must
+        block all buys AND survive _refresh_prediction — an "up"/"neutral" prediction
+        must not re-arm with_position and let the bot keep buying."""
+        from core.context import MarketContext
+        from strategies.grid import GridStrategy
+        # ml_enabled=False → deterministic rule-based prediction, no network.
+        strategy = GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                                ml_enabled=False)
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+
+        # A strong uptrend df → the rule-based prediction (ML disabled) yields "up".
+        n = 60
+        close = pd.Series(np.linspace(100, 140, n))
+        df = pd.DataFrame({
+            "open": close * 0.999, "high": close * 1.002,
+            "low": close * 0.998, "close": close,
+            "volume": np.full(n, 1000.0),
+        })
+
+        # Sanity: without the latch, an uptrend arms buys.
+        strategy._refresh_prediction("SOL/USD", df, ctx)
+        assert state.with_position is True
+        assert strategy._buys_allowed(state) is True
+
+        # Latch the graceful stop, then let a fresh uptrend prediction run.
+        state.sell_only = True
+        strategy._refresh_prediction("SOL/USD", df, ctx)
+        assert state.with_position is False           # not re-armed
+        assert strategy._buys_allowed(state) is False  # buys stay blocked
+
     def test_per_position_sl_fires_on_tick(self):
         from core.context import MarketContext
         strategy = self._strategy()

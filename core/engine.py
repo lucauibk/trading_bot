@@ -414,6 +414,10 @@ class Engine:
                 for sym in self.symbols:
                     state = getattr(self.strategy, "get_state", lambda s: None)(sym)
                     if state:
+                        # sell_only is a permanent latch: _refresh_prediction resets
+                        # with_position every candle, so setting only with_position
+                        # would re-arm buys within ~75s (#115).
+                        state.sell_only = True
                         state.with_position = False
                 self._waiting_for_fills = True
                 logger.info("Dashboard: wait_fills – sell-only mode active, will stop when all filled")
