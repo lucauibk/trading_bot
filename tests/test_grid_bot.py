@@ -331,6 +331,21 @@ class TestBacktestMetrics:
         assert "hit_rate_pct" in result
         assert "profit_factor" in result
 
+    def test_summary_pnls_longer_than_equity_no_indexerror(self):
+        """Regression for #131: pnls is filled per SL/TP tick AND per fill while
+        equity_curve grows one entry per candle, so len(pnls) can exceed
+        len(equity_curve). summary() must not raise IndexError (which the sweep
+        silently swallows as {"error": ...} → selection bias)."""
+        from backtest.metrics import summary
+        pnls = [1.0, -0.5, 2.0, -1.0, 0.7, 3.0, -2.0]   # 7 realized pnls
+        equity = [1000, 1002, 1001]                      # only 3 candle snapshots
+        assert len(pnls) > len(equity)
+        result = summary(pnls, equity, days=10)          # must not raise
+        assert result["n_trades"] == 7
+        # Returns normalized by starting capital (1000), not a per-candle equity.
+        assert result["sharpe"] == pytest.approx(
+            summary([p * 2 for p in pnls], [2000, 2004, 2002], days=10)["sharpe"])
+
 
 # ── Risk Manager ─────────────────────────────────────────────────────────────
 
