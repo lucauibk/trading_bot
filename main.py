@@ -29,6 +29,26 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 
+def resolve_active_grids(symbols, per_coin, settings):
+    """Resolve the active symbol list and per-coin grid config from dashboard
+    coin_settings. A coin with enabled=0 is dropped entirely; an enabled coin's
+    max_investment can only reduce its budget below per_coin (the broker's hard
+    per-symbol cash bucket), never exceed it. A symbol absent from settings
+    defaults to enabled with full per_coin budget. (#114)
+
+    settings: {symbol: {"enabled": int, "max_investment": float, ...}}
+    Returns (active_symbols, grids_config).
+    """
+    active_symbols = [s for s in symbols if settings.get(s, {}).get("enabled", 1)]
+    grids_config = [
+        {"symbol": s,
+         "investment": min(settings.get(s, {}).get("max_investment", per_coin), per_coin),
+         "levels": 8}
+        for s in active_symbols
+    ]
+    return active_symbols, grids_config
+
+
 def main():
     parser = argparse.ArgumentParser(description="Grid Trading Bot")
     parser.add_argument("--mode", choices=["paper", "live"], default="paper")
@@ -86,20 +106,21 @@ def main():
             pass
 
     per_coin = initial_investment / len(symbols)
-    overrides = {}
-    if paper:
-        try:
-            from dashboard.db import get_all_coin_settings
-            overrides = {r["symbol"]: r["max_investment"]
-                         for r in get_all_coin_settings() if r["enabled"]}
-        except Exception:
-            pass
-    grids_config = [
-        # coin_settings can only reduce budget below per_coin, never exceed the
-        # broker's hard per-symbol cash bucket (initial_capital / n_symbols).
-        {"symbol": s, "investment": min(overrides.get(s, per_coin), per_coin), "levels": 8}
-        for s in symbols
-    ]
+    # Dashboard coin_settings are the control plane in BOTH paper and live modes
+    # (CLAUDE.md: "Bot liest diese Felder jede Loop-Iteration"). Load them
+    # unconditionally so `enabled` and `max_investment` take effect live too.
+    settings = {}
+    try:
+        from dashboard.db import get_all_coin_settings
+        settings = {r["symbol"]: r for r in get_all_coin_settings()}
+    except Exception:
+        pass
+
+    # A disabled coin is removed entirely — it must NOT trade with a fallback budget.
+    # (GridStrategy.init defaults any unconfigured symbol to 40 USDT, and the engine
+    # iterates the symbol list it is handed, so filtering grids_config alone is not
+    # enough: the engine's symbol list must be filtered too — see below.)
+    active_symbols, grids_config = resolve_active_grids(symbols, per_coin, settings)
 
     # Build components
     from core.context import MarketContext
@@ -146,15 +167,18 @@ def main():
         reconciler = Reconciler(broker.reconcile_fills)
 
     from core.engine import Engine
-    engine = Engine(strategy, broker, symbols, ctx, reconciler, initial_capital=initial_investment)
+    # Only trade the enabled coins — disabled coins are excluded from the engine's
+    # per-tick loop (and thus from strategy.init) so they never build a grid.
+    engine = Engine(strategy, broker, active_symbols, ctx, reconciler,
+                    initial_capital=initial_investment)
 
     logger.info("Starting | mode=%s | symbols=%s | capital=%.0f USDT",
-                args.mode.upper(), symbols, initial_investment)
+                args.mode.upper(), active_symbols, initial_investment)
 
     engine.run()
 
     total_profit = sum(
-        getattr(strategy.get_state(s), "total_profit", 0) for s in symbols
+        getattr(strategy.get_state(s), "total_profit", 0) for s in active_symbols
     )
     logger.info("Bot stopped | total profit: %.4f USDT", total_profit)
 

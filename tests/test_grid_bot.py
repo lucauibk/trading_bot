@@ -182,6 +182,37 @@ class TestMLFeatures:
         assert conf == 0.8
 
 
+class TestResolveActiveGrids:
+    """Regression for #114: coin_settings.enabled must take a coin offline (not give
+    it full budget), and max_investment must cap budget in both paper and live."""
+
+    def test_disabled_coin_removed_not_full_budget(self):
+        from main import resolve_active_grids
+        settings = {"ETH/USD": {"enabled": 0, "max_investment": 50.0}}
+        active, grids = resolve_active_grids(["SOL/USD", "ETH/USD"], 200.0, settings)
+        # ETH is disabled → dropped entirely, NOT falling back to full per_coin.
+        assert active == ["SOL/USD"]
+        assert [g["symbol"] for g in grids] == ["SOL/USD"]
+
+    def test_max_investment_caps_below_per_coin(self):
+        from main import resolve_active_grids
+        settings = {"SOL/USD": {"enabled": 1, "max_investment": 40.0}}
+        _, grids = resolve_active_grids(["SOL/USD"], 200.0, settings)
+        assert grids[0]["investment"] == 40.0  # capped below per_coin
+
+    def test_max_investment_cannot_exceed_per_coin(self):
+        from main import resolve_active_grids
+        settings = {"SOL/USD": {"enabled": 1, "max_investment": 999.0}}
+        _, grids = resolve_active_grids(["SOL/USD"], 200.0, settings)
+        assert grids[0]["investment"] == 200.0  # clamped to broker bucket
+
+    def test_symbol_absent_from_settings_defaults_enabled_full_budget(self):
+        from main import resolve_active_grids
+        active, grids = resolve_active_grids(["SOL/USD"], 200.0, {})
+        assert active == ["SOL/USD"]
+        assert grids[0]["investment"] == 200.0
+
+
 # ── optimize.py ready-for-live drawdown gate ─────────────────────────────────
 
 class TestReadyForLiveDrawdown:
