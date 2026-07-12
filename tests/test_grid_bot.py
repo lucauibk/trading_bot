@@ -1149,3 +1149,20 @@ class TestLatentTraps:
         import inspect
         import data_fetcher
         assert inspect.signature(data_fetcher.get_balance).parameters["currency"].default == "USD"
+
+
+# ── Confident-neutral LLM must not inflate blended confidence (#129) ───────────
+class TestLLMNeutralConfidence:
+    def test_neutral_llm_does_not_inflate_confidence(self):
+        from ml.llm_analyst import blend_scores, LLM_WEIGHT
+        # Confident neutral LLM (passes the gate) must contribute 0 to directional conf.
+        neutral = {"direction": "neutral", "confidence": 0.90, "score": 0.0}
+        blended, conf = blend_scores(0.50, 0.50, neutral)
+        assert conf == (1 - LLM_WEIGHT) * 0.50  # LGBM-only confidence, LLM zeroed
+        assert conf < 0.50 + 1e-9
+
+    def test_directional_llm_still_contributes_confidence(self):
+        from ml.llm_analyst import blend_scores, LLM_WEIGHT
+        up = {"direction": "up", "confidence": 0.90, "score": 0.90}
+        blended, conf = blend_scores(0.50, 0.50, up)
+        assert conf == (1 - LLM_WEIGHT) * 0.50 + LLM_WEIGHT * 0.90
