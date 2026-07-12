@@ -1149,3 +1149,31 @@ class TestLatentTraps:
         import inspect
         import data_fetcher
         assert inspect.signature(data_fetcher.get_balance).parameters["currency"].default == "USD"
+
+
+# ── PaperBroker balance provisioning (#149) ───────────────────────────────────
+class TestPaperBalanceProvisioning:
+    """With per-symbol buckets, the fallback pool must not double-provision the
+    account, and get_balance() must include every pool it can move money to."""
+
+    def test_seeded_buckets_do_not_double_provision(self):
+        from execution.paper import PaperBroker
+        b = PaperBroker(initial_balance=900.0, symbols=["A/USD", "B/USD", "C/USD"])
+        # Buckets already sum to 900; the hidden fallback pool must be 0, not 900.
+        assert b._balance == 0.0
+        assert b.get_balance() == 900.0
+
+    def test_unseeded_symbol_cannot_spend_the_account(self):
+        from execution.paper import PaperBroker
+        b = PaperBroker(initial_balance=900.0, symbols=["A/USD", "B/USD", "C/USD"])
+        # A symbol not in the seed list has no bucket → buy must be rejected by the
+        # affordability guard instead of draining a hidden full-account pool.
+        b.place_limit("Z/USD", "buy", 100.0, 1.0, client_id="z1")
+        fills = b.update_price("Z/USD", 100.0)
+        assert fills == []
+        assert b.get_balance() == 900.0
+
+    def test_no_symbols_keeps_single_pool(self):
+        from execution.paper import PaperBroker
+        b = PaperBroker(initial_balance=500.0)
+        assert b.get_balance() == 500.0

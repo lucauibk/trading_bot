@@ -47,8 +47,13 @@ class PaperBroker(Broker):
         else:
             self._balances = {}
 
-        # Fallback single-pool (used when symbol not in _balances)
-        self._balance: float = initial_balance
+        # Fallback single-pool (used when symbol not in _balances).
+        # When per-symbol buckets already sum to initial_balance, this pool MUST be
+        # 0.0 — otherwise it double-provisions the account and an unseeded symbol
+        # (string mismatch, or a coin enabled after startup) transacts against a
+        # hidden full-account pool, breaking per-coin isolation (#149). With 0.0 the
+        # buy affordability guard rejects any unseeded-symbol buy instead.
+        self._balance: float = 0.0 if self._balances else initial_balance
 
         self._orders:          Dict[str, BrokerOrder] = {}
         self._fill_callbacks:  list                   = []
@@ -217,10 +222,12 @@ class PaperBroker(Broker):
         logger.debug("[PAPER] SL credit %.4f for %s", amount, symbol)
 
     def get_balance(self, currency: str = "USD") -> float:
-        """Total cash across all symbol buckets."""
-        if self._balances:
-            return sum(self._balances.values())
-        return self._balance
+        """Total cash across all symbol buckets plus the fallback pool.
+
+        Always include self._balance so any movement booked against the fallback
+        pool (e.g. a pre-seeded sell for an unseeded symbol) stays visible to
+        equity / mark-to-market instead of vanishing (#149)."""
+        return sum(self._balances.values()) + self._balance
 
     def round_qty(self, symbol: str, qty: float) -> float:
         return round(qty, 6)
