@@ -1149,3 +1149,34 @@ class TestLatentTraps:
         import inspect
         import data_fetcher
         assert inspect.signature(data_fetcher.get_balance).parameters["currency"].default == "USD"
+
+
+# ── /api/leverage endpoint echo (#150) ────────────────────────────────────────
+class TestLeverageEndpoint:
+    """POST /api/leverage must echo the *stored* (clamped) leverage, not the raw
+    request value, and reject non-numeric input with 400 instead of a 500."""
+
+    def _client(self, tmp_path, monkeypatch):
+        import dashboard.db as ddb
+        monkeypatch.setattr(ddb, "DB_PATH", tmp_path / "trades.db")
+        import dashboard.app as dapp
+        dapp.app.config["TESTING"] = True
+        return dapp.app.test_client()
+
+    def test_leverage_echo_is_clamped(self, tmp_path, monkeypatch):
+        client = self._client(tmp_path, monkeypatch)
+        resp = client.post("/api/leverage", json={"leverage": 8})
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body["ok"] is True
+        # 8× is clamped to the 3× cap; the response must not claim 8×.
+        assert body["leverage"] == 3.0
+        # and it must match what the bot actually reads back
+        resp_get = client.get("/api/leverage")
+        assert resp_get.get_json()["leverage"] == 3.0
+
+    def test_leverage_invalid_input_returns_400(self, tmp_path, monkeypatch):
+        client = self._client(tmp_path, monkeypatch)
+        resp = client.post("/api/leverage", json={"leverage": "abc"})
+        assert resp.status_code == 400
+        assert resp.get_json()["ok"] is False
