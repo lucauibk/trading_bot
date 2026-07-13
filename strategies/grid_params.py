@@ -74,6 +74,19 @@ class GridParams:
     # fallback, not trades).  0.0 means disabled; sweep to find optimum.
     min_confidence_to_buy: float = 0.0
 
+    # ── Aggressiv-Paket (2026-07-13, bewusste User-Entscheidung: mehr Risiko) ──
+    # DCA/Martingale-Sizing: Level i von oben bekommt Gewicht dca_size_mult^depth
+    # (unterste Linie = max). 1.0 = aus (bit-identisch zu vorher). Research-Range
+    # 1.2–1.3 konservativ, 1.5–2.0 aggressiv. Sweep-Achse: {1.0, 1.3, 1.6}.
+    dca_size_mult: float = 1.0
+    # Runner-Modus: Bei preisbasiertem Hard-Uptrend (EMA9>21>50 + ADX, Gegenstück
+    # zum Downtrend-Filter) wird der Paar-Sell nicht ans nächste Grid-Level gelegt,
+    # sondern auf entry + runner_tp_atr × ATR gedeckelt — der vorhandene
+    # Trailing-SL (Breakeven bei +1 ATR, Trail 1.5 ATR) sichert den Gewinn.
+    # Bewusst NICHT am ML-Score gehängt: der ist im Backtest auf ±0.1 gedeckelt.
+    runner_enabled: bool = False
+    runner_tp_atr: float = 3.0
+
     # When True, each rebuild cohort's buys keep their own floor SL (stored
     # at seeding time) instead of being ratcheted to the global floor on the
     # next rebuild.  A single-price breach then only flushes one cohort rather

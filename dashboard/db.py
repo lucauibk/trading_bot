@@ -502,7 +502,10 @@ def get_leverage() -> float:
 
 
 def set_leverage(value: float):
-    value = max(1.0, min(3.0, float(value)))
+    # Cap 3.0 → 5.0 (Aggressiv-Paket 2026-07-13, bewusste User-Entscheidung).
+    # Achtung: PaperBroker modelliert keine Margin-Zinsen/Liquidation — 5× im
+    # Paper ist optimistischer als es live auf Kraken wäre.
+    value = max(1.0, min(5.0, float(value)))
     con = get_conn()
     con.execute("UPDATE bot_status SET leverage=? WHERE id=1", (value,))
     con.commit()

@@ -809,3 +809,89 @@ class TestFixes20260713:
         assert broker.get_balance() == pytest.approx(500.0)
         broker._deduct("SOL/USD", 100.0)
         assert broker.get_balance() == pytest.approx(400.0)
+
+
+# ── Aggressiv-Paket 2026-07-13 (DCA-Mult, Runner, Leverage 5×) ────────────────
+
+class TestAggressivePackage:
+
+    def test_dca_allocations_sum_and_bias(self):
+        """dca_size_mult=1.6: Summe bleibt investment, unterste Linie > oberste."""
+        from strategies.grid import _calc_level_allocations
+        lines = [90.0, 95.0, 100.0, 105.0, 110.0]
+        alloc = _calc_level_allocations(lines, 100.0, 500.0, 0.0, dca_mult=1.6)
+        assert sum(alloc.values()) == pytest.approx(500.0)
+        assert alloc[90.0] > alloc[110.0]
+        # Monoton: jede tiefere Linie bekommt mehr
+        sorted_lines = sorted(lines)
+        vals = [alloc[p] for p in sorted_lines]
+        assert all(vals[i] > vals[i + 1] for i in range(len(vals) - 1))
+
+    def test_dca_mult_one_is_legacy_behavior(self):
+        """dca_size_mult=1.0 == exakt bisheriges Verhalten (uniform bei score~0)."""
+        from strategies.grid import _calc_level_allocations
+        lines = [90.0, 100.0, 110.0]
+        alloc = _calc_level_allocations(lines, 100.0, 300.0, 0.0, dca_mult=1.0)
+        assert all(v == pytest.approx(100.0) for v in alloc.values())
+
+    def _runner_strategy(self, runner=True):
+        from core.context import MarketContext
+        from strategies.grid import GridStrategy
+        from strategies.grid_params import GridParams
+        params = GridParams.from_dict({
+            "runner_enabled": runner, "runner_tp_atr": 3.0,
+            "sl_mode": "per_position", "momentum_hold_max": 0,
+        })
+        strategy = GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                                ml_enabled=False, params=params)
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state.with_position = True
+        strategy.setup_grid("SOL/USD", 100.0, ctx)
+        return strategy, ctx, state
+
+    def test_runner_buy_fill_trails_instead_of_next_level(self):
+        """Bei Hard-Uptrend: Sell = entry + 3×ATR mit runner-Flag statt nächstem Level."""
+        from core.strategy import Fill
+        strategy, ctx, state = self._runner_strategy(runner=True)
+        state._hard_trend_up = True
+        state._atr = 2.0
+
+        cid, order = next((c, o) for c, o in state.orders.items() if o["side"] == "buy")
+        fill = Fill(client_id=cid, symbol="SOL/USD", side="buy",
+                    price=order["price"], qty=order["qty"], fee=0.0, ts=time.time())
+        strategy.on_fill(fill, ctx)
+
+        runner_sells = [o for o in state.orders.values()
+                        if o["side"] == "sell" and o.get("runner")]
+        assert len(runner_sells) == 1
+        assert runner_sells[0]["price"] == pytest.approx(order["price"] + 3.0 * 2.0)
+        assert "sl_price" in runner_sells[0]
+
+    def test_no_runner_without_uptrend(self):
+        """Ohne Hard-Uptrend bleibt der Sell am nächsten Grid-Level (kein runner-Flag)."""
+        from core.strategy import Fill
+        strategy, ctx, state = self._runner_strategy(runner=True)
+        state._hard_trend_up = False
+        state._atr = 2.0
+
+        cid, order = next((c, o) for c, o in state.orders.items() if o["side"] == "buy")
+        fill = Fill(client_id=cid, symbol="SOL/USD", side="buy",
+                    price=order["price"], qty=order["qty"], fee=0.0, ts=time.time())
+        strategy.on_fill(fill, ctx)
+
+        assert not any(o.get("runner") for o in state.orders.values()
+                       if o["side"] == "sell")
+
+    def test_leverage_clamped_at_five(self):
+        """set_leverage clampt jetzt auf 5.0 (vorher 3.0)."""
+        from dashboard.db import get_leverage, set_leverage
+        before = get_leverage()
+        try:
+            set_leverage(8.0)
+            assert get_leverage() == pytest.approx(5.0)
+            set_leverage(4.0)
+            assert get_leverage() == pytest.approx(4.0)
+        finally:
+            set_leverage(before)

@@ -33,29 +33,47 @@ LEVERAGE = 3.0          # pinned so results don't depend on the live dashboard D
 WARMUP_CANDLES = 60     # run_backtest skips the first 60 candles
 
 
-def build_param_grid() -> list:
+def build_param_grid(aggressive: bool = False) -> list:
     """Ehrlicher Post-Phantom-Sweep (Review 2026-07-02): wenige, orthogonale Achsen.
 
     - sl_mode: floor vs per_position — der nie sauber OOS-verglichene Kern-Streit
     - min_step_fee_multiple: der real bindende Geometrie-Parameter (pinnt den Step
       auf 2×fee×mult in allen Regimen); war nie gesweept
     Directional bleibt AUS (5 Familien negativ getestet), momentum_hold 0.
+
+    aggressive=True (Aggressiv-Paket 2026-07-13) erweitert um:
+    - dca_size_mult {1.0, 1.3, 1.6}: Martingale-Sizing auf tiefe Levels
+    - runner {aus, an mit tp=3 ATR}: Gewinner trailen statt am Level kappen
+    - leverage {3, 5}
     """
     sl_variants = [
         {"sl_mode": "per_position"},
         {"sl_mode": "floor", "floor_sl_atr_mult": 1.0},
     ]
+    if aggressive:
+        dca_axis = [1.0, 1.3, 1.6]
+        runner_axis = [{"runner_enabled": False},
+                       {"runner_enabled": True, "runner_tp_atr": 3.0}]
+        lev_axis = [3.0, 5.0]
+    else:
+        dca_axis = [1.0]
+        runner_axis = [{"runner_enabled": False}]
+        lev_axis = [LEVERAGE]
+
     grid = []
-    for sl, step_mult in itertools.product(sl_variants, [2.0, 3.0, 4.0, 6.0]):
+    for sl, step_mult, dca, runner, lev in itertools.product(
+            sl_variants, [2.0, 3.0, 4.0, 6.0], dca_axis, runner_axis, lev_axis):
         cfg = {
             **sl,
+            **runner,
             "min_step_fee_multiple": step_mult,
+            "dca_size_mult": dca,
             "momentum_hold_max": 0,
             "trend_filter_enabled": True,
             "min_step_pct": 0.006,
             "max_inventory_notional_mult": 1.5,
             "directional_enabled": False,
-            "leverage": LEVERAGE,
+            "leverage": lev,
         }
         grid.append(cfg)
     return grid
@@ -140,6 +158,15 @@ def main():
                              "Testphase (der alte Sweep filterte alle floor-Configs vor OOS raus)")
     parser.add_argument("--max-dd", type=float, default=-15.0)
     parser.add_argument("--min-trades", type=int, default=100)
+    parser.add_argument("--symbol", action="append", dest="symbols", default=None,
+                        help="Nur diese(s) Symbol(e) sweepen (mehrfach angebbar). "
+                             "Default: alle. (nightly_tune.py übergibt --symbol — "
+                             "war vorher ein argparse-Crash)")
+    parser.add_argument("--rank-by", choices=["calmar", "return"], default="calmar",
+                        help="return: Ranking nach median_return statt Calmar "
+                             "(Aggressiv-Paket; --max-dd entsprechend lockern, z.B. -35)")
+    parser.add_argument("--aggressive", action="store_true",
+                        help="Aggressiv-Achsen aktivieren: dca_size_mult, runner, leverage 5")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -153,10 +180,15 @@ def main():
     rebuild_every = max(1, 900 // tf_sec)
     log.info("Timeframe %s → rebuild_every=%d Candles", args.timeframe, rebuild_every)
 
+    symbols = args.symbols or SYMBOLS
+    rank_key = "median_calmar" if args.rank_by == "calmar" else "median_return"
+    log.info("Symbole: %s | Ranking: %s%s", symbols, rank_key,
+             " | AGGRESSIV-Achsen aktiv" if args.aggressive else "")
+
     # Pre-warm OHLCV cache serially (avoid concurrent Binance fetches)
     from backtest.data import load_ohlcv
     dfs = {}
-    for s in SYMBOLS:
+    for s in symbols:
         dfs[s] = load_ohlcv(s, args.timeframe, args.days)
         log.info("Data %s: %d candles (%s → %s)", s, len(dfs[s]),
                  dfs[s].index[0], dfs[s].index[-1])
@@ -168,17 +200,17 @@ def main():
     test_start = split_ts - datetime.timedelta(seconds=WARMUP_CANDLES * tf_sec)
     log.info("Train: %s → %s | Test (OOS): %s → %s", data_start, split_ts, split_ts, data_end)
 
-    grid = build_param_grid()
+    grid = build_param_grid(aggressive=args.aggressive)
     log.info("Param grid: %d configs × %d symbols = %d train runs",
-             len(grid), len(SYMBOLS), len(grid) * len(SYMBOLS))
+             len(grid), len(symbols), len(grid) * len(symbols))
 
     train_jobs = [
         (i, cfg, sym, "train", data_start, split_ts)
-        for i, cfg in enumerate(grid) for sym in SYMBOLS
+        for i, cfg in enumerate(grid) for sym in symbols
     ]
 
     with Pool(args.jobs, initializer=_init_worker,
-              initargs=(SYMBOLS, args.days, args.timeframe, rebuild_every)) as pool:
+              initargs=(symbols, args.days, args.timeframe, rebuild_every)) as pool:
         train_results = pool.map(_run_one, train_jobs)
 
         errors = [r for r in train_results if "error" in r]
@@ -192,9 +224,9 @@ def main():
                 if a["worst_dd"] > args.max_dd
                 and a["total_trades"] >= args.min_trades
                 and not a["any_halted"]
-                and a["n_symbols"] == len(SYMBOLS)
+                and a["n_symbols"] == len(symbols)
             ),
-            key=lambda kv: kv[1]["median_calmar"], reverse=True,
+            key=lambda kv: kv[1][rank_key], reverse=True,
         )
         log.info("%d/%d configs pass constraints (worst_dd > %s%%, trades ≥ %d, no halt)",
                  len(ranked), len(agg), args.max_dd, args.min_trades)
@@ -220,14 +252,14 @@ def main():
 
         oos_jobs = [
             (cid, agg[cid]["params"], sym, "test", test_start, data_end)
-            for cid, _ in top for sym in SYMBOLS
+            for cid, _ in top for sym in symbols
         ]
         oos_results = pool.map(_run_one, oos_jobs)
 
     oos_agg = aggregate(oos_results)
     final = sorted(
         ((cid, oos_agg[cid]) for cid, _ in top if cid in oos_agg),
-        key=lambda kv: kv[1]["median_calmar"], reverse=True,
+        key=lambda kv: kv[1][rank_key], reverse=True,
     )
 
     # ── Outputs ──────────────────────────────────────────────────────────
@@ -242,15 +274,16 @@ def main():
                         "params": json.dumps(r["params"])})
 
     lines = ["# Sweep Report (ehrliche Metriken — ohne Phantom-PnL, ab Commit e5170a4)", "",
-             f"Symbole: {', '.join(SYMBOLS)} | {args.days}d @ {args.timeframe} "
-             f"(Train {args.train_days}d / Test {args.days - args.train_days}d) | Leverage {LEVERAGE}× "
-             f"| rebuild_every={rebuild_every}", "",
-             "## Top-Configs: Train vs. OOS (Ranking nach OOS-median-Calmar)", "",
+             f"Symbole: {', '.join(symbols)} | {args.days}d @ {args.timeframe} "
+             f"(Train {args.train_days}d / Test {args.days - args.train_days}d) "
+             f"| rebuild_every={rebuild_every} | Ranking: {rank_key}", "",
+             "## Top-Configs: Train vs. OOS", "",
              "| # | cfg | OOS Calmar | OOS Ret% | OOS worstDD | Train Calmar | Train Ret% | Params |",
              "|---|-----|-----------|----------|-------------|--------------|------------|--------|"]
     for rank, (cid, oos) in enumerate(final, 1):
         tr = agg[cid]
-        p = {k: v for k, v in oos["params"].items() if k != "leverage"}
+        # leverage bleibt sichtbar — ist seit dem Aggressiv-Paket eine Sweep-Achse
+        p = dict(oos["params"])
         lines.append(
             f"| {rank} | {cid} | {oos['median_calmar']:.2f} | {oos['median_return']:.1f} "
             f"| {oos['worst_dd']:.1f} | {tr['median_calmar']:.2f} | {tr['median_return']:.1f} "

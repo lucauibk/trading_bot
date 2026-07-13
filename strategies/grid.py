@@ -40,10 +40,21 @@ NO_DIRECTIONAL_HOURS = frozenset({5, 6, 7, 8})   # UTC hours with negative EV
 
 
 def _calc_level_allocations(grid_lines: list, current_price: float,
-                             investment: float, direction_score: float) -> dict:
-    """Non-uniform budget allocation: bullish → more on lower buy levels (DCA into dips)."""
+                             investment: float, direction_score: float,
+                             dca_mult: float = 1.0) -> dict:
+    """Non-uniform budget allocation: bullish → more on lower buy levels (DCA into dips).
+
+    dca_mult > 1.0 (Aggressiv-Paket): Martingale-artiges Sizing — Level i von
+    oben gewichtet mit dca_mult^depth, unterste Linie bekommt am meisten.
+    Rebounds nach Dips zahlen überproportional; Crash-Risiko steigt entsprechend
+    (Rails: fast_drop, trend_filter, per-Pos-SL-Cap, max_inventory_notional_mult).
+    """
     n = len(grid_lines)
-    if not ADAPTIVE_SIZING or abs(direction_score) < 0.05 or n == 0:
+    if n == 0:
+        return {}
+    use_score = ADAPTIVE_SIZING and abs(direction_score) >= 0.05
+    use_dca = dca_mult > 1.0
+    if not use_score and not use_dca:
         base = investment / n
         return {p: base for p in grid_lines}
 
@@ -52,11 +63,17 @@ def _calc_level_allocations(grid_lines: list, current_price: float,
     weights = []
     for i, price in enumerate(sorted_lines):
         rank = i / (n - 1) if n > 1 else 0.5  # 0 = lowest level, 1 = highest
-        if direction_score >= 0:
+        if not use_score:
+            w = 1.0
+        elif direction_score >= 0:
             w = 1.0 + bias * (0.5 - rank) * 2       # bullish: boost lower levels
         else:
             w = 1.0 + abs(bias) * (rank - 0.5) * 2  # bearish: boost upper levels
-        weights.append(max(0.2, w))
+        w = max(0.2, w)
+        if use_dca:
+            depth = (n - 1 - i)  # 0 = oberste Linie, n-1 = unterste
+            w *= dca_mult ** depth
+        weights.append(w)
 
     total_w = sum(weights)
     return {p: w / total_w * investment for p, w in zip(sorted_lines, weights)}
@@ -115,6 +132,7 @@ class _GridState:
         self.grid_lower: float = 0.0
         self.floor_sl: float = 0.0
         self._hard_trend_down: bool = False
+        self._hard_trend_up: bool = False   # Runner-Trigger (preisbasiert, EMA/ADX)
         self._trend_up_count: int = 0
         self._fast_drop_active: bool = False   # set on fast-drop → longer resume confirmation
 
@@ -225,6 +243,11 @@ class GridStrategy(Strategy):
             fast_drop = recent_ret <= -self.p.fast_drop_pct
 
         hard_down = fast_drop or (ema9 < ema21 < ema50) or (adx > self.p.trend_adx_min and di_minus > di_plus)
+
+        # Runner-Trigger: bestätigter Hard-Uptrend (Gegenstück zu hard_down).
+        # Preisbasiert statt ML-Score, damit er auch im Backtest/Sweep feuert.
+        state._hard_trend_up = (not hard_down and ema9 > ema21 > ema50
+                                and adx > self.p.trend_adx_min and di_plus > di_minus)
         if hard_down:
             if not state._hard_trend_down:
                 logger.info("[TREND] %s hard downtrend → grid buys paused%s",
@@ -522,7 +545,14 @@ class GridStrategy(Strategy):
         except ValueError:
             idx = None
 
-        if idx is not None and idx < len(state.grid_lines) - 1:
+        runner = (self.p.runner_enabled and state._hard_trend_up and state._atr > 0)
+        if runner:
+            # Runner-Modus (Aggressiv-Paket): im bestätigten Uptrend den Gewinn
+            # nicht am nächsten Grid-Level kappen — Limit-Sell weit oben als
+            # Deckel, der Trailing-SL (_update_trailing_stops: Breakeven bei
+            # +1 ATR, Trail 1.5 ATR) sichert den Gewinn nach unten.
+            sell_price = buy_price + self.p.runner_tp_atr * state._atr
+        elif idx is not None and idx < len(state.grid_lines) - 1:
             sell_price = state.grid_lines[idx + 1]
         else:
             # Buy am obersten Grid-Level oder off-grid (z.B. Replenish an der
@@ -569,9 +599,11 @@ class GridStrategy(Strategy):
             "trailing_activated": False,
             "momentum_holds": 0,
             "entry_ts": time.time(),
+            "runner": runner,
         }
         state.price_to_id[sell_price] = sell_cid
-        logger.info("[GRID] BUY fill %s @ %.4f | SL=%.4f | -> sell @ %.4f",
+        logger.info("[%s] BUY fill %s @ %.4f | SL=%.4f | -> sell @ %.4f",
+                    "RUNNER" if runner else "GRID",
                     fill.symbol, buy_price, sl_price, sell_price)
 
         ctx.add_position(Position(
@@ -850,14 +882,21 @@ class GridStrategy(Strategy):
                 state.total_profit += net
                 state.trade_count += 1
                 order["filled"] = True
-                logger.warning("[SL] %s @ %.4f | bought @ %.4f | net=%.4f",
+                # Runner-Positionen exiten planmäßig über den getrailten SL —
+                # das ist ein Gewinn-Lock, kein Stop-Loss; eigener reason fürs
+                # Pattern-Mining.
+                exit_reason = ("runner_trail"
+                               if order.get("runner") and order.get("trailing_activated")
+                               else "stop_loss")
+                logger.warning("[%s] %s @ %.4f | bought @ %.4f | net=%.4f",
+                               "RUNNER-EXIT" if exit_reason == "runner_trail" else "SL",
                                symbol, price, buy_price, net)
                 try:
                     if os.getenv("GRIDBOT_BACKTEST"):
                         raise ImportError("backtest: dashboard logging disabled")
                     from dashboard.db import log_trade
                     log_trade(symbol, "SELL", buy_price, price, net,
-                              "stop_loss", "grid", "paper",
+                              exit_reason, "grid", "paper",
                               context={
                                   "regime": state._last_regime,
                                   "ml_prediction": state._last_prediction,
@@ -1042,9 +1081,11 @@ class GridStrategy(Strategy):
             atr = state._atr if state._atr > 0 else price * 0.02
             state.floor_sl = max(lower - self.p.floor_sl_atr_mult * atr, 0.0)
 
-        # Adaptive sizing: more budget on lower levels when bullish
+        # Adaptive sizing: more budget on lower levels when bullish;
+        # dca_size_mult > 1 legt zusätzlich Martingale-Gewichtung auf die Tiefe.
         allocations = _calc_level_allocations(grid_lines, price, state.investment,
-                                              state._direction_score)
+                                              state._direction_score,
+                                              dca_mult=self.p.dca_size_mult)
 
         # Preserve open positions through rebuild (real filled buys with pending sells).
         # Excludes pre_seeded sells: those are placeholder walls, not real positions,
