@@ -5,6 +5,8 @@ from typing import Callable, Dict, List, Optional
 
 import ta as ta_lib
 
+from config import LLM_ANALYST_ENABLED
+
 from .data_store import MLDataStore
 from .features import extract_features
 from .features.combined import extract_all as extract_all_features, ALL_FEATURE_NAMES
@@ -159,9 +161,12 @@ class MLPredictor:
                         ) if f.exception() else None
                     )
 
-            # LLM-Analyse (gecacht, ~1×/Stunde pro Coin)
-            llm_indicators = self._build_llm_indicators(df, symbol)
-            llm_result = llm_analyse(symbol, llm_indicators)
+            # LLM-Analyse (gecacht, ~1×/Stunde pro Coin) — nur wenn aktiviert,
+            # sonst reines LGBM (blend_scores/Logging behandeln None bereits).
+            llm_result = None
+            if LLM_ANALYST_ENABLED:
+                llm_indicators = self._build_llm_indicators(df, symbol)
+                llm_result = llm_analyse(symbol, llm_indicators)
 
             # Blending: LightGBM + Claude Haiku
             blended_score, blended_conf = blend_scores(lgbm_score, lgbm_conf, llm_result)

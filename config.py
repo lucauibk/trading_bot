@@ -38,6 +38,13 @@ MIN_VOLUME_USDT = 1_000_000   # mind. 1M USDT Volumen in letzter Stunde
 # ── Kapital ───────────────────────────────────────────────────────────────────
 INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "1000"))
 
+# ── ML / LLM ──────────────────────────────────────────────────────────────────
+# LLM-Analyst (Claude Haiku) fürs Score-Blending. Default AUS (Entscheidung
+# 2026-07-13): das Blending lag 786/786-mal unter MIN_CONFIDENCE und hat nie
+# einen Trade beeinflusst — nur API-Kosten + Loop-Latenz. LightGBM sammelt
+# weiter passiv Trainingsdaten. Reaktivieren: LLM_ANALYST_ENABLED=true in .env.
+LLM_ANALYST_ENABLED = os.getenv("LLM_ANALYST_ENABLED", "false").lower() == "true"
+
 # ── Telegram ──────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
