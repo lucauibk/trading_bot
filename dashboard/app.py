@@ -6,6 +6,7 @@ Aufruf: python3 dashboard/app.py
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -33,6 +34,14 @@ def no_cache(response):
 
 # ── Bot starten / stoppen ─────────────────────────────────────────────────────
 
+def _keep_awake(pid: int):
+    """macOS: Idle-Sleep verhindern solange der Bot-Prozess lebt (caffeinate -w
+    endet mit ihm). Auf Linux/Raspberry Pi existiert caffeinate nicht → no-op."""
+    if shutil.which("caffeinate"):
+        subprocess.Popen(["caffeinate", "-i", "-w", str(pid)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 @app.route("/api/bot/start", methods=["POST"])
 def api_start():
     global _bot_process
@@ -58,6 +67,7 @@ def api_start():
     cmd = [sys.executable, "main.py", "--mode", mode, "--no-confirm"]
     _bot_process = subprocess.Popen(cmd, cwd=str(_ROOT))
     (_ROOT / ".bot.pid").write_text(str(_bot_process.pid))
+    _keep_awake(_bot_process.pid)
 
     set_status(running=True, mode=mode, strategy="grid")
     return jsonify({"ok": True,
@@ -142,6 +152,7 @@ def api_restart():
     global _bot_process
     _bot_process = subprocess.Popen(cmd, cwd=str(_ROOT))
     (_ROOT / ".bot.pid").write_text(str(_bot_process.pid))
+    _keep_awake(_bot_process.pid)
     set_status(running=True, mode=mode, strategy="grid")
     return jsonify({"ok": True, "msg": f"Bot neu gestartet ({mode.upper()})"})
 

@@ -23,6 +23,7 @@ venv/
 # PID-Files
 .dashboard.pid
 .bot.pid
+.bot.stopped
 
 # Sweep-Ergebnisse (auto-generiert)
 results/

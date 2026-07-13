@@ -23,10 +23,12 @@ err()  { echo -e "${RED}[error]${NC} $*"; exit 1; }
 # -- Argumente --
 START_BOT=false
 BOT_MODE="paper"
+OPEN_BROWSER=true
 for arg in "$@"; do
   case $arg in
     --bot)  START_BOT=true ;;
     --live) START_BOT=true; BOT_MODE="live" ;;
+    --no-browser) OPEN_BROWSER=false ;;
   esac
 done
 
@@ -41,6 +43,9 @@ if [ "$BOT_MODE" = "live" ]; then
 fi
 
 mkdir -p "$LOG_DIR"
+
+# Watchdog-Marker entfernen: Bot soll (wieder) laufen
+rm -f "$ROOT/.bot.stopped"
 
 # -- Dashboard starten falls nicht schon laufend --
 dashboard_running() {
@@ -98,16 +103,23 @@ if $START_BOT; then
     nohup "$PYTHON" main.py --mode "$BOT_MODE" --no-confirm \
       > "$LOG_DIR/trading_bot.log" 2>&1 &
     echo $! > "$BOT_PIDFILE"
+    # macOS: Idle-Sleep verhindern solange der Bot lebt (-w endet mit dem Bot).
+    # Auf Linux/Raspberry Pi gibt es caffeinate nicht -> kein Wrapper noetig.
+    if command -v caffeinate >/dev/null 2>&1; then
+      nohup caffeinate -i -w "$(cat "$BOT_PIDFILE")" >/dev/null 2>&1 &
+    fi
     info "Bot-PID: $(cat "$BOT_PIDFILE") | Log: logs/trading_bot.log"
   fi
 fi
 
 # -- Browser oeffnen --
 URL="http://localhost:$DASHBOARD_PORT"
-if command -v open >/dev/null 2>&1; then
-  open "$URL"
-elif command -v xdg-open >/dev/null 2>&1; then
-  xdg-open "$URL"
+if $OPEN_BROWSER; then
+  if command -v open >/dev/null 2>&1; then
+    open "$URL"
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$URL"
+  fi
 fi
 
 # -- Status-Ausgabe --

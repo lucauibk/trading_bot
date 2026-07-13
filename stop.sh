@@ -36,6 +36,9 @@ stop_pid() {
   fi
 }
 
+# Marker für den Watchdog: bewusst gestoppt → nicht automatisch neu starten
+touch "$ROOT/.bot.stopped"
+
 stop_pid "Bot"       "$BOT_PIDFILE"
 stop_pid "Dashboard" "$PIDFILE"
 
