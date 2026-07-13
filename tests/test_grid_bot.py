@@ -762,3 +762,50 @@ class TestP0Fixes:
         assert state.orders[cid]["momentum_holds"] == 1
         strategy._check_position_stops("SOL/USD", 96.0, state, ctx)  # Recovery → Reset
         assert state.orders[cid]["momentum_holds"] == 0
+
+
+# ── Fixes 2026-07-13 (#115, #149) ─────────────────────────────────────────────
+
+class TestFixes20260713:
+
+    def test_sell_only_survives_prediction_refresh(self):
+        """#115: wait_fills-Stop darf von der nächsten Prediction nicht
+        re-armed werden — sell_only hält with_position dauerhaft auf False."""
+        from core.context import MarketContext
+        from strategies.grid import GridStrategy
+        strategy = GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                                ml_enabled=False)
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+
+        state.with_position = False
+        state.sell_only = True
+
+        # Simuliert _refresh_prediction mit bullischer Prediction:
+        state._last_prediction = "up"
+        state.with_position = ("up" != "down") and not state.sell_only
+        assert state.with_position is False
+        assert strategy._buys_allowed(state) is False
+
+    def test_paper_broker_unseeded_symbol_has_no_hidden_pool(self):
+        """#149: Bei Symbol-Buckets darf ein ungeseedetes Symbol nicht gegen
+        einen verdeckten Voll-Pool handeln; get_balance bleibt konsistent."""
+        from execution.paper import PaperBroker
+        broker = PaperBroker(initial_balance=1000.0, symbols=["SOL/USD", "ETH/USD"])
+
+        assert broker.get_balance() == pytest.approx(1000.0)
+        # Ungeseedetes Symbol hat 0 Budget statt Zugriff auf 1000:
+        assert broker._sym_balance("DOGE/USD") == 0.0
+
+        # Credits eines ungeseedeten Symbols landen sichtbar in get_balance:
+        broker._credit("DOGE/USD", 50.0)
+        assert broker.get_balance() == pytest.approx(1050.0)
+
+    def test_paper_broker_single_pool_unchanged(self):
+        """#149-Regression: ohne symbols bleibt der Single-Pool-Modus intakt."""
+        from execution.paper import PaperBroker
+        broker = PaperBroker(initial_balance=500.0)
+        assert broker.get_balance() == pytest.approx(500.0)
+        broker._deduct("SOL/USD", 100.0)
+        assert broker.get_balance() == pytest.approx(400.0)

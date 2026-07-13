@@ -98,6 +98,9 @@ class _GridState:
         self._last_pred_low = 0.0
         self._last_pred_high = 0.0
         self.with_position = False
+        # Sell-Only-Modus (graceful "wait_fills"-Stop): dauerhaft, wird von
+        # _refresh_prediction NICHT überschrieben (#115).
+        self.sell_only = False
 
         # Directional trade state
         self._directional: dict = {}
@@ -256,7 +259,7 @@ class GridStrategy(Strategy):
         return total
 
     def _buys_allowed(self, state: _GridState) -> bool:
-        if not state.with_position:
+        if state.sell_only or not state.with_position:
             return False
         if self.p.trend_filter_enabled and state._hard_trend_down:
             return False
@@ -306,7 +309,8 @@ class GridStrategy(Strategy):
 
         state._last_prediction = direction
         state._direction_score = score
-        state.with_position = direction != "down"
+        # sell_only (graceful wait_fills-Stop) darf nie re-armed werden (#115)
+        state.with_position = (direction != "down") and not state.sell_only
 
     def _build_grid_params(self, symbol: str, price: float, state: _GridState):
         """Compute (lower, upper, levels, range_pct, regime, confidence)."""

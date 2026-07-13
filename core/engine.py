@@ -220,14 +220,17 @@ class Engine:
             # (der Live-Reconciler läuft ebenfalls unbedingt; #46).
             self.process_paper_fills(sym, price)
 
-            # Safety ticks (SL/TP) run even during freeze
-            if hasattr(self.strategy, "on_tick_safety"):
-                try:
-                    self.strategy.on_tick_safety(sym, price, self.ctx)
-                except Exception as e:
-                    logger.warning("on_tick_safety failed %s: %s", sym, e)
-
-            if not self.ctx.is_frozen():
+            # Safety ticks (SL/TP) laufen auch während Freeze — aber nur, wenn
+            # on_tick() nicht ohnehin läuft: on_tick() enthält dieselben
+            # Stop-Checks, doppelte Ausführung verbraucht das momentum_hold-
+            # Budget in einem Tick statt über mehrere (#146).
+            if self.ctx.is_frozen():
+                if hasattr(self.strategy, "on_tick_safety"):
+                    try:
+                        self.strategy.on_tick_safety(sym, price, self.ctx)
+                    except Exception as e:
+                        logger.warning("on_tick_safety failed %s: %s", sym, e)
+            else:
                 self.strategy.on_tick(sym, price, self.ctx)
 
             # For live mode: reconcile fills from exchange (paper has no reconciler)
@@ -408,6 +411,10 @@ class Engine:
                 state = getattr(self.strategy, "get_state", lambda s: None)(sym)
                 if state:
                     state.with_position = False
+                    # Persistent — with_position wird von _refresh_prediction
+                    # jede ~75s neu gesetzt und würde den Sell-Only-Modus
+                    # sonst still wieder aufheben (#115).
+                    state.sell_only = True
             self._waiting_for_fills = True
             logger.info("Dashboard: wait_fills – sell-only mode active, will stop when all filled")
 

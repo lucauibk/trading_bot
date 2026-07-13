@@ -46,11 +46,15 @@ class PaperBroker(Broker):
         if symbols:
             per_coin = initial_balance / len(symbols)
             self._balances: Dict[str, float] = {s: per_coin for s in symbols}
+            # Buckets summieren sich bereits auf initial_balance — der Fallback-
+            # Pool MUSS 0 sein, sonst kann ein ungeseedetes Symbol (Mismatch,
+            # nachträglich aktivierter Coin) verdeckt das ganze Konto nochmal
+            # ausgeben, unsichtbar für get_balance() (#149).
+            self._balance: float = 0.0
         else:
             self._balances = {}
-
-        # Fallback single-pool (used when symbol not in _balances)
-        self._balance: float = initial_balance
+            # Single-Pool-Modus (kein Symbol-Seeding)
+            self._balance = initial_balance
 
         self._orders:          Dict[str, BrokerOrder] = {}
         self._fill_callbacks:  list                   = []
@@ -60,17 +64,22 @@ class PaperBroker(Broker):
 
     def _sym_balance(self, symbol: str) -> float:
         """Free cash available for *symbol*."""
-        return self._balances.get(symbol, self._balance)
+        if self._balances:
+            # Bucket-Modus: unbekanntes Symbol hat 0 Budget (kein verdeckter
+            # Vollzugriff auf den Gesamtpool, #149); ein Bucket entsteht erst
+            # durch _credit (z.B. Verkauf von Alt-Bestand).
+            return self._balances.get(symbol, 0.0)
+        return self._balance
 
     def _deduct(self, symbol: str, amount: float) -> None:
-        if symbol in self._balances:
-            self._balances[symbol] -= amount
+        if self._balances:
+            self._balances[symbol] = self._balances.get(symbol, 0.0) - amount
         else:
             self._balance -= amount
 
     def _credit(self, symbol: str, amount: float) -> None:
-        if symbol in self._balances:
-            self._balances[symbol] += amount
+        if self._balances:
+            self._balances[symbol] = self._balances.get(symbol, 0.0) + amount
         else:
             self._balance += amount
 

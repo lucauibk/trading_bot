@@ -260,6 +260,15 @@ def main():
     if final:
         winner_id, winner = final[0]
         (out_dir / "winner.json").write_text(json.dumps(winner["params"], indent=2))
+        # Metriken maschinenlesbar — nightly_tune.py liest den Calmar hieraus
+        # statt fehleranfällig Logzeilen zu scrapen (#128: Logs gehen nach
+        # stderr, und split()[-1] hätte den Worst-DD statt Calmar geparst).
+        (out_dir / "winner_meta.json").write_text(json.dumps({
+            "config_id": winner_id,
+            "median_calmar": winner["median_calmar"],
+            "median_return": winner["median_return"],
+            "worst_dd": winner["worst_dd"],
+        }, indent=2))
         log.info("WINNER cfg %d: %s", winner_id, winner["params"])
         log.info("OOS: median calmar %.2f | median return %.1f%% | worst DD %.1f%%",
                  winner["median_calmar"], winner["median_return"], winner["worst_dd"])

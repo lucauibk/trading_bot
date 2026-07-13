@@ -46,7 +46,11 @@ def _keep_awake(pid: int):
 def api_start():
     global _bot_process
 
-    if _bot_process and _bot_process.poll() is None:
+    # _is_running() statt nur _bot_process: erkennt auch einen extern (start.sh/
+    # Watchdog) gestarteten Bot via PID-File — sonst spawnt "Start" einen
+    # Doppel-Bot und überschreibt .bot.pid mit der PID des sofort am
+    # Singleton-Lock sterbenden Kindes (#162).
+    if _is_running():
         return jsonify({"ok": False, "msg": "Bot läuft bereits"})
 
     data = request.get_json() or {}
@@ -294,14 +298,18 @@ def api_leverage_get():
 
 @app.route("/api/leverage", methods=["POST"])
 def api_leverage_set():
-    from dashboard.db import set_leverage
+    from dashboard.db import get_leverage, set_leverage
     data = request.get_json() or {}
-    val = float(data.get("leverage", 1.0))
-    # Clamp: negative/0 Leverage würde im PaperBroker die Buy-Kosten negativ
-    # machen (Balance-Gutschrift beim Kauf, #37).
-    val = max(1.0, min(val, 10.0))
+    try:
+        val = float(data.get("leverage", 1.0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "msg": "Ungültiger Leverage-Wert"}), 400
+    # set_leverage clampt auf [1.0, 3.0] (#37); den tatsächlich gespeicherten
+    # Wert zurücklesen statt den rohen Input zu echoen — sonst zeigt das
+    # Dashboard z.B. 8× während der Bot mit 3× läuft (#150).
     set_leverage(val)
-    return jsonify({"ok": True, "leverage": val, "msg": f"Hebel auf {val:.1f}× gesetzt"})
+    actual = get_leverage()
+    return jsonify({"ok": True, "leverage": actual, "msg": f"Hebel auf {actual:.1f}× gesetzt"})
 
 
 @app.route("/api/capital", methods=["GET"])

@@ -127,23 +127,24 @@ def run_sweep(symbols: List[str]) -> Tuple[Optional[Dict], str]:
                  "--days", "180", "--train-days", "120", "--jobs", "4"],
                 capture_output=True, text=True, timeout=900,
             )
-            parts.append(f"### {sym}\n\n```\n{r.stdout[-3000:]}\n```\n")
+            # sweep.py loggt via logging → stderr; stdout ist praktisch leer (#128)
+            output = (r.stdout + r.stderr)[-3000:]
+            parts.append(f"### {sym}\n\n```\n{output}\n```\n")
 
             results_dirs = sorted((ROOT / "results").glob("sweep_*"))
             if results_dirs:
                 winner_file = results_dirs[-1] / "winner.json"
-                if winner_file.exists():
+                meta_file = results_dirs[-1] / "winner_meta.json"
+                if winner_file.exists() and meta_file.exists():
                     w = json.loads(winner_file.read_text())
-                    for line in r.stdout.splitlines():
-                        if "median calmar" in line.lower():
-                            try:
-                                calmar = float(line.split()[-1])
-                                if calmar > best_calmar:
-                                    best_calmar = calmar
-                                    best_params = w
-                                    log.info("New best config from %s: Calmar=%.2f", sym, calmar)
-                            except Exception:
-                                pass
+                    try:
+                        calmar = float(json.loads(meta_file.read_text())["median_calmar"])
+                    except (KeyError, ValueError, json.JSONDecodeError):
+                        calmar = None
+                    if calmar is not None and calmar > best_calmar:
+                        best_calmar = calmar
+                        best_params = w
+                        log.info("New best config from %s: Calmar=%.2f", sym, calmar)
         except subprocess.TimeoutExpired:
             parts.append(f"### {sym}\n\nTimeout (>15 min) — skipped.\n")
         except Exception as e:
