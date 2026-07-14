@@ -15,7 +15,22 @@ stop_pid() {
     local pid
     pid=$(cat "$pidfile")
     if kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" && info "$name gestoppt (PID $pid)."
+      kill "$pid"
+      # Auf ECHTES Prozess-Ende warten: der Graceful-Shutdown beendet erst
+      # seine laufende Loop-/Bootstrap-Iteration (30-60s) und haelt solange
+      # den Singleton-Lock. Ohne Warten startet ein direkt folgendes
+      # start.sh in die Lock-Kollision und der neue Bot stirbt leise
+      # (Befund 2026-07-14).
+      local waited=0
+      while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 60 ]; do
+        sleep 1; waited=$((waited + 1))
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        warn "$name reagiert nach ${waited}s nicht auf SIGTERM — SIGKILL."
+        kill -9 "$pid" 2>/dev/null
+        sleep 1
+      fi
+      info "$name gestoppt (PID $pid, nach ${waited}s beendet)."
     else
       warn "$name war nicht mehr aktiv."
     fi
