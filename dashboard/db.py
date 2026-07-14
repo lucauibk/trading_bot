@@ -204,6 +204,7 @@ def _init(con: sqlite3.Connection):
         ("frozen", "INTEGER DEFAULT 0"),
         ("frozen_reason", "TEXT DEFAULT NULL"),
         ("paper_balances", "TEXT DEFAULT NULL"),
+        ("open_positions", "TEXT DEFAULT NULL"),
     ]:
         try:
             con.execute(f"ALTER TABLE bot_status ADD COLUMN {col} {coldef}")
@@ -602,9 +603,10 @@ def save_paper_balances(balances: dict) -> None:
 def clear_paper_balances() -> None:
     """Gespeicherte Paper-Balances verwerfen — nächster Start beginnt frisch
     mit dem konfigurierten Startkapital (nötig nach Kapital-Änderung, sonst
-    überschreibt der Balance-Restore in main.py das neue Kapital)."""
+    überschreibt der Balance-Restore in main.py das neue Kapital).
+    Offene Positionen gehören zur selben Session → ebenfalls verwerfen."""
     con = get_conn()
-    con.execute("UPDATE bot_status SET paper_balances=NULL WHERE id=1")
+    con.execute("UPDATE bot_status SET paper_balances=NULL, open_positions=NULL WHERE id=1")
     con.commit()
     con.close()
 
@@ -616,6 +618,31 @@ def load_paper_balances():
     con.close()
     if row and row["paper_balances"]:
         return json.loads(row["paper_balances"])
+    return None
+
+
+def save_open_positions(positions: dict) -> None:
+    """Offene Grid-Positionen (Sell-Orders mit bought_at) persistieren.
+
+    Ohne das strandet bei jedem Restart die Margin offener Positionen im
+    Nirwana: Buckets sind reduziert, aber die Position existierte nur im
+    Speicher — kein Sell bucht sie je zurück (Leak-Fund 2026-07-14: ~8.7 USDT
+    durch drei Restarts mit offenen ETH/LINK-Positionen)."""
+    import json
+    con = get_conn()
+    con.execute("UPDATE bot_status SET open_positions=? WHERE id=1",
+                (json.dumps(positions),))
+    con.commit()
+    con.close()
+
+
+def load_open_positions():
+    import json
+    con = get_conn()
+    row = con.execute("SELECT open_positions FROM bot_status WHERE id=1").fetchone()
+    con.close()
+    if row and row["open_positions"]:
+        return json.loads(row["open_positions"])
     return None
 
 

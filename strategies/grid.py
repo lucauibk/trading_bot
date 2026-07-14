@@ -1160,6 +1160,65 @@ class GridStrategy(Strategy):
     def get_state(self, symbol: str) -> Optional[_GridState]:
         return self._states.get(symbol)
 
+    # ── Restart-Persistenz offener Positionen (Leak-Fix 2026-07-14) ──────
+    # Buckets werden über Restarts persistiert, die Positionen lebten aber nur
+    # im Speicher → Margin offener Buys strandete bei jedem Restart dauerhaft.
+
+    _POSITION_FIELDS = ("price", "qty", "bought_at", "sl_price", "leverage",
+                        "entry_ts", "runner", "trailing_activated",
+                        "momentum_holds", "cohort_floor")
+
+    def export_open_positions(self) -> dict:
+        """Alle offenen Positionen (unfilled Sells mit bought_at, nicht pre-seeded)
+        als JSON-serialisierbares Dict — wird jeden Tick mitgespeichert."""
+        out = {}
+        for sym, state in self._states.items():
+            rows = []
+            for o in state.orders.values():
+                if (not o.get("filled") and o.get("side") == "sell"
+                        and "bought_at" in o and not o.get("pre_seeded")):
+                    rows.append({k: o[k] for k in self._POSITION_FIELDS if k in o})
+            if rows:
+                out[sym] = rows
+        return out
+
+    def restore_open_positions(self, saved: dict, ctx: MarketContext) -> int:
+        """Persistierte Positionen der letzten Session wieder adoptieren:
+        Sell-Order rekonstruieren (desired_orders platziert sie erneut am
+        Broker) + ctx.add_position fürs Risk-Exposure. SL-Überwachung greift
+        ab dem ersten Tick — ist der Markt unter den alten SL gefallen,
+        wird der Verlust realisiert statt zu stranden."""
+        restored = 0
+        for sym, rows in (saved or {}).items():
+            state = self._states.get(sym)
+            if not state:
+                logger.warning("[GRID] Restore: %s nicht mehr konfiguriert — "
+                               "%d Position(en) verworfen", sym, len(rows))
+                continue
+            for r in rows:
+                if "bought_at" not in r or "qty" not in r or "price" not in r:
+                    continue
+                cid = str(uuid.uuid4())
+                order = {"side": "sell", "filled": False,
+                         "trailing_activated": False, "momentum_holds": 0,
+                         "entry_ts": time.time(), **r}
+                state.orders[cid] = order
+                state.price_to_id[order["price"]] = cid
+                lev = float(order.get("leverage") or self._lev())
+                ctx.add_position(Position(
+                    symbol=sym, side="grid",
+                    entry_price=order["bought_at"], qty=order["qty"],
+                    usdt_value=order["bought_at"] * order["qty"],
+                    leverage=lev,
+                ))
+                restored += 1
+                logger.warning("[GRID] Restore %s: bought @ %.4f qty=%.6f "
+                               "SL=%s -> sell @ %.4f (aus letzter Session)",
+                               sym, order["bought_at"], order["qty"],
+                               f"{order['sl_price']:.4f}" if order.get("sl_price") else "-",
+                               order["price"])
+        return restored
+
     def status(self, symbol: str) -> dict:
         state = self._states.get(symbol)
         if not state:

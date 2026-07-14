@@ -895,3 +895,92 @@ class TestAggressivePackage:
             assert get_leverage() == pytest.approx(4.0)
         finally:
             set_leverage(before)
+
+
+# ── Restart-Persistenz offener Positionen (Leak-Fix 2026-07-14) ───────────────
+
+class TestPositionPersistence:
+
+    def _strategy_with_position(self):
+        from core.context import MarketContext
+        from strategies.grid import GridStrategy
+        strategy = GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                                ml_enabled=False)
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        cid = str(uuid.uuid4())
+        state.orders[cid] = {
+            "side": "sell", "price": 105.0, "qty": 1.5, "filled": False,
+            "bought_at": 100.0, "sl_price": 96.0, "leverage": 3.0,
+            "trailing_activated": False, "momentum_holds": 0,
+            "entry_ts": 1234.5,
+        }
+        # Pre-seeded Sell und gefüllte Order dürfen NICHT exportiert werden
+        state.orders["seed"] = {"side": "sell", "price": 110.0, "qty": 1.0,
+                                "filled": False, "bought_at": 100.0, "pre_seeded": True}
+        state.orders["done"] = {"side": "sell", "price": 102.0, "qty": 1.0,
+                                "filled": True, "bought_at": 100.0}
+        return strategy, ctx
+
+    def test_export_only_real_open_positions(self):
+        strategy, _ = self._strategy_with_position()
+        exported = strategy.export_open_positions()
+        assert list(exported.keys()) == ["SOL/USD"]
+        assert len(exported["SOL/USD"]) == 1
+        row = exported["SOL/USD"][0]
+        assert row["bought_at"] == 100.0 and row["qty"] == 1.5
+        assert row["sl_price"] == 96.0
+        import json
+        json.dumps(exported)  # muss JSON-serialisierbar sein
+
+    def test_restore_roundtrip_recreates_position(self):
+        from core.context import MarketContext
+        from strategies.grid import GridStrategy
+        strategy, _ = self._strategy_with_position()
+        exported = strategy.export_open_positions()
+
+        fresh = GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                             ml_enabled=False)
+        ctx2 = MarketContext()
+        fresh.init(["SOL/USD"], ctx2)
+        n = fresh.restore_open_positions(exported, ctx2)
+        assert n == 1
+
+        state = fresh.get_state("SOL/USD")
+        restored = [o for o in state.orders.values()
+                    if o["side"] == "sell" and o.get("bought_at") == 100.0]
+        assert len(restored) == 1
+        assert restored[0]["sl_price"] == 96.0
+        assert restored[0]["qty"] == 1.5
+        # Risk-Exposure wieder registriert
+        assert ctx2.open_position_count() == 1
+
+    def test_restored_position_sl_still_fires(self):
+        """Nach Restore muss der SL-Pfad greifen (kein ungestopptes Inventar)."""
+        from core.context import MarketContext
+        from strategies.grid import GridStrategy
+        strategy, _ = self._strategy_with_position()
+        exported = strategy.export_open_positions()
+
+        fresh = GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                             ml_enabled=False)
+        ctx2 = MarketContext()
+        fresh.init(["SOL/USD"], ctx2)
+        fresh.restore_open_positions(exported, ctx2)
+        state = fresh.get_state("SOL/USD")
+
+        fresh._check_position_stops("SOL/USD", 95.0, state, ctx2)  # unter SL 96
+        assert all(o.get("filled") for o in state.orders.values()
+                   if o.get("bought_at") == 100.0 and not o.get("pre_seeded"))
+
+    def test_restore_unknown_symbol_is_skipped(self):
+        from core.context import MarketContext
+        from strategies.grid import GridStrategy
+        fresh = GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                             ml_enabled=False)
+        ctx = MarketContext()
+        fresh.init(["SOL/USD"], ctx)
+        n = fresh.restore_open_positions(
+            {"DOGE/USD": [{"price": 1.0, "qty": 1.0, "bought_at": 0.9}]}, ctx)
+        assert n == 0

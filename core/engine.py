@@ -91,13 +91,32 @@ class Engine:
 
         self.strategy.init(self.symbols, self.ctx)
 
+        # Offene Positionen der letzten Session adoptieren (Leak-Fix 2026-07-14):
+        # Buckets sind bereits um deren Margin reduziert — ohne Restore wäre
+        # das Geld dauerhaft gestrandet. Nur Paper: im Live-Modus liegen die
+        # Orders real bei Kraken, ein Replay würde sie doppeln (#171).
+        from execution.paper import PaperBroker
+        if isinstance(self.broker, PaperBroker) and \
+                hasattr(self.strategy, "restore_open_positions"):
+            try:
+                from dashboard.db import load_open_positions
+                saved = load_open_positions()
+                if saved:
+                    n = self.strategy.restore_open_positions(saved, self.ctx)
+                    if n:
+                        logger.info("Engine: %d offene Position(en) aus letzter "
+                                    "Session restauriert", n)
+            except Exception as e:
+                logger.warning("Positions-Restore fehlgeschlagen: %s", e)
+
         # Initialise equity so daily-drawdown brake has a valid baseline.
         # Die ECHTE (ggf. restaurierte) Broker-Balance nehmen, nicht das
         # konfigurierte Initial-Kapital: nach einem Neustart mit historischen
         # Verlusten würde die Verankerung an initial_capital den Alt-Verlust
         # als "Tagesverlust" werten und sofort die DD-Bremse auslösen (#42).
-        # Offene Positionen existieren zu diesem Zeitpunkt nicht (Paper-State
-        # wird nicht über Neustarts persistiert) → Balance = volle Equity.
+        # Restaurierte offene Positionen sind hier noch nicht ge-MtM-t —
+        # Balance ist dann eine leichte Untergrenze; der erste volle Tick
+        # setzt Balance+MtM (Richtung ist safe für die DD-Bremse).
         try:
             balance = float(self.broker.get_balance("USD"))
         except Exception as e:
@@ -470,6 +489,19 @@ class Engine:
             except Exception as e:
                 logger.error("Emergency sell failed %s: %s", sym, e)
 
+        # Finalen Stand persistieren: der Bot beendet sich direkt nach dem
+        # Sell-All — ohne diesen Save würde der nächste Start die VOR dem
+        # Verkauf gespeicherten Balances+Positionen laden und die soeben
+        # verkauften Positionen wieder zum Leben erwecken.
+        try:
+            from dashboard.db import save_paper_balances, save_open_positions
+            if hasattr(self.broker, "_balances") and self.broker._balances:
+                save_paper_balances(dict(self.broker._balances))
+            if hasattr(self.strategy, "export_open_positions"):
+                save_open_positions(self.strategy.export_open_positions())
+        except Exception as e:
+            logger.warning("Persist nach Emergency-Sell fehlgeschlagen: %s", e)
+
     def _update_dashboard(self, symbol: str, price: float):
         try:
             from dashboard.db import update_grid_state, log_prediction
@@ -580,11 +612,16 @@ class Engine:
                            "ctx.total_equity stays stale: %s", e, exc_info=True)
             return
         try:
-            from dashboard.db import log_equity, update_capital, save_paper_balances
+            from dashboard.db import (log_equity, update_capital,
+                                      save_paper_balances, save_open_positions)
             log_equity(total)
             update_capital(total)
             if hasattr(self.broker, "_balances") and self.broker._balances:
                 save_paper_balances(dict(self.broker._balances))
+                # Offene Positionen im selben Takt persistieren — auch ein
+                # leeres Dict (alles glatt) muss den alten Stand überschreiben.
+                if hasattr(self.strategy, "export_open_positions"):
+                    save_open_positions(self.strategy.export_open_positions())
         except Exception as e:
             logger.warning("_log_equity: DB write failed: %s", e)
 
