@@ -399,4 +399,7 @@ def stream():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5001, debug=False)
+    # 0.0.0.0: seit dem Pi-Umzug (2026-07-15) läuft das Dashboard auf dem Pi,
+    # bedient wird aber auch vom Mac aus — LAN-Zugriff nötig. Kein Auth-Layer:
+    # nur im vertrauenswürdigen Heimnetz betreiben, niemals Port-Forwarding.
+    app.run(host=os.getenv("DASHBOARD_BIND", "0.0.0.0"), port=5001, debug=False)
