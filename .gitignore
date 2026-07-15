@@ -27,3 +27,4 @@ venv/
 
 # Sweep-Ergebnisse (auto-generiert)
 results/
+.watchdog.lastrestart

@@ -29,8 +29,33 @@ bot_running() {
   return 1
 }
 
+RESTART_MARKER="$ROOT/.watchdog.lastrestart"
+
 if bot_running; then
-  exit 0
+  # Hang-Erkennung: Prozess lebt, aber die Loop schreibt keine Equity mehr
+  # (health_check.py prueft Equity-Alter, Bootstrap-Grace und Internet).
+  "${PYTHON:-python3}" "$ROOT/scripts/health_check.py" --check >> "$LOG" 2>&1
+  HC=$?
+  if [ "$HC" -ne 1 ]; then
+    exit 0   # gesund (0) oder Sonderfall — nichts tun
+  fi
+  # Kill-Loop-Schutz: max. 1 Hang-Restart pro Stunde, sonst nur Alarm.
+  if [ -f "$RESTART_MARKER" ] && [ $(( $(date +%s) - $(stat -c %Y "$RESTART_MARKER" 2>/dev/null || stat -f %m "$RESTART_MARKER") )) -lt 3600 ]; then
+    log "Bot haengt erneut binnen 1h — KEIN weiterer Kill (systematisches Problem?)"
+    cd "$ROOT" && "${PYTHON:-python3}" - <<'PY' >> "$LOG" 2>&1
+try:
+    from notifier import _send
+    _send("🚨 Watchdog: Bot hängt wiederholt (2× binnen 1h) — kein Auto-Restart mehr, bitte anschauen!")
+except Exception as e:
+    print(f"Telegram-Notify fehlgeschlagen: {e}")
+PY
+    exit 0
+  fi
+  log "Bot haengt (Equity stale, PID $(cat "$BOT_PIDFILE")) — kill + restart"
+  kill -9 "$(cat "$BOT_PIDFILE")" 2>/dev/null
+  rm -f "$BOT_PIDFILE"
+  touch "$RESTART_MARKER"
+  # faellt durch in den Restart-Pfad unten
 fi
 
 log "Bot laeuft nicht — starte Dashboard + Bot (paper) neu via start.sh --bot"
