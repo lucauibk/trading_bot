@@ -36,8 +36,10 @@ fi
 log "Bot laeuft nicht — starte Dashboard + Bot (paper) neu via start.sh --bot"
 if "$ROOT/start.sh" --bot --no-browser >> "$LOG" 2>&1; then
   log "Restart ausgeloest (Bot-PID: $(cat "$BOT_PIDFILE" 2>/dev/null || echo '?'))"
-  # Telegram-Notify über bestehenden Notifier (best effort)
-  cd "$ROOT" && python3 - <<'PY' >> "$LOG" 2>&1
+  # Telegram-Notify über bestehenden Notifier (best effort).
+  # ${PYTHON:-python3}: auf dem Pi liegt der Stack im venv — System-python3
+  # hat kein dotenv/requests.
+  cd "$ROOT" && "${PYTHON:-python3}" - <<'PY' >> "$LOG" 2>&1
 try:
     from notifier import _send
     _send("🐶 Watchdog: Bot war down und wurde im Paper-Modus neu gestartet.")
