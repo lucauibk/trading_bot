@@ -930,6 +930,93 @@ class TestEmergencyStopSL:
         assert calls["safety"] == 1   # SL/TP still runs (was 0 before the fix)
         assert calls["on_tick"] == 0  # no new buys
         assert calls["sync"] == 0     # no new orders submitted
+
+
+# ── Emergency sell-all paper credit (#180) ─────────────────────────────────────
+
+class TestEmergencySellAllPaperCredit:
+    """The graceful 'sell_all' stop must credit margin + PnL of every open
+    position back to the paper cash bucket. Before the fix _emergency_sell_all
+    only called on_fill (which updates in-memory total_profit but never the
+    broker balance), so the entire margin vanished from the persisted paper
+    balance and corrupted the equity baseline of all future sessions.
+    """
+
+    def test_sell_all_credits_margin_and_pnl(self, monkeypatch):
+        import types
+        from core.engine import Engine
+        from execution.paper import PaperBroker
+        from core.context import MarketContext
+        from strategies.grid import KRAKEN_FEE
+
+        # One open long: bought 1 SOL @ 100 (lev 1). Buy fill already deducted
+        # margin(100) + buy fee(0.16) from the 200 bucket → 99.84 free cash.
+        broker = PaperBroker(initial_balance=200.0, symbols=["SOL/USD"])
+        broker._deduct("SOL/USD", 100.0 + 100.0 * KRAKEN_FEE)
+        bal_before = broker.get_balance()
+        assert bal_before == pytest.approx(99.84)
+
+        state = types.SimpleNamespace(orders={
+            "s1": {"side": "sell", "filled": False, "bought_at": 100.0,
+                   "qty": 1.0, "leverage": 1.0, "pre_seeded": False},
+        })
+
+        on_fill_calls = {"n": 0}
+
+        class FakeStrategy:
+            _broker = broker
+            def get_state(self, s): return state
+            # Mirror the real GridStrategy: on_fill touches in-memory profit
+            # only, never the broker cash balance.
+            def on_fill(self, fill, ctx): on_fill_calls["n"] += 1
+
+        eng = Engine(FakeStrategy(), broker, ["SOL/USD"],
+                     ctx=MarketContext(), initial_capital=200.0)
+
+        import data_fetcher
+        monkeypatch.setattr(data_fetcher, "fetch_ticker", lambda s: {"last": 105.0})
+
+        eng._emergency_sell_all()
+
+        # credit = margin(100) + PnL(5) − sell fee(105*0.0016=0.168) = 104.832
+        # net round-trip PnL = 5 − 0.16 (buy fee) − 0.168 (sell fee) = 4.672
+        assert on_fill_calls["n"] == 1
+        assert broker.get_balance() == pytest.approx(99.84 + 104.832)
+        assert broker.get_balance() == pytest.approx(204.672)
+        # Regression guard: balance must have grown, not stayed flat.
+        assert broker.get_balance() > bal_before + 100.0
+
+    def test_pre_seeded_sell_not_double_credited(self, monkeypatch):
+        """Pre-seeded sells never deposited margin → must not be credited by
+        the emergency path (they are skipped, same as the SL path)."""
+        import types
+        from core.engine import Engine
+        from execution.paper import PaperBroker
+        from core.context import MarketContext
+
+        broker = PaperBroker(initial_balance=200.0, symbols=["SOL/USD"])
+        bal_before = broker.get_balance()
+
+        state = types.SimpleNamespace(orders={
+            "p1": {"side": "sell", "filled": False, "bought_at": 100.0,
+                   "qty": 1.0, "leverage": 1.0, "pre_seeded": True},
+        })
+
+        class FakeStrategy:
+            _broker = broker
+            def get_state(self, s): return state
+            def on_fill(self, fill, ctx): pass
+
+        eng = Engine(FakeStrategy(), broker, ["SOL/USD"],
+                     ctx=MarketContext(), initial_capital=200.0)
+
+        import data_fetcher
+        monkeypatch.setattr(data_fetcher, "fetch_ticker", lambda s: {"last": 105.0})
+
+        eng._emergency_sell_all()
+        assert broker.get_balance() == pytest.approx(bal_before)
+
+
 # ── Engine equity staleness (#89) ─────────────────────────────────────────────
 
 class TestEquityStaleGuard:
