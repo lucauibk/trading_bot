@@ -2,12 +2,15 @@
 RiskManager – reads config/config.yaml and enforces all risk rules.
 
 Pre-trade checks via can_open() replace the scattered inline checks in grid_bot.py.
-Daily drawdown is cross-coin, loaded from config.yaml (was hardcoded 8%).
+The cross-coin drawdown brake is anchored to the deposit baseline (the configured
+starting capital), loaded from config.yaml (`max_daily_drawdown`, was hardcoded 8%).
+It is NOT a daily-resetting brake: the engine feeds a constant deposit baseline, so
+there is no intraday/daily reset or relief — the brake measures drawdown from the
+initial deposit (see #132).
 Correlation-aware bucketing prevents 5-alt over-concentration.
 """
 
 import logging
-from datetime import date
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -44,8 +47,9 @@ class RiskManager:
 
         self.corr = correlation
 
-        self._daily_start: float = 0.0
-        self._daily_date: date = date.today()
+        # Drawdown baseline: anchored once to the deposit (configured starting
+        # capital) by the engine. Deliberately constant — no daily reset (#132).
+        self._baseline: float = 0.0
 
         logger.info(
             "RiskManager loaded: max_dd=%.1f%% max_pos=%.0f%% max_open=%d",
@@ -54,18 +58,23 @@ class RiskManager:
             self.max_open_positions,
         )
 
-    def set_daily_start(self, equity: float):
-        today = date.today()
-        if today != self._daily_date:
-            self._daily_start = equity
-            self._daily_date = today
-        elif self._daily_start == 0.0:
-            self._daily_start = equity
+    def set_drawdown_baseline(self, equity: float):
+        """Anchor the drawdown baseline once, to the deposit (starting capital).
 
-    def daily_drawdown_ok(self, equity: float) -> bool:
-        if self._daily_start <= 0:
+        Set-once semantics: the first non-zero call fixes the baseline and every
+        later call is a no-op. The engine feeds a constant deposit baseline every
+        tick, so there is intentionally no daily/intraday reset or relief — the
+        brake always measures drawdown from the original deposit (#132). A later
+        equity value never re-anchors the baseline.
+        """
+        if self._baseline == 0.0 and equity > 0:
+            self._baseline = equity
+
+    def drawdown_ok(self, equity: float) -> bool:
+        """True while equity is within max_daily_drawdown of the deposit baseline."""
+        if self._baseline <= 0:
             return True
-        dd = (equity - self._daily_start) / self._daily_start
+        dd = (equity - self._baseline) / self._baseline
         return dd > -self.max_daily_drawdown
 
     def can_open(
@@ -82,8 +91,8 @@ class RiskManager:
         if equity <= 0:
             return True, ""
 
-        # 1. Daily drawdown
-        if not self.daily_drawdown_ok(equity):
+        # 1. Drawdown-from-deposit brake
+        if not self.drawdown_ok(equity):
             return False, "daily_drawdown_exceeded"
 
         # 2. BTC hard filter

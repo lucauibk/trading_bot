@@ -346,7 +346,7 @@ class TestRiskManager:
         rm = self._make_rm()
         ctx = MarketContext()
         ctx.set_equity(1000.0)
-        rm.set_daily_start(1000.0)
+        rm.set_drawdown_baseline(1000.0)
         ok, reason = rm.can_open("SOL/USD", 50.0, ctx)
         assert ok is True
 
@@ -357,17 +357,36 @@ class TestRiskManager:
         ctx.set_equity(1000.0)
         # max_daily_drawdown is 0.10 (10%) per config.yaml (raised from 0.03 in dd0531b).
         # Use an 11% loss so the check still triggers regardless of the configured value.
-        rm.set_daily_start(1124.0)  # 1000/1124 − 1 = −11.0% loss → exceeds 10% threshold
+        rm.set_drawdown_baseline(1124.0)  # 1000/1124 − 1 = −11.0% loss → exceeds 10% threshold
         ok, reason = rm.can_open("SOL/USD", 50.0, ctx)
         assert ok is False
         assert "drawdown" in reason
+
+    def test_drawdown_baseline_anchors_once_no_daily_reset(self):
+        # #132: the brake is anchored once to the deposit and must NOT re-anchor
+        # on later calls (no daily reset). A later, higher equity value passed in
+        # must be ignored so an account that grew still measures drawdown from the
+        # original deposit.
+        rm = self._make_rm()
+        rm.set_drawdown_baseline(1000.0)   # deposit baseline
+        rm.set_drawdown_baseline(1200.0)   # later mid-session equity → ignored
+        # 1050 is +5% vs deposit(1000) → OK, even though it is −12.5% vs 1200.
+        assert rm.drawdown_ok(1050.0) is True
+        # 850 is −15% vs the deposit(1000) baseline → tripped.
+        assert rm.drawdown_ok(850.0) is False
+        # Zero/negative equity never re-anchors the baseline either.
+        rm2 = self._make_rm()
+        rm2.set_drawdown_baseline(0.0)
+        assert rm2.drawdown_ok(500.0) is True  # no baseline yet → permissive
+        rm2.set_drawdown_baseline(1000.0)
+        assert rm2.drawdown_ok(850.0) is False
 
     def test_blocks_on_btc_crash(self):
         from core.context import MarketContext, BTCContext
         rm = self._make_rm()
         ctx = MarketContext()
         ctx.set_equity(1000.0)
-        rm.set_daily_start(1000.0)
+        rm.set_drawdown_baseline(1000.0)
         ctx.set_btc(BTCContext(
             trend="down", return_1h=-0.05, return_4h=-0.10,
             return_24h=-0.15, realized_vol_7d=0.8, dominance=0.5
