@@ -670,7 +670,66 @@ class Engine:
         except Exception as e:
             logger.debug("update_prediction_outcomes failed: %s", e)
 
+    def _mtm_close_paper_positions(self):
+        """#183: Before shutdown, mark-to-market open paper positions into the
+        cash balance so a restart does not lose their bound margin + unrealized
+        PnL.
+
+        Only the per-tick *cash* balance is persisted (save_paper_balances); the
+        open positions themselves are never persisted or rehydrated. Without this,
+        every SIGTERM/restart/crash (i.e. everything except the sell_all graceful
+        stop, which already closes positions) drops the persisted equity by the
+        full margin + unrealized of each open position — permanently, cumulatively.
+
+        We credit exactly ``margin + unrealized`` (no synthetic sell fee), which is
+        precisely what _log_equity reports as that position's MTM, so the persisted
+        cash equals the equity that was last displayed — continuity, no phantom
+        gain or loss. The redeployed cash pays normal buy fees next session.
+
+        Positions already closed via _emergency_sell_all (sell_all stop) have been
+        popped from state.orders, so this is a no-op there — no double credit.
+        """
+        from execution.paper import PaperBroker
+        if not isinstance(self.broker, PaperBroker):
+            return
+        for sym in self.symbols:
+            try:
+                price = self._last_prices.get(sym, 0.0)
+                if price <= 0:
+                    continue  # no known price → cannot MTM; leave balance as-is
+                state = getattr(self.strategy, "get_state", lambda s: None)(sym)
+                if state is None:
+                    continue
+                for cid, o in list(state.orders.items()):
+                    if (
+                        not o.get("filled")
+                        and o.get("side") == "sell"
+                        and "bought_at" in o
+                        and not o.get("pre_seeded")
+                    ):
+                        qty = o.get("qty", 0.0)
+                        bought_at = o["bought_at"]
+                        # entry leverage (what the buy fill deducted margin at)
+                        entry_lev = o.get("leverage", 1.0) or 1.0
+                        margin = qty * bought_at / entry_lev
+                        unrealized = qty * (price - bought_at)
+                        self.broker.sl_credit(sym, margin + unrealized)
+                        # Credit exactly once: drop the position so a re-entrant
+                        # _log_equity/MTM cannot count it again.
+                        state.orders.pop(cid, None)
+            except Exception:
+                logger.debug("MTM-close failed for %s", sym, exc_info=True)
+
     def _cleanup(self):
+        # #183: settle open paper positions into cash *before* the final persist
+        # so restart equity keeps the bound margin instead of leaking it.
+        try:
+            self._mtm_close_paper_positions()
+            if hasattr(self.broker, "_balances") and self.broker._balances:
+                from dashboard.db import save_paper_balances
+                save_paper_balances(dict(self.broker._balances))
+        except Exception:
+            logger.debug("cleanup MTM persist failed", exc_info=True)
         try:
             from core.lifecycle import release_singleton
             release_singleton()
