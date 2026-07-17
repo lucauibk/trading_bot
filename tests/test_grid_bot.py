@@ -930,6 +930,90 @@ class TestEmergencyStopSL:
         assert calls["safety"] == 1   # SL/TP still runs (was 0 before the fix)
         assert calls["on_tick"] == 0  # no new buys
         assert calls["sync"] == 0     # no new orders submitted
+
+
+class TestCoinSettingsLiveToggle:
+    """#184: the dashboard coin `enabled` toggle must work as a *live* control.
+    A coin disabled mid-run is re-read each tick (paper only) and frozen like an
+    emergency stop — no new buys (on_tick/_sync_orders), but SL/TP stays live.
+    """
+
+    def _run_one_tick(self, monkeypatch, enabled):
+        import types
+        from core.engine import Engine
+        from execution.paper import PaperBroker
+        from core.context import MarketContext
+
+        calls = {"safety": 0, "on_tick": 0, "sync": 0}
+        state = types.SimpleNamespace(total_profit=0.0,
+                                      investment=100.0, grid_lines=[])
+
+        class FakeStrategy:
+            _broker = None
+            def get_state(self, s): return state
+            def on_tick_safety(self, s, p, ctx): calls["safety"] += 1
+            def on_tick(self, s, p, ctx): calls["on_tick"] += 1
+            def on_candle(self, s, df, ctx): pass
+
+        broker = PaperBroker(initial_balance=100.0, symbols=["SOL/USD"])
+        eng = Engine(FakeStrategy(), broker, ["SOL/USD"],
+                     ctx=MarketContext(), initial_capital=100.0)
+
+        for name in ("_check_dashboard_stop", "_check_daily_drawdown",
+                     "_reconcile_fills", "_log_equity"):
+            monkeypatch.setattr(eng, name, lambda *a, **k: None)
+        monkeypatch.setattr(eng, "_update_dashboard", lambda s, p: None)
+        monkeypatch.setattr(eng, "_update_prediction_outcomes", lambda f: None)
+        monkeypatch.setattr(eng, "_sync_orders",
+                            lambda s, p: calls.__setitem__("sync", calls["sync"] + 1))
+
+        # Drive _refresh_coin_settings via the real DB helper (monkeypatched).
+        import dashboard.db as ddb
+        monkeypatch.setattr(
+            ddb, "get_all_coin_settings",
+            lambda: [{"symbol": "SOL/USD", "max_investment": 100.0,
+                      "enabled": 1 if enabled else 0}],
+        )
+
+        import data_fetcher
+        monkeypatch.setattr(data_fetcher, "fetch_ticker", lambda s: {"last": 100.0})
+        monkeypatch.setattr(data_fetcher, "fetch_ohlcv", lambda *a, **k: None)
+        import core.engine as ce
+        monkeypatch.setattr(ce.time, "sleep", lambda *a, **k: None)
+
+        eng._loop_count = 1
+        eng._tick()
+        return calls, eng
+
+    def test_enabled_coin_trades_normally(self, monkeypatch):
+        calls, eng = self._run_one_tick(monkeypatch, enabled=True)
+        assert calls == {"safety": 1, "on_tick": 1, "sync": 1}
+        assert eng._disabled_coins == set()
+
+    def test_disabled_coin_keeps_sl_blocks_orders(self, monkeypatch):
+        calls, eng = self._run_one_tick(monkeypatch, enabled=False)
+        assert calls["safety"] == 1   # SL/TP still protects open positions
+        assert calls["on_tick"] == 0  # no new buys
+        assert calls["sync"] == 0     # no new orders submitted
+        assert eng._disabled_coins == {"SOL/USD"}
+
+    def test_refresh_is_paper_only(self, monkeypatch):
+        # Live broker must not be touched (Live-Parität lock, #171) — refresh no-ops.
+        from core.engine import Engine
+        from core.context import MarketContext
+
+        class FakeLiveBroker:  # not a PaperBroker
+            def cancel_all(self, s): pass
+
+        called = {"n": 0}
+        import dashboard.db as ddb
+        monkeypatch.setattr(ddb, "get_all_coin_settings",
+                            lambda: called.__setitem__("n", called["n"] + 1) or [])
+        eng = Engine(object(), FakeLiveBroker(), ["SOL/USD"],
+                     ctx=MarketContext(), initial_capital=100.0)
+        eng._refresh_coin_settings()
+        assert called["n"] == 0                 # DB never queried for a live broker
+        assert eng._disabled_coins == set()
 # ── Engine equity staleness (#89) ─────────────────────────────────────────────
 
 class TestEquityStaleGuard:
