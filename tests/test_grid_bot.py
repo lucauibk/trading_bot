@@ -1123,6 +1123,64 @@ class TestFloorSLCredit:
         amount = self._sl_credit_amount(monkeypatch, entry_lev=2.0, live_lev=1.0)
         expected = 100.0 / 2.0 + (98.0 - 100.0) - 98.0 * KRAKEN_FEE
         assert amount == pytest.approx(expected)
+
+
+class TestEmergencySellAllCredit:
+    """#180: the graceful "sell_all" paper stop must credit margin+PnL back to
+    the broker cash bucket, exactly like the floor-SL path. Before the fix the
+    synthetic sell only updated in-memory total_profit and logged the trade;
+    the broker sell order was already cancelled, so update_price never credited
+    the margin → the persisted balance leaked margin+unrealized on every stop.
+    """
+
+    def _run_emergency(self, monkeypatch, entry_lev, sell_price):
+        from core.engine import Engine, KRAKEN_FEE
+        from execution.paper import PaperBroker
+        from strategies.grid import GridStrategy, _GridState
+        from strategies.grid_params import GridParams
+        from core.context import MarketContext
+
+        monkeypatch.setenv("GRIDBOT_BACKTEST", "1")  # skip dashboard/notifier
+
+        strat = GridStrategy(
+            [{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+            ml_enabled=False,
+            params=GridParams(leverage=entry_lev),
+        )
+        broker = PaperBroker(initial_balance=100.0, symbols=["SOL/USD"])
+        strat._broker = broker
+
+        state = _GridState("SOL/USD", 100.0, 6, 0.05)
+        state.orders["sell1"] = {
+            "side": "sell", "price": 110.0, "qty": 1.0, "filled": False,
+            "bought_at": 100.0, "sl_price": 99.0, "leverage": entry_lev,
+            "momentum_holds": 0, "entry_ts": 0.0,
+        }
+        strat._states["SOL/USD"] = state
+
+        eng = Engine(strat, broker, ["SOL/USD"],
+                     ctx=MarketContext(), initial_capital=100.0)
+
+        import data_fetcher
+        monkeypatch.setattr(data_fetcher, "fetch_ticker",
+                            lambda s: {"last": sell_price})
+
+        bucket_before = broker._balances["SOL/USD"]
+        eng._emergency_sell_all()
+        return broker._balances["SOL/USD"], bucket_before, KRAKEN_FEE
+
+    def test_bucket_credited_margin_and_pnl(self, monkeypatch):
+        after, before, fee = self._run_emergency(monkeypatch, entry_lev=1.0,
+                                                 sell_price=105.0)
+        # margin(100) + pnl(+5) - sell_fee(105*fee); buy fee NOT re-charged.
+        credit = 100.0 / 1.0 + (105.0 - 100.0) - 105.0 * fee
+        assert after == pytest.approx(before + credit)
+
+    def test_bucket_credit_uses_entry_leverage(self, monkeypatch):
+        after, before, fee = self._run_emergency(monkeypatch, entry_lev=2.0,
+                                                 sell_price=105.0)
+        credit = 100.0 / 2.0 + (105.0 - 100.0) - 105.0 * fee
+        assert after == pytest.approx(before + credit)
 # ── Latent correctness traps (#78) ────────────────────────────────────────────
 
 class TestLatentTraps:

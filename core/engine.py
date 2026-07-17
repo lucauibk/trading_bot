@@ -448,14 +448,36 @@ class Engine:
                         from core.strategy import Fill
                         for cid, o in list(state.orders.items()):
                             if o.get("side") == "sell" and not o.get("filled") and "bought_at" in o and not o.get("pre_seeded"):
+                                # #180: only the sell-side fee here — the buy fee
+                                # was already deducted at buy-fill time
+                                # (paper.py update_price). Charging a round-trip
+                                # fee would double-count the buy fee, mirroring
+                                # the floor-SL path (grid.py:752).
+                                sell_fee = price * o["qty"] * KRAKEN_FEE
                                 fill = Fill(
                                     client_id=cid,
                                     symbol=sym, side="sell",
                                     price=price, qty=o["qty"],
-                                    fee=price * o["qty"] * 2 * KRAKEN_FEE,
+                                    fee=sell_fee,
                                     ts=time.time(),
                                 )
                                 self.strategy.on_fill(fill, self.ctx)
+                                # #180: on_fill only updates in-memory total_profit
+                                # and logs the trade — it never touches the broker
+                                # cash bucket. Since cancel_all() above already
+                                # cancelled the broker sell order, update_price will
+                                # never credit margin+PnL back. Credit it here,
+                                # identically to the floor-SL path (grid.py:747-754),
+                                # so the persisted paper balance keeps the full
+                                # margin instead of leaking it on every sell_all stop.
+                                entry_lev = o.get("leverage", 1.0) or 1.0
+                                bought_at = o["bought_at"]
+                                credit = (
+                                    bought_at * o["qty"] / entry_lev
+                                    + (price - bought_at) * o["qty"]
+                                    - sell_fee
+                                )
+                                self.broker.sl_credit(sym, credit)
             except Exception as e:
                 logger.error("Emergency sell failed %s: %s", sym, e)
 
