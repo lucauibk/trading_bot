@@ -1123,6 +1123,77 @@ class TestFloorSLCredit:
         amount = self._sl_credit_amount(monkeypatch, entry_lev=2.0, live_lev=1.0)
         expected = 100.0 / 2.0 + (98.0 - 100.0) - 98.0 * KRAKEN_FEE
         assert amount == pytest.approx(expected)
+
+
+class TestPaperRestartMargin:
+    """#183: normal SIGTERM/restart/crash never sells open positions, and only
+    the cash balance is persisted (not the positions). Without settling them,
+    each restart drops the persisted equity by the full margin + unrealized PnL.
+    _mtm_close_paper_positions() must credit exactly margin+unrealized (== the MTM
+    _log_equity reports) into the bucket so restart equity == displayed equity.
+    """
+
+    def _build_engine(self, entry_lev, last_price):
+        from core.engine import Engine
+        from execution.paper import PaperBroker
+        from strategies.grid import GridStrategy, _GridState
+        from strategies.grid_params import GridParams
+        from core.context import MarketContext
+
+        strat = GridStrategy(
+            [{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+            ml_enabled=False,
+            params=GridParams(leverage=entry_lev),
+        )
+        broker = PaperBroker(initial_balance=100.0, symbols=["SOL/USD"])
+        strat._broker = broker
+
+        state = _GridState("SOL/USD", 100.0, 6, 0.05)
+        state.orders["sell1"] = {
+            "side": "sell", "price": 110.0, "qty": 1.0, "filled": False,
+            "bought_at": 100.0, "sl_price": 99.0, "leverage": entry_lev,
+        }
+        strat._states["SOL/USD"] = state
+
+        eng = Engine(strat, broker, ["SOL/USD"],
+                     ctx=MarketContext(), initial_capital=100.0)
+        eng._last_prices["SOL/USD"] = last_price
+        return eng, broker, state
+
+    def test_mtm_close_credits_margin_and_unrealized(self):
+        eng, broker, state = self._build_engine(entry_lev=1.0, last_price=105.0)
+        before = broker._balances["SOL/USD"]
+        eng._mtm_close_paper_positions()
+        # margin(100) + unrealized(+5); no synthetic fee → equity continuity.
+        assert broker._balances["SOL/USD"] == pytest.approx(before + 105.0)
+        assert "sell1" not in state.orders  # credited exactly once
+
+    def test_mtm_close_uses_entry_leverage(self):
+        eng, broker, state = self._build_engine(entry_lev=2.0, last_price=105.0)
+        before = broker._balances["SOL/USD"]
+        eng._mtm_close_paper_positions()
+        # margin(100/2=50) + unrealized(+5)
+        assert broker._balances["SOL/USD"] == pytest.approx(before + 55.0)
+
+    def test_mtm_close_skips_without_known_price(self):
+        eng, broker, state = self._build_engine(entry_lev=1.0, last_price=105.0)
+        eng._last_prices["SOL/USD"] = 0.0  # no known price
+        before = broker._balances["SOL/USD"]
+        eng._mtm_close_paper_positions()
+        assert broker._balances["SOL/USD"] == pytest.approx(before)  # unchanged
+        assert "sell1" in state.orders  # left intact, not lost
+
+    def test_mtm_close_ignores_pre_seeded(self):
+        eng, broker, state = self._build_engine(entry_lev=1.0, last_price=105.0)
+        state.orders["seed1"] = {
+            "side": "sell", "price": 120.0, "qty": 1.0, "filled": False,
+            "bought_at": 100.0, "pre_seeded": True, "leverage": 1.0,
+        }
+        before = broker._balances["SOL/USD"]
+        eng._mtm_close_paper_positions()
+        # only the real position (sell1) is credited; pre-seeded had no margin.
+        assert broker._balances["SOL/USD"] == pytest.approx(before + 105.0)
+        assert "seed1" in state.orders
 # ── Latent correctness traps (#78) ────────────────────────────────────────────
 
 class TestLatentTraps:
