@@ -930,6 +930,90 @@ class TestEmergencyStopSL:
         assert calls["safety"] == 1   # SL/TP still runs (was 0 before the fix)
         assert calls["on_tick"] == 0  # no new buys
         assert calls["sync"] == 0     # no new orders submitted
+
+
+class TestCoinSettingsLiveToggle:
+    """#184: the dashboard coin `enabled` toggle must work as a *live* control.
+    A coin disabled mid-run is re-read each tick (paper only) and frozen like an
+    emergency stop — no new buys (on_tick/_sync_orders), but SL/TP stays live.
+    """
+
+    def _run_one_tick(self, monkeypatch, enabled):
+        import types
+        from core.engine import Engine
+        from execution.paper import PaperBroker
+        from core.context import MarketContext
+
+        calls = {"safety": 0, "on_tick": 0, "sync": 0}
+        state = types.SimpleNamespace(total_profit=0.0,
+                                      investment=100.0, grid_lines=[])
+
+        class FakeStrategy:
+            _broker = None
+            def get_state(self, s): return state
+            def on_tick_safety(self, s, p, ctx): calls["safety"] += 1
+            def on_tick(self, s, p, ctx): calls["on_tick"] += 1
+            def on_candle(self, s, df, ctx): pass
+
+        broker = PaperBroker(initial_balance=100.0, symbols=["SOL/USD"])
+        eng = Engine(FakeStrategy(), broker, ["SOL/USD"],
+                     ctx=MarketContext(), initial_capital=100.0)
+
+        for name in ("_check_dashboard_stop", "_check_daily_drawdown",
+                     "_reconcile_fills", "_log_equity"):
+            monkeypatch.setattr(eng, name, lambda *a, **k: None)
+        monkeypatch.setattr(eng, "_update_dashboard", lambda s, p: None)
+        monkeypatch.setattr(eng, "_update_prediction_outcomes", lambda f: None)
+        monkeypatch.setattr(eng, "_sync_orders",
+                            lambda s, p: calls.__setitem__("sync", calls["sync"] + 1))
+
+        # Drive _refresh_coin_settings via the real DB helper (monkeypatched).
+        import dashboard.db as ddb
+        monkeypatch.setattr(
+            ddb, "get_all_coin_settings",
+            lambda: [{"symbol": "SOL/USD", "max_investment": 100.0,
+                      "enabled": 1 if enabled else 0}],
+        )
+
+        import data_fetcher
+        monkeypatch.setattr(data_fetcher, "fetch_ticker", lambda s: {"last": 100.0})
+        monkeypatch.setattr(data_fetcher, "fetch_ohlcv", lambda *a, **k: None)
+        import core.engine as ce
+        monkeypatch.setattr(ce.time, "sleep", lambda *a, **k: None)
+
+        eng._loop_count = 1
+        eng._tick()
+        return calls, eng
+
+    def test_enabled_coin_trades_normally(self, monkeypatch):
+        calls, eng = self._run_one_tick(monkeypatch, enabled=True)
+        assert calls == {"safety": 1, "on_tick": 1, "sync": 1}
+        assert eng._disabled_coins == set()
+
+    def test_disabled_coin_keeps_sl_blocks_orders(self, monkeypatch):
+        calls, eng = self._run_one_tick(monkeypatch, enabled=False)
+        assert calls["safety"] == 1   # SL/TP still protects open positions
+        assert calls["on_tick"] == 0  # no new buys
+        assert calls["sync"] == 0     # no new orders submitted
+        assert eng._disabled_coins == {"SOL/USD"}
+
+    def test_refresh_is_paper_only(self, monkeypatch):
+        # Live broker must not be touched (Live-Parität lock, #171) — refresh no-ops.
+        from core.engine import Engine
+        from core.context import MarketContext
+
+        class FakeLiveBroker:  # not a PaperBroker
+            def cancel_all(self, s): pass
+
+        called = {"n": 0}
+        import dashboard.db as ddb
+        monkeypatch.setattr(ddb, "get_all_coin_settings",
+                            lambda: called.__setitem__("n", called["n"] + 1) or [])
+        eng = Engine(object(), FakeLiveBroker(), ["SOL/USD"],
+                     ctx=MarketContext(), initial_capital=100.0)
+        eng._refresh_coin_settings()
+        assert called["n"] == 0                 # DB never queried for a live broker
+        assert eng._disabled_coins == set()
 # ── Engine equity staleness (#89) ─────────────────────────────────────────────
 
 class TestEquityStaleGuard:
@@ -1125,6 +1209,64 @@ class TestFloorSLCredit:
         assert amount == pytest.approx(expected)
 
 
+class TestEmergencySellAllCredit:
+    """#180: the graceful "sell_all" paper stop must credit margin+PnL back to
+    the broker cash bucket, exactly like the floor-SL path. Before the fix the
+    synthetic sell only updated in-memory total_profit and logged the trade;
+    the broker sell order was already cancelled, so update_price never credited
+    the margin -> the persisted balance leaked margin+unrealized on every stop.
+    """
+
+    def _run_emergency(self, monkeypatch, entry_lev, sell_price):
+        from core.engine import Engine, KRAKEN_FEE
+        from execution.paper import PaperBroker
+        from strategies.grid import GridStrategy, _GridState
+        from strategies.grid_params import GridParams
+        from core.context import MarketContext
+
+        monkeypatch.setenv("GRIDBOT_BACKTEST", "1")  # skip dashboard/notifier
+
+        strat = GridStrategy(
+            [{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+            ml_enabled=False,
+            params=GridParams(leverage=entry_lev),
+        )
+        broker = PaperBroker(initial_balance=100.0, symbols=["SOL/USD"])
+        strat._broker = broker
+
+        state = _GridState("SOL/USD", 100.0, 6, 0.05)
+        state.orders["sell1"] = {
+            "side": "sell", "price": 110.0, "qty": 1.0, "filled": False,
+            "bought_at": 100.0, "sl_price": 99.0, "leverage": entry_lev,
+            "momentum_holds": 0, "entry_ts": 0.0,
+        }
+        strat._states["SOL/USD"] = state
+
+        eng = Engine(strat, broker, ["SOL/USD"],
+                     ctx=MarketContext(), initial_capital=100.0)
+
+        import data_fetcher
+        monkeypatch.setattr(data_fetcher, "fetch_ticker",
+                            lambda s: {"last": sell_price})
+
+        bucket_before = broker._balances["SOL/USD"]
+        eng._emergency_sell_all()
+        return broker._balances["SOL/USD"], bucket_before, KRAKEN_FEE
+
+    def test_bucket_credited_margin_and_pnl(self, monkeypatch):
+        after, before, fee = self._run_emergency(monkeypatch, entry_lev=1.0,
+                                                 sell_price=105.0)
+        # margin(100) + pnl(+5) - sell_fee(105*fee); buy fee NOT re-charged.
+        credit = 100.0 / 1.0 + (105.0 - 100.0) - 105.0 * fee
+        assert after == pytest.approx(before + credit)
+
+    def test_bucket_credit_uses_entry_leverage(self, monkeypatch):
+        after, before, fee = self._run_emergency(monkeypatch, entry_lev=2.0,
+                                                 sell_price=105.0)
+        credit = 100.0 / 2.0 + (105.0 - 100.0) - 105.0 * fee
+        assert after == pytest.approx(before + credit)
+
+
 class TestPaperRestartMargin:
     """#183: normal SIGTERM/restart/crash never sells open positions, and only
     the cash balance is persisted (not the positions). Without settling them,
@@ -1164,7 +1306,7 @@ class TestPaperRestartMargin:
         eng, broker, state = self._build_engine(entry_lev=1.0, last_price=105.0)
         before = broker._balances["SOL/USD"]
         eng._mtm_close_paper_positions()
-        # margin(100) + unrealized(+5); no synthetic fee → equity continuity.
+        # margin(100) + unrealized(+5); no synthetic fee -> equity continuity.
         assert broker._balances["SOL/USD"] == pytest.approx(before + 105.0)
         assert "sell1" not in state.orders  # credited exactly once
 

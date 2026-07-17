@@ -88,6 +88,10 @@ class Engine:
         self._last_rebuild: Dict[str, int] = {}
         # Symbols currently in per-coin emergency stop (log-once + resume tracking).
         self._emergency_logged: set = set()
+        # #184: symbols disabled mid-run via the dashboard coin_settings toggle
+        # (enabled=0). Re-read each tick (paper only) and treated like a freeze:
+        # no new buys, but SL/TP stays active. Tracks state for log-once/resume.
+        self._disabled_coins: set = set()
 
     def run(self):
         logger.info("Engine starting | symbols=%s", self.symbols)
@@ -139,6 +143,7 @@ class Engine:
         import notifier
 
         self._check_dashboard_stop()
+        self._refresh_coin_settings()
 
         if self._loop_count % BTC_REFRESH_CYCLES == 0:
             self._refresh_btc()
@@ -179,6 +184,10 @@ class Engine:
                 state_obj
                 and state_obj.total_profit <= -(state_obj.investment * EMERGENCY_STOP_PCT)
             )
+            # #184: a coin disabled mid-run via the dashboard is frozen like an
+            # emergency stop — no new buys, but SL/TP (on_tick_safety) stays live.
+            disabled = sym in self._disabled_coins
+            block_new_risk = emergency_stopped or disabled
             if emergency_stopped and sym not in self._emergency_logged:
                 logger.warning(
                     "[ENGINE] %s emergency stop (max loss) — new buys halted, "
@@ -211,7 +220,7 @@ class Engine:
                 except Exception as e:
                     logger.warning("on_tick_safety failed %s: %s", sym, e)
 
-            if not self.ctx.is_frozen() and not emergency_stopped:
+            if not self.ctx.is_frozen() and not block_new_risk:
                 self.strategy.on_tick(sym, price, self.ctx)
 
             # For live mode: reconcile fills from exchange (paper has no reconciler)
@@ -237,7 +246,7 @@ class Engine:
                 self.strategy.setup_grid(sym, price, self.ctx)
                 self._last_rebuild[sym] = self._loop_count
 
-            if not self.ctx.is_frozen() and not emergency_stopped:
+            if not self.ctx.is_frozen() and not block_new_risk:
                 self._sync_orders(sym, price)
 
             self._update_dashboard(sym, price)
@@ -259,6 +268,46 @@ class Engine:
             if not still_open:
                 logger.info("wait_fills: all positions closed, stopping.")
                 self._shutdown.stop()
+
+    def _refresh_coin_settings(self):
+        """#184: re-read coin_settings each tick so the dashboard `enabled` toggle
+        works as a *live* control instead of only at startup.
+
+        Per CLAUDE.md the bot is meant to read coin_settings every loop iteration,
+        but only `leverage`/`stop_mode` were actually re-read; a coin disabled
+        mid-run kept trading until restart, so a bleeding coin could not be stopped
+        live. We mirror the existing per-tick reads (a single indexed SELECT).
+
+        Scope: paper mode only — the live coin_settings path is tracked separately
+        under the Live-Parität checklist (#171/#114) and must not be touched while
+        the live lock stands. A disabled coin is treated exactly like the per-coin
+        emergency stop / daily freeze: new buys are halted (on_tick + _sync_orders
+        gated in _tick) while on_tick_safety keeps SL/TP alive for open positions.
+
+        The `max_investment` half of #184 is intentionally out of scope here: a
+        mid-run investment change collides with the compounding cap
+        (_initial_investment × MAX_INVESTMENT_MULT) and needs live validation.
+        """
+        from execution.paper import PaperBroker
+        if not isinstance(self.broker, PaperBroker):
+            return
+        try:
+            from dashboard.db import get_all_coin_settings
+            rows = get_all_coin_settings()
+        except Exception:
+            return  # DB read failed → keep last-known state, do not flip coins
+        disabled = {
+            r["symbol"] for r in rows
+            if r["symbol"] in self.symbols and not r.get("enabled", 1)
+        }
+        newly_off = disabled - self._disabled_coins
+        newly_on = self._disabled_coins - disabled
+        for sym in newly_off:
+            logger.warning("[ENGINE] %s disabled via dashboard — new buys halted, "
+                           "SL/TP still active", sym)
+        for sym in newly_on:
+            logger.info("[ENGINE] %s re-enabled via dashboard — trading resumed", sym)
+        self._disabled_coins = disabled
 
     def _reconcile_fills(self):
         """Process fills from live broker via reconciler. Paper fills handled in _sync_orders."""
@@ -448,14 +497,36 @@ class Engine:
                         from core.strategy import Fill
                         for cid, o in list(state.orders.items()):
                             if o.get("side") == "sell" and not o.get("filled") and "bought_at" in o and not o.get("pre_seeded"):
+                                # #180: only the sell-side fee here — the buy fee
+                                # was already deducted at buy-fill time
+                                # (paper.py update_price). Charging a round-trip
+                                # fee would double-count the buy fee, mirroring
+                                # the floor-SL path (grid.py:752).
+                                sell_fee = price * o["qty"] * KRAKEN_FEE
                                 fill = Fill(
                                     client_id=cid,
                                     symbol=sym, side="sell",
                                     price=price, qty=o["qty"],
-                                    fee=price * o["qty"] * 2 * KRAKEN_FEE,
+                                    fee=sell_fee,
                                     ts=time.time(),
                                 )
                                 self.strategy.on_fill(fill, self.ctx)
+                                # #180: on_fill only updates in-memory total_profit
+                                # and logs the trade — it never touches the broker
+                                # cash bucket. Since cancel_all() above already
+                                # cancelled the broker sell order, update_price will
+                                # never credit margin+PnL back. Credit it here,
+                                # identically to the floor-SL path (grid.py:747-754),
+                                # so the persisted paper balance keeps the full
+                                # margin instead of leaking it on every sell_all stop.
+                                entry_lev = o.get("leverage", 1.0) or 1.0
+                                bought_at = o["bought_at"]
+                                credit = (
+                                    bought_at * o["qty"] / entry_lev
+                                    + (price - bought_at) * o["qty"]
+                                    - sell_fee
+                                )
+                                self.broker.sl_credit(sym, credit)
             except Exception as e:
                 logger.error("Emergency sell failed %s: %s", sym, e)
 
