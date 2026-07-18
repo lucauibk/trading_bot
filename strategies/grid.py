@@ -767,6 +767,13 @@ class GridStrategy(Strategy):
                 ctx.remove_position(symbol, "grid")
                 # Remove from orders after SL
                 state.orders.pop(cid, None)
+            elif order.get("momentum_holds"):
+                # #165: price recovered back above the SL — reset the momentum-hold
+                # budget so it acts per-dip-episode (N ticks of grace per contiguous
+                # touch), not as a lifetime total. Without this reset the counter
+                # only ever grows, so after a couple of independent dips a later dip
+                # stops out immediately even while the score is still bullish.
+                order["momentum_holds"] = 0
 
     def _maybe_open_directional(self, symbol: str, price: float,
                                  state: _GridState, ctx: MarketContext):
