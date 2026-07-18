@@ -1557,6 +1557,29 @@ class TestLatentTraps:
         assert inspect.signature(data_fetcher.get_balance).parameters["currency"].default == "USD"
 
 
+# ── LLM confidence/score clamping (#151) ──────────────────────────────────────
+class TestLLMClamp:
+    """A malformed Haiku confidence (e.g. a percentage like 85) must not survive
+    into a max-conviction leveraged directional trade."""
+
+    def test_blend_clamps_out_of_range_confidence_and_score(self):
+        from ml.llm_analyst import blend_scores
+        # LLM returned confidence=85 (percent) and an out-of-range score.
+        bad = {"direction": "up", "confidence": 85.0, "score": 85.0}
+        blended, conf = blend_scores(0.2, 0.5, bad)
+        assert -1.0 <= blended <= 1.0
+        assert 0.0 <= conf <= 1.0
+
+    def test_blend_none_result_passes_through(self):
+        from ml.llm_analyst import blend_scores
+        assert blend_scores(0.3, 0.7, None) == (0.3, 0.7)
+
+    def test_blend_below_gate_returns_lgbm_only(self):
+        from ml.llm_analyst import blend_scores, LLM_CONFIDENCE_MIN
+        low = {"direction": "up", "confidence": LLM_CONFIDENCE_MIN - 0.1, "score": 1.0}
+        assert blend_scores(0.3, 0.7, low) == (0.3, 0.7)
+
+
 # ── PaperBroker balance provisioning (#149) ───────────────────────────────────
 class TestPaperBalanceProvisioning:
     """With per-symbol buckets, the fallback pool must not double-provision the
