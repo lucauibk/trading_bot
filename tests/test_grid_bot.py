@@ -1611,6 +1611,42 @@ class TestLatentTraps:
         assert inspect.signature(data_fetcher.get_balance).parameters["currency"].default == "USD"
 
 
+# ── coin_settings enable/disable + budget cap (#114) ──────────────────────────
+class TestCoinSettingsGridConfig:
+    """coin_settings must disable coins and cap budget in BOTH paper and live mode
+    (the logic is mode-independent)."""
+
+    def test_disabled_coin_is_dropped(self):
+        from main import _build_grids_config
+        settings = {"ETH/USD": {"enabled": 0, "max_investment": 300.0}}
+        active, cfg = _build_grids_config(["SOL/USD", "ETH/USD"], 200.0, settings)
+        assert active == ["SOL/USD"]
+        assert [c["symbol"] for c in cfg] == ["SOL/USD"]
+
+    def test_missing_row_defaults_enabled(self):
+        from main import _build_grids_config
+        active, cfg = _build_grids_config(["SOL/USD"], 200.0, {})
+        assert active == ["SOL/USD"]
+        assert cfg[0]["investment"] == 200.0  # full per_coin bucket
+
+    def test_max_investment_only_reduces(self):
+        from main import _build_grids_config
+        settings = {
+            "SOL/USD": {"enabled": 1, "max_investment": 50.0},    # reduce
+            "ETH/USD": {"enabled": 1, "max_investment": 9999.0},  # cannot exceed per_coin
+        }
+        _, cfg = _build_grids_config(["SOL/USD", "ETH/USD"], 200.0, settings)
+        inv = {c["symbol"]: c["investment"] for c in cfg}
+        assert inv["SOL/USD"] == 50.0
+        assert inv["ETH/USD"] == 200.0
+
+    def test_all_disabled_yields_empty(self):
+        from main import _build_grids_config
+        settings = {"SOL/USD": {"enabled": 0}, "ETH/USD": {"enabled": 0}}
+        active, cfg = _build_grids_config(["SOL/USD", "ETH/USD"], 200.0, settings)
+        assert active == [] and cfg == []
+
+
 # ── Double SL/directional checks per tick (#146) ──────────────────────────────
 class TestTickCheckDedup:
     """on_tick_safety + on_tick must not run the SL/directional checks twice in a

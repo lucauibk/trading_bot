@@ -29,6 +29,25 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 
+def _build_grids_config(symbols, per_coin, settings):
+    """Derive the active symbol set + grid config from dashboard coin_settings (#114).
+
+    - A coin with no settings row defaults to enabled.
+    - `enabled == 0` drops the coin from the traded set entirely.
+    - `max_investment` can only *reduce* budget below the hard per-coin bucket,
+      never exceed it. A None/0 value falls back to the full per_coin bucket.
+    Applies identically in paper and live mode.
+    """
+    active = [s for s in symbols if settings.get(s, {}).get("enabled", 1)]
+    grids_config = [
+        {"symbol": s,
+         "investment": min(float(settings.get(s, {}).get("max_investment", per_coin) or per_coin), per_coin),
+         "levels": 8}
+        for s in active
+    ]
+    return active, grids_config
+
+
 def main():
     parser = argparse.ArgumentParser(description="Grid Trading Bot")
     parser.add_argument("--mode", choices=["paper", "live"], default="paper")
@@ -85,21 +104,27 @@ def main():
         except Exception:
             pass
 
+    # Per-coin bucket sizing uses the FULL configured symbol count so that
+    # disabling a coin frees capital rather than concentrating exposure onto the
+    # remaining coins (conservative for real money).
     per_coin = initial_investment / len(symbols)
-    overrides = {}
-    if paper:
-        try:
-            from dashboard.db import get_all_coin_settings
-            overrides = {r["symbol"]: r["max_investment"]
-                         for r in get_all_coin_settings() if r["enabled"]}
-        except Exception:
-            pass
-    grids_config = [
-        # coin_settings can only reduce budget below per_coin, never exceed the
-        # broker's hard per-symbol cash bucket (initial_capital / n_symbols).
-        {"symbol": s, "investment": min(overrides.get(s, per_coin), per_coin), "levels": 8}
-        for s in symbols
-    ]
+
+    # coin_settings drive the dashboard's per-coin control. This MUST apply in
+    # both paper and live mode (#114): previously the whole block sat behind
+    # `if paper:`, so live-mode per-coin caps and enable/disable were ignored
+    # (uncapped real-money exposure), and `enabled=0` only dropped the coin from
+    # the override dict — it kept trading with the full per_coin budget.
+    settings = {}
+    try:
+        from dashboard.db import get_all_coin_settings
+        # dict(row) so the .get(...) lookups work (sqlite3.Row has no .get).
+        settings = {r["symbol"]: dict(r) for r in get_all_coin_settings()}
+    except Exception:
+        pass
+
+    # A disabled coin is dropped from the traded set entirely (no grid, no
+    # bucket, no ticks). per_coin stays sized on the full symbol count above.
+    symbols, grids_config = _build_grids_config(symbols, per_coin, settings)
 
     # Build components
     from core.context import MarketContext
