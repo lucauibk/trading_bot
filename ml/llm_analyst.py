@@ -203,15 +203,22 @@ def blend_scores(lgbm_score: float, lgbm_confidence: float,
     if llm_conf < LLM_CONFIDENCE_MIN:
         return lgbm_score, lgbm_confidence
 
+    # A confident *neutral* LLM is confidence in NO direction — feeding its raw
+    # confidence into blended_conf would let a borderline LGBM signal + a confident
+    # neutral LLM clear MIN_CONFIDENCE and open a leveraged directional. Zero the
+    # LLM's directional-confidence contribution for a neutral call, mirroring the
+    # LGBM-side directional_lgbm_conf() fix (#103) applied here for the LLM (#129).
+    # llm_conf ist bereits geclampt (#151) — Neutral-Zero wirkt auf dem Clamp-Wert.
     llm_score = min(1.0, max(-1.0, llm_result["score"]))
+    llm_conf_dir = 0.0 if llm_result.get("direction") == "neutral" else llm_conf
     blended   = (1 - LLM_WEIGHT) * lgbm_score + LLM_WEIGHT * llm_score
-    blended_conf = (1 - LLM_WEIGHT) * lgbm_confidence + LLM_WEIGHT * llm_conf
+    blended_conf = (1 - LLM_WEIGHT) * lgbm_confidence + LLM_WEIGHT * llm_conf_dir
     blended      = min(1.0, max(-1.0, blended))
     blended_conf = min(1.0, max(0.0, blended_conf))
 
     logger.debug(
-        "Blend: LGBM=%+.2f (%.2f) + LLM=%+.2f (%.2f) → %+.2f (%.2f)",
+        "Blend: LGBM=%+.2f (%.2f) + LLM=%+.2f (%.2f, dir_conf=%.2f) → %+.2f (%.2f)",
         lgbm_score, lgbm_confidence, llm_score, llm_result["confidence"],
-        blended, blended_conf,
+        llm_conf_dir, blended, blended_conf,
     )
     return blended, blended_conf
