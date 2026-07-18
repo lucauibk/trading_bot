@@ -102,6 +102,11 @@ class _GridState:
         self._last_pred_low = 0.0
         self._last_pred_high = 0.0
         self.with_position = False
+        # Permanent sell-only latch for the graceful "wait_fills" shutdown. Unlike
+        # with_position (recomputed every candle from the prediction), this is never
+        # reset by _refresh_prediction, so the bot cannot re-arm buys after the user
+        # requested a graceful stop. (#115)
+        self.sell_only = False
 
         # Directional trade state
         self._directional: dict = {}
@@ -244,6 +249,9 @@ class GridStrategy(Strategy):
         return total
 
     def _buys_allowed(self, state: _GridState) -> bool:
+        # Graceful wait_fills stop: no new buys, ever, regardless of prediction.
+        if state.sell_only:
+            return False
         if not state.with_position:
             return False
         if self.p.trend_filter_enabled and state._hard_trend_down:
@@ -294,7 +302,9 @@ class GridStrategy(Strategy):
 
         state._last_prediction = direction
         state._direction_score = score
-        state.with_position = direction != "down"
+        # Once a graceful wait_fills stop is latched, keep buys off — never let a
+        # fresh "up"/"neutral" prediction flip with_position back on. (#115)
+        state.with_position = False if state.sell_only else (direction != "down")
 
     def _build_grid_params(self, symbol: str, price: float, state: _GridState):
         """Compute (lower, upper, levels, range_pct, regime, confidence)."""
