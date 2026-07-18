@@ -236,6 +236,27 @@ class TestSweepCLI:
         args = build_parser().parse_args([])
         assert args.symbol is None
 
+    def test_run_sweep_disables_live_ml(self, monkeypatch):
+        """Regression for #130: cmd_run_sweep is an offline backtest and must build
+        GridStrategy with ml_enabled=False — otherwise the ML predict path makes live
+        Kraken fetches and paid LightGBM/Claude calls during the sweep."""
+        import data_fetcher
+        import backtest.engine as bt
+        from scripts import optimize
+
+        df = _make_df(120)
+        monkeypatch.setattr(data_fetcher, "fetch_ohlcv", lambda *a, **k: df)
+
+        captured = {}
+
+        def fake_run_backtest(strategy, *a, **k):
+            captured["ml_enabled"] = strategy._ml_enabled
+            return {"total_pnl": 0.0}
+
+        monkeypatch.setattr(bt, "run_backtest", fake_run_backtest)
+        optimize.cmd_run_sweep("SOL/USD")
+        assert captured["ml_enabled"] is False
+
 
 # ── MLPredictor error path (#117) ────────────────────────────────────────────
 
