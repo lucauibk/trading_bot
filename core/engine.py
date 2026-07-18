@@ -88,6 +88,10 @@ class Engine:
         self._last_rebuild: Dict[str, int] = {}
         # Symbols currently in per-coin emergency stop (log-once + resume tracking).
         self._emergency_logged: set = set()
+        # #184: symbols disabled mid-run via the dashboard coin_settings toggle
+        # (enabled=0). Re-read each tick (paper only) and treated like a freeze:
+        # no new buys, but SL/TP stays active. Tracks state for log-once/resume.
+        self._disabled_coins: set = set()
 
     def run(self):
         logger.info("Engine starting | symbols=%s", self.symbols)
@@ -139,6 +143,7 @@ class Engine:
         import notifier
 
         self._check_dashboard_stop()
+        self._refresh_coin_settings()
 
         if self._loop_count % BTC_REFRESH_CYCLES == 0:
             self._refresh_btc()
@@ -179,6 +184,10 @@ class Engine:
                 state_obj
                 and state_obj.total_profit <= -(state_obj.investment * EMERGENCY_STOP_PCT)
             )
+            # #184: a coin disabled mid-run via the dashboard is frozen like an
+            # emergency stop — no new buys, but SL/TP (on_tick_safety) stays live.
+            disabled = sym in self._disabled_coins
+            block_new_risk = emergency_stopped or disabled
             if emergency_stopped and sym not in self._emergency_logged:
                 logger.warning(
                     "[ENGINE] %s emergency stop (max loss) — new buys halted, "
@@ -211,7 +220,7 @@ class Engine:
                 except Exception as e:
                     logger.warning("on_tick_safety failed %s: %s", sym, e)
 
-            if not self.ctx.is_frozen() and not emergency_stopped:
+            if not self.ctx.is_frozen() and not block_new_risk:
                 self.strategy.on_tick(sym, price, self.ctx)
 
             # For live mode: reconcile fills from exchange (paper has no reconciler)
@@ -237,7 +246,7 @@ class Engine:
                 self.strategy.setup_grid(sym, price, self.ctx)
                 self._last_rebuild[sym] = self._loop_count
 
-            if not self.ctx.is_frozen() and not emergency_stopped:
+            if not self.ctx.is_frozen() and not block_new_risk:
                 self._sync_orders(sym, price)
 
             self._update_dashboard(sym, price)
@@ -260,6 +269,46 @@ class Engine:
                 logger.info("wait_fills: all positions closed, stopping.")
                 self._shutdown.stop()
 
+    def _refresh_coin_settings(self):
+        """#184: re-read coin_settings each tick so the dashboard `enabled` toggle
+        works as a *live* control instead of only at startup.
+
+        Per CLAUDE.md the bot is meant to read coin_settings every loop iteration,
+        but only `leverage`/`stop_mode` were actually re-read; a coin disabled
+        mid-run kept trading until restart, so a bleeding coin could not be stopped
+        live. We mirror the existing per-tick reads (a single indexed SELECT).
+
+        Scope: paper mode only — the live coin_settings path is tracked separately
+        under the Live-Parität checklist (#171/#114) and must not be touched while
+        the live lock stands. A disabled coin is treated exactly like the per-coin
+        emergency stop / daily freeze: new buys are halted (on_tick + _sync_orders
+        gated in _tick) while on_tick_safety keeps SL/TP alive for open positions.
+
+        The `max_investment` half of #184 is intentionally out of scope here: a
+        mid-run investment change collides with the compounding cap
+        (_initial_investment × MAX_INVESTMENT_MULT) and needs live validation.
+        """
+        from execution.paper import PaperBroker
+        if not isinstance(self.broker, PaperBroker):
+            return
+        try:
+            from dashboard.db import get_all_coin_settings
+            rows = get_all_coin_settings()
+        except Exception:
+            return  # DB read failed → keep last-known state, do not flip coins
+        disabled = {
+            r["symbol"] for r in rows
+            if r["symbol"] in self.symbols and not r.get("enabled", 1)
+        }
+        newly_off = disabled - self._disabled_coins
+        newly_on = self._disabled_coins - disabled
+        for sym in newly_off:
+            logger.warning("[ENGINE] %s disabled via dashboard — new buys halted, "
+                           "SL/TP still active", sym)
+        for sym in newly_on:
+            logger.info("[ENGINE] %s re-enabled via dashboard — trading resumed", sym)
+        self._disabled_coins = disabled
+
     def _reconcile_fills(self):
         """Process fills from live broker via reconciler. Paper fills handled in _sync_orders."""
         from execution.paper import PaperBroker
@@ -271,6 +320,11 @@ class Engine:
                 self.strategy.on_fill(fill, self.ctx)
                 if fill.client_id in self._active_orders.get(fill.symbol, {}):
                     del self._active_orders[fill.symbol][fill.client_id]
+                # Drop the persisted open_orders row once the fill is processed —
+                # otherwise the table grows unbounded and a stale row can resolve a
+                # later empty-client_id fill to the wrong order (#134).
+                if fill.client_id:
+                    self.reconciler.remove_order(fill.client_id)
 
     def process_paper_fills(self, symbol: str, price: float):
         from execution.paper import PaperBroker
@@ -292,6 +346,10 @@ class Engine:
             if cid not in desired:
                 self.broker.cancel(cid)
                 del active[cid]
+                # Also drop the persisted open_orders row (live mode) so cancelled
+                # orders don't leak the table forever (#134).
+                if self.reconciler:
+                    self.reconciler.remove_order(cid)
 
         for cid, order in desired.items():
             if cid not in active:
@@ -419,6 +477,10 @@ class Engine:
                 for sym in self.symbols:
                     state = getattr(self.strategy, "get_state", lambda s: None)(sym)
                     if state:
+                        # sell_only is a permanent latch: _refresh_prediction resets
+                        # with_position every candle, so setting only with_position
+                        # would re-arm buys within ~75s (#115).
+                        state.sell_only = True
                         state.with_position = False
                 self._waiting_for_fills = True
                 logger.info("Dashboard: wait_fills – sell-only mode active, will stop when all filled")
@@ -431,6 +493,11 @@ class Engine:
             try:
                 # Cancel open broker orders
                 self.broker.cancel_all(sym)
+                # Drop persisted open_orders rows so a live restart doesn't reconcile
+                # against orders cancelled during emergency shutdown (#134).
+                if self.reconciler:
+                    for o in self.reconciler.get_tracked_orders(sym):
+                        self.reconciler.remove_order(o["client_id"])
                 self._active_orders[sym] = {}
 
                 # For live broker: place market sell for open positions
@@ -453,14 +520,36 @@ class Engine:
                         from core.strategy import Fill
                         for cid, o in list(state.orders.items()):
                             if o.get("side") == "sell" and not o.get("filled") and "bought_at" in o and not o.get("pre_seeded"):
+                                # #180: only the sell-side fee here — the buy fee
+                                # was already deducted at buy-fill time
+                                # (paper.py update_price). Charging a round-trip
+                                # fee would double-count the buy fee, mirroring
+                                # the floor-SL path (grid.py:752).
+                                sell_fee = price * o["qty"] * KRAKEN_FEE
                                 fill = Fill(
                                     client_id=cid,
                                     symbol=sym, side="sell",
                                     price=price, qty=o["qty"],
-                                    fee=price * o["qty"] * 2 * KRAKEN_FEE,
+                                    fee=sell_fee,
                                     ts=time.time(),
                                 )
                                 self.strategy.on_fill(fill, self.ctx)
+                                # #180: on_fill only updates in-memory total_profit
+                                # and logs the trade — it never touches the broker
+                                # cash bucket. Since cancel_all() above already
+                                # cancelled the broker sell order, update_price will
+                                # never credit margin+PnL back. Credit it here,
+                                # identically to the floor-SL path (grid.py:747-754),
+                                # so the persisted paper balance keeps the full
+                                # margin instead of leaking it on every sell_all stop.
+                                entry_lev = o.get("leverage", 1.0) or 1.0
+                                bought_at = o["bought_at"]
+                                credit = (
+                                    bought_at * o["qty"] / entry_lev
+                                    + (price - bought_at) * o["qty"]
+                                    - sell_fee
+                                )
+                                self.broker.sl_credit(sym, credit)
             except Exception as e:
                 logger.error("Emergency sell failed %s: %s", sym, e)
 
@@ -604,7 +693,66 @@ class Engine:
         except Exception as e:
             logger.debug("update_prediction_outcomes failed: %s", e)
 
+    def _mtm_close_paper_positions(self):
+        """#183: Before shutdown, mark-to-market open paper positions into the
+        cash balance so a restart does not lose their bound margin + unrealized
+        PnL.
+
+        Only the per-tick *cash* balance is persisted (save_paper_balances); the
+        open positions themselves are never persisted or rehydrated. Without this,
+        every SIGTERM/restart/crash (i.e. everything except the sell_all graceful
+        stop, which already closes positions) drops the persisted equity by the
+        full margin + unrealized of each open position — permanently, cumulatively.
+
+        We credit exactly ``margin + unrealized`` (no synthetic sell fee), which is
+        precisely what _log_equity reports as that position's MTM, so the persisted
+        cash equals the equity that was last displayed — continuity, no phantom
+        gain or loss. The redeployed cash pays normal buy fees next session.
+
+        Positions already closed via _emergency_sell_all (sell_all stop) have been
+        popped from state.orders, so this is a no-op there — no double credit.
+        """
+        from execution.paper import PaperBroker
+        if not isinstance(self.broker, PaperBroker):
+            return
+        for sym in self.symbols:
+            try:
+                price = self._last_prices.get(sym, 0.0)
+                if price <= 0:
+                    continue  # no known price → cannot MTM; leave balance as-is
+                state = getattr(self.strategy, "get_state", lambda s: None)(sym)
+                if state is None:
+                    continue
+                for cid, o in list(state.orders.items()):
+                    if (
+                        not o.get("filled")
+                        and o.get("side") == "sell"
+                        and "bought_at" in o
+                        and not o.get("pre_seeded")
+                    ):
+                        qty = o.get("qty", 0.0)
+                        bought_at = o["bought_at"]
+                        # entry leverage (what the buy fill deducted margin at)
+                        entry_lev = o.get("leverage", 1.0) or 1.0
+                        margin = qty * bought_at / entry_lev
+                        unrealized = qty * (price - bought_at)
+                        self.broker.sl_credit(sym, margin + unrealized)
+                        # Credit exactly once: drop the position so a re-entrant
+                        # _log_equity/MTM cannot count it again.
+                        state.orders.pop(cid, None)
+            except Exception:
+                logger.debug("MTM-close failed for %s", sym, exc_info=True)
+
     def _cleanup(self):
+        # #183: settle open paper positions into cash *before* the final persist
+        # so restart equity keeps the bound margin instead of leaking it.
+        try:
+            self._mtm_close_paper_positions()
+            if hasattr(self.broker, "_balances") and self.broker._balances:
+                from dashboard.db import save_paper_balances
+                save_paper_balances(dict(self.broker._balances))
+        except Exception:
+            logger.debug("cleanup MTM persist failed", exc_info=True)
         try:
             from core.lifecycle import release_singleton
             release_singleton()

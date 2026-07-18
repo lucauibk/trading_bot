@@ -253,7 +253,7 @@ predict(symbol)
   │
   ├── blend_scores: 0.55 × lgbm + 0.45 × llm
   │
-  ├── if blended_conf >= MIN_CONFIDENCE (0.45):
+  ├── if blended_conf >= MIN_CONFIDENCE (0.65):
   │     score > +0.15 → "up", score < -0.15 → "down", sonst "neutral"
   │
   └── else: Fallback _rule_based() → score ±0.5
