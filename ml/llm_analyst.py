@@ -144,7 +144,11 @@ def analyse(symbol: str, indicators: dict) -> Optional[dict]:
         data = json.loads(raw)
 
         direction  = data.get("direction", "neutral")
-        confidence = float(data.get("confidence", 0.5))
+        # Claude occasionally returns a percentage (85) or an out-of-range value
+        # instead of a 0.0–1.0 confidence. Left unclamped, score = ±85 sails past
+        # the LLM_CONFIDENCE_MIN gate and, once clamped downstream to ±1.0, sizes a
+        # max-conviction leveraged directional trade off one malformed number (#151).
+        confidence = min(1.0, max(0.0, float(data.get("confidence", 0.5))))
         reason     = data.get("reason", "")
 
         score_map = {"up": 1.0, "neutral": 0.0, "down": -1.0}
@@ -191,7 +195,12 @@ def blend_scores(lgbm_score: float, lgbm_confidence: float,
     Gibt (blended_score, blended_confidence) zurück.
     score: -1.0 (down) … +1.0 (up)
     """
-    if llm_result is None or llm_result["confidence"] < LLM_CONFIDENCE_MIN:
+    # Defensive re-clamp: analyse() already clamps, but blend_scores can be handed
+    # a cached/DB-loaded result, so never trust the range here either (#151).
+    if llm_result is None:
+        return lgbm_score, lgbm_confidence
+    llm_conf = min(1.0, max(0.0, llm_result["confidence"]))
+    if llm_conf < LLM_CONFIDENCE_MIN:
         return lgbm_score, lgbm_confidence
 
     # A confident *neutral* LLM is confidence in NO direction — feeding its raw
@@ -199,10 +208,13 @@ def blend_scores(lgbm_score: float, lgbm_confidence: float,
     # neutral LLM clear MIN_CONFIDENCE and open a leveraged directional. Zero the
     # LLM's directional-confidence contribution for a neutral call, mirroring the
     # LGBM-side directional_lgbm_conf() fix (#103) applied here for the LLM (#129).
-    llm_score = llm_result["score"]
-    llm_conf_dir = 0.0 if llm_result.get("direction") == "neutral" else llm_result["confidence"]
+    # llm_conf ist bereits geclampt (#151) — Neutral-Zero wirkt auf dem Clamp-Wert.
+    llm_score = min(1.0, max(-1.0, llm_result["score"]))
+    llm_conf_dir = 0.0 if llm_result.get("direction") == "neutral" else llm_conf
     blended   = (1 - LLM_WEIGHT) * lgbm_score + LLM_WEIGHT * llm_score
     blended_conf = (1 - LLM_WEIGHT) * lgbm_confidence + LLM_WEIGHT * llm_conf_dir
+    blended      = min(1.0, max(-1.0, blended))
+    blended_conf = min(1.0, max(0.0, blended_conf))
 
     logger.debug(
         "Blend: LGBM=%+.2f (%.2f) + LLM=%+.2f (%.2f, dir_conf=%.2f) → %+.2f (%.2f)",
