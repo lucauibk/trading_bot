@@ -102,6 +102,11 @@ class _GridState:
         self._last_pred_low = 0.0
         self._last_pred_high = 0.0
         self.with_position = False
+        # Permanent sell-only latch for the graceful "wait_fills" shutdown. Unlike
+        # with_position (recomputed every candle from the prediction), this is never
+        # reset by _refresh_prediction, so the bot cannot re-arm buys after the user
+        # requested a graceful stop. (#115)
+        self.sell_only = False
 
         # Directional trade state
         self._directional: dict = {}
@@ -137,6 +142,10 @@ class GridStrategy(Strategy):
         self._mtf_bias: dict = {}
         self._mtf_setup: dict = {}
         self._mtf_bias_ts: dict = {}
+        # Symbols whose SL/directional-exit checks already ran via on_tick_safety
+        # this engine tick — on_tick must not run them a second time (#146),
+        # otherwise the momentum_hold_max SL deferral is consumed twice per tick.
+        self._safety_checked: set = set()
 
     def _lev(self) -> float:
         """Pinned leverage from params (backtest/sweep determinism) or live dashboard value."""
@@ -244,6 +253,9 @@ class GridStrategy(Strategy):
         return total
 
     def _buys_allowed(self, state: _GridState) -> bool:
+        # Graceful wait_fills stop: no new buys, ever, regardless of prediction.
+        if state.sell_only:
+            return False
         if not state.with_position:
             return False
         if self.p.trend_filter_enabled and state._hard_trend_down:
@@ -294,7 +306,9 @@ class GridStrategy(Strategy):
 
         state._last_prediction = direction
         state._direction_score = score
-        state.with_position = direction != "down"
+        # Once a graceful wait_fills stop is latched, keep buys off — never let a
+        # fresh "up"/"neutral" prediction flip with_position back on. (#115)
+        state.with_position = False if state.sell_only else (direction != "down")
 
     def _build_grid_params(self, symbol: str, price: float, state: _GridState):
         """Compute (lower, upper, levels, range_pct, regime, confidence)."""
@@ -424,36 +438,54 @@ class GridStrategy(Strategy):
         except ValueError:
             idx = None
 
+        # Determine the take-profit sell level for this filled buy. Normally the
+        # next grid line above the buy. But a buy can fill at a price that is NOT a
+        # current grid line — a neutral-replenish of a pre-seeded sell (bought_at is
+        # the build-time price), or a buy still resting from before a grid rebuild.
+        # In those cases idx is None (or the buy sits at the top line) and the old
+        # code skipped sell+SL creation entirely, leaving an unsellable, unstopped
+        # position with unbounded downside — defeating the floor-SL design (#127).
+        # Always create a sell carrying both the TP and the SL.
         if idx is not None and idx < len(state.grid_lines) - 1:
             sell_price = state.grid_lines[idx + 1]
-            if self.p.sl_mode == "floor" and state.floor_sl > 0:
-                # Per-cohort mode: use the floor stamped at seeding time so each
-                # rebuild cohort has its own SL trigger.  A breach then only flushes
-                # that cohort, not all accumulated positions from every rebuild.
-                sl_price = (order.get("cohort_floor", state.floor_sl)
-                            if self.p.floor_sl_per_cohort else state.floor_sl)
+        else:
+            above = [gl for gl in state.grid_lines if gl > buy_price]
+            if above:
+                sell_price = min(above)          # snap to nearest grid line above
+            elif len(state.grid_lines) >= 2:
+                grid_step = state.grid_lines[1] - state.grid_lines[0]
+                sell_price = buy_price + grid_step  # synthetic step matching grid spacing
             else:
-                step_pct = (sell_price - buy_price) / buy_price
-                sl_pct = max(step_pct * self.p.per_pos_sl_step_mult, self.p.per_pos_sl_min_pct)
-                # Hard-cap: no per-position SL can be wider than per_pos_sl_max_pct (4%)
-                sl_pct = min(sl_pct, self.p.per_pos_sl_max_pct)
-                sl_price = buy_price * (1 - sl_pct)
+                sell_price = buy_price * (1 + self.p.per_pos_sl_min_pct)
 
-            sell_cid = str(uuid.uuid4())
-            state.orders[sell_cid] = {
-                "side": "sell",
-                "price": sell_price,
-                "qty": qty,
-                "filled": False,
-                "bought_at": buy_price,
-                "sl_price": sl_price,
-                "leverage": lev,
-                "trailing_activated": False,
-                "momentum_holds": 0,
-            }
-            state.price_to_id[sell_price] = sell_cid
-            logger.info("[GRID] BUY fill %s @ %.4f | SL=%.4f | -> sell @ %.4f",
-                        fill.symbol, buy_price, sl_price, sell_price)
+        if self.p.sl_mode == "floor" and state.floor_sl > 0:
+            # Per-cohort mode: use the floor stamped at seeding time so each
+            # rebuild cohort has its own SL trigger.  A breach then only flushes
+            # that cohort, not all accumulated positions from every rebuild.
+            sl_price = (order.get("cohort_floor", state.floor_sl)
+                        if self.p.floor_sl_per_cohort else state.floor_sl)
+        else:
+            step_pct = (sell_price - buy_price) / buy_price
+            sl_pct = max(step_pct * self.p.per_pos_sl_step_mult, self.p.per_pos_sl_min_pct)
+            # Hard-cap: no per-position SL can be wider than per_pos_sl_max_pct (4%)
+            sl_pct = min(sl_pct, self.p.per_pos_sl_max_pct)
+            sl_price = buy_price * (1 - sl_pct)
+
+        sell_cid = str(uuid.uuid4())
+        state.orders[sell_cid] = {
+            "side": "sell",
+            "price": sell_price,
+            "qty": qty,
+            "filled": False,
+            "bought_at": buy_price,
+            "sl_price": sl_price,
+            "leverage": lev,
+            "trailing_activated": False,
+            "momentum_holds": 0,
+        }
+        state.price_to_id[sell_price] = sell_cid
+        logger.info("[GRID] BUY fill %s @ %.4f | SL=%.4f | -> sell @ %.4f",
+                    fill.symbol, buy_price, sl_price, sell_price)
 
         ctx.add_position(Position(
             symbol=fill.symbol, side="grid",
@@ -562,8 +594,15 @@ class GridStrategy(Strategy):
         if not state:
             return []
 
-        self._check_position_stops(symbol, price, state, ctx)
-        self._check_directional(symbol, price, state, ctx)
+        # on_tick_safety already ran the SL/TP + directional-exit checks for this
+        # symbol this tick (engine always calls it first). Running them again here
+        # would burn the momentum_hold_max deferral twice in one tick (#146). Only
+        # re-run them when on_tick is invoked standalone (e.g. unit tests).
+        if symbol in self._safety_checked:
+            self._safety_checked.discard(symbol)
+        else:
+            self._check_position_stops(symbol, price, state, ctx)
+            self._check_directional(symbol, price, state, ctx)
         self._maybe_open_directional(symbol, price, state, ctx)
         self._check_mtf_entry(symbol, price, state, ctx)
         self._update_trailing_stops(symbol, price, state)
@@ -580,6 +619,9 @@ class GridStrategy(Strategy):
             # the market dumps. _check_directional only ever *closes* a position, never
             # opens one, so it is safe on the freeze path (#104).
             self._check_directional(symbol, price, state, ctx)
+            # Mark this symbol so the paired on_tick this tick doesn't repeat the
+            # SL/directional checks (#146).
+            self._safety_checked.add(symbol)
 
     def _update_trailing_stops(self, symbol: str, price: float, state: _GridState):
         atr = state._atr
@@ -757,6 +799,13 @@ class GridStrategy(Strategy):
                 ctx.remove_position(symbol, "grid")
                 # Remove from orders after SL
                 state.orders.pop(cid, None)
+            elif order.get("momentum_holds"):
+                # #165: price recovered back above the SL — reset the momentum-hold
+                # budget so it acts per-dip-episode (N ticks of grace per contiguous
+                # touch), not as a lifetime total. Without this reset the counter
+                # only ever grows, so after a couple of independent dips a later dip
+                # stops out immediately even while the score is still bullish.
+                order["momentum_holds"] = 0
 
     def _maybe_open_directional(self, symbol: str, price: float,
                                  state: _GridState, ctx: MarketContext):

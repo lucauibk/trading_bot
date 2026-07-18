@@ -667,7 +667,12 @@ def cmd_run_sweep(symbol: str):
     try:
         from strategies.grid import GridStrategy
         from backtest.engine import run_backtest
-        strategy = GridStrategy([{"symbol": symbol, "investment": 200.0, "levels": 8}])
+        # ml_enabled=False: this is an offline backtest — the ML predict path pulls
+        # live Kraken data and calls LightGBM/Claude Haiku (slow, non-deterministic,
+        # paid API). GRIDBOT_BACKTEST only gates DB logging/notifier, not ML. Matches
+        # sweep.py and backtest/engine.py, the other backtest call sites. (#130)
+        strategy = GridStrategy([{"symbol": symbol, "investment": 200.0, "levels": 8}],
+                                ml_enabled=False)
         results = run_backtest(strategy, df, symbol, initial_balance=200.0)
         results.pop("equity_curve", None)
         results.pop("pnls", None)
