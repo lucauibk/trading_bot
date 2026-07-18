@@ -1420,3 +1420,25 @@ class TestMomentumHoldReset:
         assert "c1" in state.orders
         strategy._check_position_stops("SOL/USD", 97.0, state, ctx)  # budget spent → SL
         assert "c1" not in state.orders, "contiguous dip must still stop out after max"
+
+
+class TestDirectionalDisabledInConfig:
+    """#188: config/grid_params.json must keep the directional path disabled.
+    directional trades bypass the broker (#33/#51) — their PnL is invisible to the
+    equity curve and daily-drawdown brake — and the last OOS backtest showed a 12%
+    win rate. The shipped config drifted to true; this locks it back to false."""
+
+    def test_config_directional_disabled(self):
+        import json
+        from pathlib import Path
+        cfg = json.loads((Path(__file__).parents[1] / "config" / "grid_params.json").read_text())
+        assert cfg.get("directional_enabled") is False, \
+            "config/grid_params.json must ship with directional_enabled=false (#188)"
+
+    def test_loaded_params_have_directional_off(self):
+        import json
+        from pathlib import Path
+        from strategies.grid_params import GridParams
+        cfg = json.loads((Path(__file__).parents[1] / "config" / "grid_params.json").read_text())
+        params = GridParams.from_dict(cfg)
+        assert params.directional_enabled is False
