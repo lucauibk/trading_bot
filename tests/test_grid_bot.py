@@ -182,6 +182,130 @@ class TestMLFeatures:
         assert conf == 0.8
 
 
+class TestReconcilerOrderCleanup:
+    """Regression for #134: the live reconciler's open_orders table must be pruned
+    on cancel and on fill — remove_order() had zero callers, leaking the table."""
+
+    class _StubReconciler:
+        def __init__(self):
+            self.removed = []
+            self._fills = []
+
+        def reconcile(self):
+            return self._fills
+
+        def remove_order(self, client_id):
+            self.removed.append(client_id)
+
+        def track_order(self, *a, **k):
+            pass
+
+        def get_tracked_orders(self, symbol=None):
+            return []
+
+    class _StubBroker:  # deliberately NOT a PaperBroker so live paths run
+        def __init__(self):
+            self.cancelled = []
+
+        def cancel(self, cid):
+            self.cancelled.append(cid)
+
+    class _StubStrategy:
+        _broker = None
+
+        def desired_orders(self, symbol, price, ctx):
+            return []  # nothing desired → existing active order gets cancelled
+
+        def on_fill(self, fill, ctx):
+            pass
+
+    def _engine(self, reconciler):
+        from core.engine import Engine
+        return Engine(self._StubStrategy(), self._StubBroker(), ["X/USD"],
+                      reconciler=reconciler)
+
+    def test_cancel_removes_persisted_order(self):
+        rec = self._StubReconciler()
+        eng = self._engine(rec)
+        eng._active_orders["X/USD"] = {"c1": object()}
+        eng._sync_orders("X/USD", 100.0)
+        assert eng.broker.cancelled == ["c1"]
+        assert rec.removed == ["c1"]
+
+    def test_fill_removes_persisted_order(self):
+        from core.strategy import Fill
+        rec = self._StubReconciler()
+        rec._fills = [Fill(client_id="c1", symbol="X/USD", side="buy",
+                           price=100.0, qty=1.0, fee=0.0, ts=time.time())]
+        eng = self._engine(rec)
+        eng._reconcile_fills()
+        assert rec.removed == ["c1"]
+
+    def test_reconciler_remove_order_round_trip(self, tmp_path, monkeypatch):
+        import execution.reconciler as recmod
+        monkeypatch.setattr(recmod, "_DB_PATH", tmp_path / "t.db")
+        r = recmod.Reconciler(lambda since: [])
+        r.track_order("c1", "x1", "X/USD", "buy", 100.0, 1.0)
+        assert any(o["client_id"] == "c1" for o in r.get_tracked_orders())
+        r.remove_order("c1")
+        assert r.get_tracked_orders() == []
+
+
+class TestRefreshRollbackFeatureNames:
+
+    def test_rollback_restores_feature_names(self, monkeypatch):
+        """Regression for #119: when a daily refresh trains a worse model on a
+        different feature count and is rolled back, _feature_names must be restored
+        alongside _clf. Otherwise _clf (34 feats) and _feature_names (16) desync and
+        predict()'s feature-count guard trips permanently → silent (hold, 0.0)."""
+        import numpy as np
+        import pandas as pd
+        import ml.trainer as trainer
+        from ml.model import TradingModel
+
+        m = TradingModel("TEST/USD")
+
+        class _OldClf:
+            classes_ = np.array([0, 1, 2])
+
+            def predict_proba(self, x):
+                return np.array([[0.1, 0.2, 0.7]])
+
+        old_clf = _OldClf()
+        m._clf = old_clf
+        m._n_samples = 500
+        m._last_oos_f1 = 0.60
+        m._feature_names = [f"f{i}" for i in range(34)]  # good model: 34 features
+
+        # Simulate train(): produces a *worse* model trained on only 16 features,
+        # exactly as the 34→16 fallback path would when it fires for the whole window.
+        def fake_train(X, y):
+            m._clf = object()
+            m._n_samples = len(X)
+            m._last_oos_f1 = 0.40  # worse by >0.05 → triggers rollback
+            m._feature_names = [f"f{i}" for i in range(16)]
+
+        monkeypatch.setattr(m, "train", fake_train)
+        monkeypatch.setattr(m, "_save", lambda: None)
+        monkeypatch.setattr(TradingModel, "MIN_SAMPLES", 5)
+        monkeypatch.setattr(trainer, "_extract_training_features",
+                            lambda df, window, btc_corr=0.0: np.zeros(34, np.float32))
+        monkeypatch.setattr(trainer, "_get_atr_pct", lambda df, i: 0.01)
+        monkeypatch.setattr(trainer, "_compute_label_triple_barrier",
+                            lambda df, i, atr_pct: i % 3)
+
+        n = 80
+        df = pd.DataFrame({"close": np.linspace(100, 110, n)})
+        trainer.refresh_from_recent_history("TEST/USD", df, store=None, model=m)
+
+        # Rollback must restore BOTH the old classifier and its feature names.
+        assert m._clf is old_clf
+        assert len(m._feature_names) == 34
+        # And predict() with a real 34-feature vector must not hit the mismatch guard.
+        label, conf = m.predict(np.zeros(34, dtype=np.float32))
+        assert label == 2 and conf == pytest.approx(0.7)
+
+
 # ── optimize.py ready-for-live drawdown gate ─────────────────────────────────
 
 class TestReadyForLiveDrawdown:
@@ -235,6 +359,27 @@ class TestSweepCLI:
         from scripts.sweep import build_parser
         args = build_parser().parse_args([])
         assert args.symbol is None
+
+    def test_run_sweep_disables_live_ml(self, monkeypatch):
+        """Regression for #130: cmd_run_sweep is an offline backtest and must build
+        GridStrategy with ml_enabled=False — otherwise the ML predict path makes live
+        Kraken fetches and paid LightGBM/Claude calls during the sweep."""
+        import data_fetcher
+        import backtest.engine as bt
+        from scripts import optimize
+
+        df = _make_df(120)
+        monkeypatch.setattr(data_fetcher, "fetch_ohlcv", lambda *a, **k: df)
+
+        captured = {}
+
+        def fake_run_backtest(strategy, *a, **k):
+            captured["ml_enabled"] = strategy._ml_enabled
+            return {"total_pnl": 0.0}
+
+        monkeypatch.setattr(bt, "run_backtest", fake_run_backtest)
+        optimize.cmd_run_sweep("SOL/USD")
+        assert captured["ml_enabled"] is False
 
 
 # ── MLPredictor error path (#117) ────────────────────────────────────────────
@@ -331,6 +476,21 @@ class TestBacktestMetrics:
         assert "hit_rate_pct" in result
         assert "profit_factor" in result
 
+    def test_summary_pnls_longer_than_equity_no_indexerror(self):
+        """Regression for #131: pnls is filled per SL/TP tick AND per fill while
+        equity_curve grows one entry per candle, so len(pnls) can exceed
+        len(equity_curve). summary() must not raise IndexError (which the sweep
+        silently swallows as {"error": ...} → selection bias)."""
+        from backtest.metrics import summary
+        pnls = [1.0, -0.5, 2.0, -1.0, 0.7, 3.0, -2.0]   # 7 realized pnls
+        equity = [1000, 1002, 1001]                      # only 3 candle snapshots
+        assert len(pnls) > len(equity)
+        result = summary(pnls, equity, days=10)          # must not raise
+        assert result["n_trades"] == 7
+        # Returns normalized by starting capital (1000), not a per-candle equity.
+        assert result["sharpe"] == pytest.approx(
+            summary([p * 2 for p in pnls], [2000, 2004, 2002], days=10)["sharpe"])
+
 
 # ── Risk Manager ─────────────────────────────────────────────────────────────
 
@@ -417,6 +577,39 @@ class TestGridStrategy:
 
         sells_after = sum(1 for o in state.orders.values() if o["side"] == "sell")
         assert sells_after > sells_before
+
+    def test_sell_only_latch_blocks_buys_and_survives_refresh(self):
+        """Regression for #115: after a graceful wait_fills stop, sell_only must
+        block all buys AND survive _refresh_prediction — an "up"/"neutral" prediction
+        must not re-arm with_position and let the bot keep buying."""
+        from core.context import MarketContext
+        from strategies.grid import GridStrategy
+        # ml_enabled=False → deterministic rule-based prediction, no network.
+        strategy = GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                                ml_enabled=False)
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+
+        # A strong uptrend df → the rule-based prediction (ML disabled) yields "up".
+        n = 60
+        close = pd.Series(np.linspace(100, 140, n))
+        df = pd.DataFrame({
+            "open": close * 0.999, "high": close * 1.002,
+            "low": close * 0.998, "close": close,
+            "volume": np.full(n, 1000.0),
+        })
+
+        # Sanity: without the latch, an uptrend arms buys.
+        strategy._refresh_prediction("SOL/USD", df, ctx)
+        assert state.with_position is True
+        assert strategy._buys_allowed(state) is True
+
+        # Latch the graceful stop, then let a fresh uptrend prediction run.
+        state.sell_only = True
+        strategy._refresh_prediction("SOL/USD", df, ctx)
+        assert state.with_position is False           # not re-armed
+        assert strategy._buys_allowed(state) is False  # buys stay blocked
 
     def test_per_position_sl_fires_on_tick(self):
         from core.context import MarketContext
@@ -930,6 +1123,90 @@ class TestEmergencyStopSL:
         assert calls["safety"] == 1   # SL/TP still runs (was 0 before the fix)
         assert calls["on_tick"] == 0  # no new buys
         assert calls["sync"] == 0     # no new orders submitted
+
+
+class TestCoinSettingsLiveToggle:
+    """#184: the dashboard coin `enabled` toggle must work as a *live* control.
+    A coin disabled mid-run is re-read each tick (paper only) and frozen like an
+    emergency stop — no new buys (on_tick/_sync_orders), but SL/TP stays live.
+    """
+
+    def _run_one_tick(self, monkeypatch, enabled):
+        import types
+        from core.engine import Engine
+        from execution.paper import PaperBroker
+        from core.context import MarketContext
+
+        calls = {"safety": 0, "on_tick": 0, "sync": 0}
+        state = types.SimpleNamespace(total_profit=0.0,
+                                      investment=100.0, grid_lines=[])
+
+        class FakeStrategy:
+            _broker = None
+            def get_state(self, s): return state
+            def on_tick_safety(self, s, p, ctx): calls["safety"] += 1
+            def on_tick(self, s, p, ctx): calls["on_tick"] += 1
+            def on_candle(self, s, df, ctx): pass
+
+        broker = PaperBroker(initial_balance=100.0, symbols=["SOL/USD"])
+        eng = Engine(FakeStrategy(), broker, ["SOL/USD"],
+                     ctx=MarketContext(), initial_capital=100.0)
+
+        for name in ("_check_dashboard_stop", "_check_daily_drawdown",
+                     "_reconcile_fills", "_log_equity"):
+            monkeypatch.setattr(eng, name, lambda *a, **k: None)
+        monkeypatch.setattr(eng, "_update_dashboard", lambda s, p: None)
+        monkeypatch.setattr(eng, "_update_prediction_outcomes", lambda f: None)
+        monkeypatch.setattr(eng, "_sync_orders",
+                            lambda s, p: calls.__setitem__("sync", calls["sync"] + 1))
+
+        # Drive _refresh_coin_settings via the real DB helper (monkeypatched).
+        import dashboard.db as ddb
+        monkeypatch.setattr(
+            ddb, "get_all_coin_settings",
+            lambda: [{"symbol": "SOL/USD", "max_investment": 100.0,
+                      "enabled": 1 if enabled else 0}],
+        )
+
+        import data_fetcher
+        monkeypatch.setattr(data_fetcher, "fetch_ticker", lambda s: {"last": 100.0})
+        monkeypatch.setattr(data_fetcher, "fetch_ohlcv", lambda *a, **k: None)
+        import core.engine as ce
+        monkeypatch.setattr(ce.time, "sleep", lambda *a, **k: None)
+
+        eng._loop_count = 1
+        eng._tick()
+        return calls, eng
+
+    def test_enabled_coin_trades_normally(self, monkeypatch):
+        calls, eng = self._run_one_tick(monkeypatch, enabled=True)
+        assert calls == {"safety": 1, "on_tick": 1, "sync": 1}
+        assert eng._disabled_coins == set()
+
+    def test_disabled_coin_keeps_sl_blocks_orders(self, monkeypatch):
+        calls, eng = self._run_one_tick(monkeypatch, enabled=False)
+        assert calls["safety"] == 1   # SL/TP still protects open positions
+        assert calls["on_tick"] == 0  # no new buys
+        assert calls["sync"] == 0     # no new orders submitted
+        assert eng._disabled_coins == {"SOL/USD"}
+
+    def test_refresh_is_paper_only(self, monkeypatch):
+        # Live broker must not be touched (Live-Parität lock, #171) — refresh no-ops.
+        from core.engine import Engine
+        from core.context import MarketContext
+
+        class FakeLiveBroker:  # not a PaperBroker
+            def cancel_all(self, s): pass
+
+        called = {"n": 0}
+        import dashboard.db as ddb
+        monkeypatch.setattr(ddb, "get_all_coin_settings",
+                            lambda: called.__setitem__("n", called["n"] + 1) or [])
+        eng = Engine(object(), FakeLiveBroker(), ["SOL/USD"],
+                     ctx=MarketContext(), initial_capital=100.0)
+        eng._refresh_coin_settings()
+        assert called["n"] == 0                 # DB never queried for a live broker
+        assert eng._disabled_coins == set()
 # ── Engine equity staleness (#89) ─────────────────────────────────────────────
 
 class TestEquityStaleGuard:
@@ -1123,6 +1400,135 @@ class TestFloorSLCredit:
         amount = self._sl_credit_amount(monkeypatch, entry_lev=2.0, live_lev=1.0)
         expected = 100.0 / 2.0 + (98.0 - 100.0) - 98.0 * KRAKEN_FEE
         assert amount == pytest.approx(expected)
+
+
+class TestEmergencySellAllCredit:
+    """#180: the graceful "sell_all" paper stop must credit margin+PnL back to
+    the broker cash bucket, exactly like the floor-SL path. Before the fix the
+    synthetic sell only updated in-memory total_profit and logged the trade;
+    the broker sell order was already cancelled, so update_price never credited
+    the margin -> the persisted balance leaked margin+unrealized on every stop.
+    """
+
+    def _run_emergency(self, monkeypatch, entry_lev, sell_price):
+        from core.engine import Engine, KRAKEN_FEE
+        from execution.paper import PaperBroker
+        from strategies.grid import GridStrategy, _GridState
+        from strategies.grid_params import GridParams
+        from core.context import MarketContext
+
+        monkeypatch.setenv("GRIDBOT_BACKTEST", "1")  # skip dashboard/notifier
+
+        strat = GridStrategy(
+            [{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+            ml_enabled=False,
+            params=GridParams(leverage=entry_lev),
+        )
+        broker = PaperBroker(initial_balance=100.0, symbols=["SOL/USD"])
+        strat._broker = broker
+
+        state = _GridState("SOL/USD", 100.0, 6, 0.05)
+        state.orders["sell1"] = {
+            "side": "sell", "price": 110.0, "qty": 1.0, "filled": False,
+            "bought_at": 100.0, "sl_price": 99.0, "leverage": entry_lev,
+            "momentum_holds": 0, "entry_ts": 0.0,
+        }
+        strat._states["SOL/USD"] = state
+
+        eng = Engine(strat, broker, ["SOL/USD"],
+                     ctx=MarketContext(), initial_capital=100.0)
+
+        import data_fetcher
+        monkeypatch.setattr(data_fetcher, "fetch_ticker",
+                            lambda s: {"last": sell_price})
+
+        bucket_before = broker._balances["SOL/USD"]
+        eng._emergency_sell_all()
+        return broker._balances["SOL/USD"], bucket_before, KRAKEN_FEE
+
+    def test_bucket_credited_margin_and_pnl(self, monkeypatch):
+        after, before, fee = self._run_emergency(monkeypatch, entry_lev=1.0,
+                                                 sell_price=105.0)
+        # margin(100) + pnl(+5) - sell_fee(105*fee); buy fee NOT re-charged.
+        credit = 100.0 / 1.0 + (105.0 - 100.0) - 105.0 * fee
+        assert after == pytest.approx(before + credit)
+
+    def test_bucket_credit_uses_entry_leverage(self, monkeypatch):
+        after, before, fee = self._run_emergency(monkeypatch, entry_lev=2.0,
+                                                 sell_price=105.0)
+        credit = 100.0 / 2.0 + (105.0 - 100.0) - 105.0 * fee
+        assert after == pytest.approx(before + credit)
+
+
+class TestPaperRestartMargin:
+    """#183: normal SIGTERM/restart/crash never sells open positions, and only
+    the cash balance is persisted (not the positions). Without settling them,
+    each restart drops the persisted equity by the full margin + unrealized PnL.
+    _mtm_close_paper_positions() must credit exactly margin+unrealized (== the MTM
+    _log_equity reports) into the bucket so restart equity == displayed equity.
+    """
+
+    def _build_engine(self, entry_lev, last_price):
+        from core.engine import Engine
+        from execution.paper import PaperBroker
+        from strategies.grid import GridStrategy, _GridState
+        from strategies.grid_params import GridParams
+        from core.context import MarketContext
+
+        strat = GridStrategy(
+            [{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+            ml_enabled=False,
+            params=GridParams(leverage=entry_lev),
+        )
+        broker = PaperBroker(initial_balance=100.0, symbols=["SOL/USD"])
+        strat._broker = broker
+
+        state = _GridState("SOL/USD", 100.0, 6, 0.05)
+        state.orders["sell1"] = {
+            "side": "sell", "price": 110.0, "qty": 1.0, "filled": False,
+            "bought_at": 100.0, "sl_price": 99.0, "leverage": entry_lev,
+        }
+        strat._states["SOL/USD"] = state
+
+        eng = Engine(strat, broker, ["SOL/USD"],
+                     ctx=MarketContext(), initial_capital=100.0)
+        eng._last_prices["SOL/USD"] = last_price
+        return eng, broker, state
+
+    def test_mtm_close_credits_margin_and_unrealized(self):
+        eng, broker, state = self._build_engine(entry_lev=1.0, last_price=105.0)
+        before = broker._balances["SOL/USD"]
+        eng._mtm_close_paper_positions()
+        # margin(100) + unrealized(+5); no synthetic fee -> equity continuity.
+        assert broker._balances["SOL/USD"] == pytest.approx(before + 105.0)
+        assert "sell1" not in state.orders  # credited exactly once
+
+    def test_mtm_close_uses_entry_leverage(self):
+        eng, broker, state = self._build_engine(entry_lev=2.0, last_price=105.0)
+        before = broker._balances["SOL/USD"]
+        eng._mtm_close_paper_positions()
+        # margin(100/2=50) + unrealized(+5)
+        assert broker._balances["SOL/USD"] == pytest.approx(before + 55.0)
+
+    def test_mtm_close_skips_without_known_price(self):
+        eng, broker, state = self._build_engine(entry_lev=1.0, last_price=105.0)
+        eng._last_prices["SOL/USD"] = 0.0  # no known price
+        before = broker._balances["SOL/USD"]
+        eng._mtm_close_paper_positions()
+        assert broker._balances["SOL/USD"] == pytest.approx(before)  # unchanged
+        assert "sell1" in state.orders  # left intact, not lost
+
+    def test_mtm_close_ignores_pre_seeded(self):
+        eng, broker, state = self._build_engine(entry_lev=1.0, last_price=105.0)
+        state.orders["seed1"] = {
+            "side": "sell", "price": 120.0, "qty": 1.0, "filled": False,
+            "bought_at": 100.0, "pre_seeded": True, "leverage": 1.0,
+        }
+        before = broker._balances["SOL/USD"]
+        eng._mtm_close_paper_positions()
+        # only the real position (sell1) is credited; pre-seeded had no margin.
+        assert broker._balances["SOL/USD"] == pytest.approx(before + 105.0)
+        assert "seed1" in state.orders
 # ── Latent correctness traps (#78) ────────────────────────────────────────────
 
 class TestLatentTraps:
@@ -1155,6 +1561,113 @@ class TestLatentTraps:
 class TestTickCheckDedup:
     """on_tick_safety + on_tick must not run the SL/directional checks twice in a
     single engine tick, or the momentum_hold_max SL deferral is halved."""
+
+
+# ── Confident-neutral LLM must not inflate blended confidence (#129) ───────────
+class TestLLMNeutralConfidence:
+    def test_neutral_llm_does_not_inflate_confidence(self):
+        from ml.llm_analyst import blend_scores, LLM_WEIGHT
+        # Confident neutral LLM (passes the gate) must contribute 0 to directional conf.
+        neutral = {"direction": "neutral", "confidence": 0.90, "score": 0.0}
+        blended, conf = blend_scores(0.50, 0.50, neutral)
+        assert conf == (1 - LLM_WEIGHT) * 0.50  # LGBM-only confidence, LLM zeroed
+        assert conf < 0.50 + 1e-9
+
+    def test_directional_llm_still_contributes_confidence(self):
+        from ml.llm_analyst import blend_scores, LLM_WEIGHT
+        up = {"direction": "up", "confidence": 0.90, "score": 0.90}
+        blended, conf = blend_scores(0.50, 0.50, up)
+        assert conf == (1 - LLM_WEIGHT) * 0.50 + LLM_WEIGHT * 0.90
+
+
+# ── LLM confidence/score clamping (#151) ──────────────────────────────────────
+class TestLLMClamp:
+    """A malformed Haiku confidence (e.g. a percentage like 85) must not survive
+    into a max-conviction leveraged directional trade."""
+
+    def test_blend_clamps_out_of_range_confidence_and_score(self):
+        from ml.llm_analyst import blend_scores
+        # LLM returned confidence=85 (percent) and an out-of-range score.
+        bad = {"direction": "up", "confidence": 85.0, "score": 85.0}
+        blended, conf = blend_scores(0.2, 0.5, bad)
+        assert -1.0 <= blended <= 1.0
+        assert 0.0 <= conf <= 1.0
+
+    def test_blend_none_result_passes_through(self):
+        from ml.llm_analyst import blend_scores
+        assert blend_scores(0.3, 0.7, None) == (0.3, 0.7)
+
+    def test_blend_below_gate_returns_lgbm_only(self):
+        from ml.llm_analyst import blend_scores, LLM_CONFIDENCE_MIN
+        low = {"direction": "up", "confidence": LLM_CONFIDENCE_MIN - 0.1, "score": 1.0}
+        assert blend_scores(0.3, 0.7, low) == (0.3, 0.7)
+
+
+# ── PaperBroker balance provisioning (#149) ───────────────────────────────────
+class TestPaperBalanceProvisioning:
+    """With per-symbol buckets, the fallback pool must not double-provision the
+    account, and get_balance() must include every pool it can move money to."""
+
+    def test_seeded_buckets_do_not_double_provision(self):
+        from execution.paper import PaperBroker
+        b = PaperBroker(initial_balance=900.0, symbols=["A/USD", "B/USD", "C/USD"])
+        # Buckets already sum to 900; the hidden fallback pool must be 0, not 900.
+        assert b._balance == 0.0
+        assert b.get_balance() == 900.0
+
+    def test_unseeded_symbol_cannot_spend_the_account(self):
+        from execution.paper import PaperBroker
+        b = PaperBroker(initial_balance=900.0, symbols=["A/USD", "B/USD", "C/USD"])
+        # A symbol not in the seed list has no bucket → buy must be rejected by the
+        # affordability guard instead of draining a hidden full-account pool.
+        b.place_limit("Z/USD", "buy", 100.0, 1.0, client_id="z1")
+        fills = b.update_price("Z/USD", 100.0)
+        assert fills == []
+        assert b.get_balance() == 900.0
+
+    def test_no_symbols_keeps_single_pool(self):
+        from execution.paper import PaperBroker
+        b = PaperBroker(initial_balance=500.0)
+        assert b.get_balance() == 500.0
+
+
+class TestLeverageEndpointClamp:
+    """#150: POST /api/leverage must echo the *persisted* (clamped) leverage, not
+    the raw request value, and return 400 (not 500) on non-numeric input."""
+
+    def _client(self, monkeypatch, tmp_path):
+        import dashboard.db as ddb
+        monkeypatch.setattr(ddb, "DB_PATH", tmp_path / "trades.db")
+        import dashboard.app as dapp
+        dapp.app.config["TESTING"] = True
+        return dapp.app.test_client()
+
+    def test_over_max_leverage_echoes_clamped_value(self, monkeypatch, tmp_path):
+        client = self._client(monkeypatch, tmp_path)
+        resp = client.post("/api/leverage", json={"leverage": 8})
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert data["leverage"] == 3.0            # clamped, not the raw 8
+        assert "3.0" in data["msg"]
+
+    def test_below_min_leverage_echoes_clamped_value(self, monkeypatch, tmp_path):
+        client = self._client(monkeypatch, tmp_path)
+        resp = client.post("/api/leverage", json={"leverage": 0.2})
+        assert resp.status_code == 200
+        assert resp.get_json()["leverage"] == 1.0  # clamped up to floor
+
+    def test_invalid_input_returns_400(self, monkeypatch, tmp_path):
+        client = self._client(monkeypatch, tmp_path)
+        resp = client.post("/api/leverage", json={"leverage": "abc"})
+        assert resp.status_code == 400
+        assert resp.get_json()["ok"] is False
+
+
+class TestMomentumHoldReset:
+    """#165: the momentum-hold SL-delay budget must reset once price recovers
+    above the SL, so it grants N ticks of grace *per contiguous dip episode*,
+    not once over the whole position lifetime."""
 
     def _strategy(self, **overrides):
         from strategies.grid import GridStrategy
@@ -1192,3 +1705,75 @@ class TestTickCheckDedup:
         # Called without a preceding safety tick → must run the checks itself.
         strategy.on_tick("SOL/USD", 100.0, ctx)
         assert calls == {"stops": 1, "dir": 1}
+
+
+        params = GridParams.from_dict(
+            {"sl_mode": "floor", "leverage": 1.0,
+             "momentum_hold_score": 0.35, "momentum_hold_max": 1, **overrides})
+        return GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                            ml_enabled=False, params=params)
+
+    def _setup(self, strategy):
+        from core.context import MarketContext
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state._atr = 2.0
+        # One open long grid position with a sell/SL leg.
+        state.orders = {
+            "c1": {"side": "sell", "price": 105.0, "qty": 1.0, "filled": False,
+                   "bought_at": 100.0, "sl_price": 98.0, "momentum_holds": 0,
+                   "leverage": 1.0},
+        }
+        state._direction_score = 0.9  # strongly bullish → holds are granted
+        return ctx, state
+
+    def test_recovery_resets_hold_budget(self):
+        strategy = self._strategy()
+        ctx, state = self._setup(strategy)
+
+        # Dip #1: below SL → grace granted, no SL fire.
+        strategy._check_position_stops("SOL/USD", 97.0, state, ctx)
+        assert "c1" in state.orders, "first dip must be held, not stopped"
+        assert state.orders["c1"]["momentum_holds"] == 1
+
+        # Recovery above SL → budget must reset to 0.
+        strategy._check_position_stops("SOL/USD", 101.0, state, ctx)
+        assert state.orders["c1"]["momentum_holds"] == 0, "recovery must reset holds"
+
+        # Dip #2 (an independent episode): must be held again, not stop out.
+        strategy._check_position_stops("SOL/USD", 97.0, state, ctx)
+        assert "c1" in state.orders, "independent later dip must still get grace"
+        assert state.orders["c1"]["momentum_holds"] == 1
+
+    def test_contiguous_dip_still_exhausts_budget(self):
+        # Without any recovery, the budget is still finite: the 2nd contiguous
+        # tick below SL stops out (max=1). Guards against the reset masking the cap.
+        strategy = self._strategy()
+        ctx, state = self._setup(strategy)
+        strategy._check_position_stops("SOL/USD", 97.0, state, ctx)  # held (hold=1)
+        assert "c1" in state.orders
+        strategy._check_position_stops("SOL/USD", 97.0, state, ctx)  # budget spent → SL
+        assert "c1" not in state.orders, "contiguous dip must still stop out after max"
+
+
+class TestDirectionalDisabledInConfig:
+    """#188: config/grid_params.json must keep the directional path disabled.
+    directional trades bypass the broker (#33/#51) — their PnL is invisible to the
+    equity curve and daily-drawdown brake — and the last OOS backtest showed a 12%
+    win rate. The shipped config drifted to true; this locks it back to false."""
+
+    def test_config_directional_disabled(self):
+        import json
+        from pathlib import Path
+        cfg = json.loads((Path(__file__).parents[1] / "config" / "grid_params.json").read_text())
+        assert cfg.get("directional_enabled") is False, \
+            "config/grid_params.json must ship with directional_enabled=false (#188)"
+
+    def test_loaded_params_have_directional_off(self):
+        import json
+        from pathlib import Path
+        from strategies.grid_params import GridParams
+        cfg = json.loads((Path(__file__).parents[1] / "config" / "grid_params.json").read_text())
+        params = GridParams.from_dict(cfg)
+        assert params.directional_enabled is False
