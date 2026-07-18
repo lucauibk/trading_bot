@@ -76,7 +76,15 @@ def profit_factor(pnls: List[float]) -> float:
 
 def summary(pnls: List[float], equity_curve: List[float], days: float) -> dict:
     """Compute and return all metrics as a dict."""
-    returns = [p / max(equity_curve[i], 1) for i, p in enumerate(pnls)] if equity_curve else pnls
+    # `pnls` is appended per SL/TP tick AND per fill, while `equity_curve` grows one
+    # entry per candle (backtest/engine.py) — the two lists have unrelated lengths.
+    # Indexing equity_curve[i] with a pnl index therefore (a) can raise IndexError
+    # when len(pnls) > len(equity_curve) — silently dropping the whole config from the
+    # sweep — and (b) divides each pnl by a chronologically-unrelated candle's equity.
+    # Normalize every realized pnl by the starting capital instead: a well-defined,
+    # order-independent return series. Sharpe/Sortino are scale-invariant, so the
+    # constant denominator does not distort them (#131).
+    returns = [p / max(equity_curve[0], 1) for p in pnls] if equity_curve else list(pnls)
     total_pnl = sum(pnls)
     total_return = total_pnl / max(equity_curve[0], 1) if equity_curve else 0
 

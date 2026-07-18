@@ -126,6 +126,25 @@ def main():
         grid_params = GridParams()
     strategy = GridStrategy(grids_config, risk_manager=risk, params=grid_params)
 
+    # #188: log the effective core switches at startup so a config drift between
+    # what the docs/team assume and what the running bot actually loads is caught
+    # early (the "directional off since 2026-07-01" claim never landed in the repo
+    # until this issue). directional_enabled is documented OFF — warn loudly if a
+    # config re-enables it, since the directional path bypasses the broker
+    # (#33/#51: PnL invisible to the equity curve and the daily-drawdown brake).
+    logger.info(
+        "Core switches: directional_enabled=%s ml_enabled=%s momentum_hold_max=%s",
+        grid_params.directional_enabled, strategy._ml_enabled,
+        grid_params.momentum_hold_max,
+    )
+    if grid_params.directional_enabled:
+        logger.warning(
+            "directional_enabled=True — directional trades are ARMED. This path "
+            "bypasses the broker (#33/#51); its PnL is invisible to the equity "
+            "curve and the daily-drawdown brake. Set it false in "
+            "config/grid_params.json unless this is a deliberate, vetted run."
+        )
+
     if paper:
         from execution.paper import PaperBroker
         broker = PaperBroker(initial_balance=initial_investment, symbols=symbols)
