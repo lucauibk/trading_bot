@@ -142,6 +142,10 @@ class GridStrategy(Strategy):
         self._mtf_bias: dict = {}
         self._mtf_setup: dict = {}
         self._mtf_bias_ts: dict = {}
+        # Symbols whose SL/directional-exit checks already ran via on_tick_safety
+        # this engine tick — on_tick must not run them a second time (#146),
+        # otherwise the momentum_hold_max SL deferral is consumed twice per tick.
+        self._safety_checked: set = set()
 
     def _lev(self) -> float:
         """Pinned leverage from params (backtest/sweep determinism) or live dashboard value."""
@@ -572,8 +576,15 @@ class GridStrategy(Strategy):
         if not state:
             return []
 
-        self._check_position_stops(symbol, price, state, ctx)
-        self._check_directional(symbol, price, state, ctx)
+        # on_tick_safety already ran the SL/TP + directional-exit checks for this
+        # symbol this tick (engine always calls it first). Running them again here
+        # would burn the momentum_hold_max deferral twice in one tick (#146). Only
+        # re-run them when on_tick is invoked standalone (e.g. unit tests).
+        if symbol in self._safety_checked:
+            self._safety_checked.discard(symbol)
+        else:
+            self._check_position_stops(symbol, price, state, ctx)
+            self._check_directional(symbol, price, state, ctx)
         self._maybe_open_directional(symbol, price, state, ctx)
         self._check_mtf_entry(symbol, price, state, ctx)
         self._update_trailing_stops(symbol, price, state)
@@ -590,6 +601,9 @@ class GridStrategy(Strategy):
             # the market dumps. _check_directional only ever *closes* a position, never
             # opens one, so it is safe on the freeze path (#104).
             self._check_directional(symbol, price, state, ctx)
+            # Mark this symbol so the paired on_tick this tick doesn't repeat the
+            # SL/directional checks (#146).
+            self._safety_checked.add(symbol)
 
     def _update_trailing_stops(self, symbol: str, price: float, state: _GridState):
         atr = state._atr
