@@ -1364,6 +1364,64 @@ class TestLatentTraps:
         assert inspect.signature(data_fetcher.get_balance).parameters["currency"].default == "USD"
 
 
+class TestMomentumHoldReset:
+    """#165: the momentum-hold SL-delay budget must reset once price recovers
+    above the SL, so it grants N ticks of grace *per contiguous dip episode*,
+    not once over the whole position lifetime."""
+
+    def _strategy(self, **overrides):
+        from strategies.grid import GridStrategy
+        from strategies.grid_params import GridParams
+        params = GridParams.from_dict(
+            {"sl_mode": "floor", "leverage": 1.0,
+             "momentum_hold_score": 0.35, "momentum_hold_max": 1, **overrides})
+        return GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                            ml_enabled=False, params=params)
+
+    def _setup(self, strategy):
+        from core.context import MarketContext
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state._atr = 2.0
+        # One open long grid position with a sell/SL leg.
+        state.orders = {
+            "c1": {"side": "sell", "price": 105.0, "qty": 1.0, "filled": False,
+                   "bought_at": 100.0, "sl_price": 98.0, "momentum_holds": 0,
+                   "leverage": 1.0},
+        }
+        state._direction_score = 0.9  # strongly bullish → holds are granted
+        return ctx, state
+
+    def test_recovery_resets_hold_budget(self):
+        strategy = self._strategy()
+        ctx, state = self._setup(strategy)
+
+        # Dip #1: below SL → grace granted, no SL fire.
+        strategy._check_position_stops("SOL/USD", 97.0, state, ctx)
+        assert "c1" in state.orders, "first dip must be held, not stopped"
+        assert state.orders["c1"]["momentum_holds"] == 1
+
+        # Recovery above SL → budget must reset to 0.
+        strategy._check_position_stops("SOL/USD", 101.0, state, ctx)
+        assert state.orders["c1"]["momentum_holds"] == 0, "recovery must reset holds"
+
+        # Dip #2 (an independent episode): must be held again, not stop out.
+        strategy._check_position_stops("SOL/USD", 97.0, state, ctx)
+        assert "c1" in state.orders, "independent later dip must still get grace"
+        assert state.orders["c1"]["momentum_holds"] == 1
+
+    def test_contiguous_dip_still_exhausts_budget(self):
+        # Without any recovery, the budget is still finite: the 2nd contiguous
+        # tick below SL stops out (max=1). Guards against the reset masking the cap.
+        strategy = self._strategy()
+        ctx, state = self._setup(strategy)
+        strategy._check_position_stops("SOL/USD", 97.0, state, ctx)  # held (hold=1)
+        assert "c1" in state.orders
+        strategy._check_position_stops("SOL/USD", 97.0, state, ctx)  # budget spent → SL
+        assert "c1" not in state.orders, "contiguous dip must still stop out after max"
+
+
 class TestDirectionalDisabledInConfig:
     """#188: config/grid_params.json must keep the directional path disabled.
     directional trades bypass the broker (#33/#51) — their PnL is invisible to the
