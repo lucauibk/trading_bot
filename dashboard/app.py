@@ -276,11 +276,17 @@ def api_leverage_get():
 
 @app.route("/api/leverage", methods=["POST"])
 def api_leverage_set():
-    from dashboard.db import set_leverage
+    from dashboard.db import set_leverage, get_leverage
     data = request.get_json() or {}
-    val = float(data.get("leverage", 1.0))
+    try:
+        val = float(data.get("leverage", 1.0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "msg": "ungültiger leverage"}), 400
     set_leverage(val)
-    return jsonify({"ok": True, "leverage": val, "msg": f"Hebel auf {val:.1f}× gesetzt"})
+    # set_leverage() clamps to [1.0, 3.0]; echo the persisted value back so the
+    # dashboard never shows a leverage the bot isn't actually running with (#150).
+    actual = get_leverage()
+    return jsonify({"ok": True, "leverage": actual, "msg": f"Hebel auf {actual:.1f}× gesetzt"})
 
 
 @app.route("/api/capital", methods=["GET"])
