@@ -1364,6 +1364,39 @@ class TestLatentTraps:
         assert inspect.signature(data_fetcher.get_balance).parameters["currency"].default == "USD"
 
 
+class TestLeverageEndpointClamp:
+    """#150: POST /api/leverage must echo the *persisted* (clamped) leverage, not
+    the raw request value, and return 400 (not 500) on non-numeric input."""
+
+    def _client(self, monkeypatch, tmp_path):
+        import dashboard.db as ddb
+        monkeypatch.setattr(ddb, "DB_PATH", tmp_path / "trades.db")
+        import dashboard.app as dapp
+        dapp.app.config["TESTING"] = True
+        return dapp.app.test_client()
+
+    def test_over_max_leverage_echoes_clamped_value(self, monkeypatch, tmp_path):
+        client = self._client(monkeypatch, tmp_path)
+        resp = client.post("/api/leverage", json={"leverage": 8})
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert data["leverage"] == 3.0            # clamped, not the raw 8
+        assert "3.0" in data["msg"]
+
+    def test_below_min_leverage_echoes_clamped_value(self, monkeypatch, tmp_path):
+        client = self._client(monkeypatch, tmp_path)
+        resp = client.post("/api/leverage", json={"leverage": 0.2})
+        assert resp.status_code == 200
+        assert resp.get_json()["leverage"] == 1.0  # clamped up to floor
+
+    def test_invalid_input_returns_400(self, monkeypatch, tmp_path):
+        client = self._client(monkeypatch, tmp_path)
+        resp = client.post("/api/leverage", json={"leverage": "abc"})
+        assert resp.status_code == 400
+        assert resp.get_json()["ok"] is False
+
+
 class TestMomentumHoldReset:
     """#165: the momentum-hold SL-delay budget must reset once price recovers
     above the SL, so it grants N ticks of grace *per contiguous dip episode*,
