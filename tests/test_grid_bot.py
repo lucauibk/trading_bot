@@ -182,6 +182,61 @@ class TestMLFeatures:
         assert conf == 0.8
 
 
+class TestRefreshRollbackFeatureNames:
+
+    def test_rollback_restores_feature_names(self, monkeypatch):
+        """Regression for #119: when a daily refresh trains a worse model on a
+        different feature count and is rolled back, _feature_names must be restored
+        alongside _clf. Otherwise _clf (34 feats) and _feature_names (16) desync and
+        predict()'s feature-count guard trips permanently → silent (hold, 0.0)."""
+        import numpy as np
+        import pandas as pd
+        import ml.trainer as trainer
+        from ml.model import TradingModel
+
+        m = TradingModel("TEST/USD")
+
+        class _OldClf:
+            classes_ = np.array([0, 1, 2])
+
+            def predict_proba(self, x):
+                return np.array([[0.1, 0.2, 0.7]])
+
+        old_clf = _OldClf()
+        m._clf = old_clf
+        m._n_samples = 500
+        m._last_oos_f1 = 0.60
+        m._feature_names = [f"f{i}" for i in range(34)]  # good model: 34 features
+
+        # Simulate train(): produces a *worse* model trained on only 16 features,
+        # exactly as the 34→16 fallback path would when it fires for the whole window.
+        def fake_train(X, y):
+            m._clf = object()
+            m._n_samples = len(X)
+            m._last_oos_f1 = 0.40  # worse by >0.05 → triggers rollback
+            m._feature_names = [f"f{i}" for i in range(16)]
+
+        monkeypatch.setattr(m, "train", fake_train)
+        monkeypatch.setattr(m, "_save", lambda: None)
+        monkeypatch.setattr(TradingModel, "MIN_SAMPLES", 5)
+        monkeypatch.setattr(trainer, "_extract_training_features",
+                            lambda df, window, btc_corr=0.0: np.zeros(34, np.float32))
+        monkeypatch.setattr(trainer, "_get_atr_pct", lambda df, i: 0.01)
+        monkeypatch.setattr(trainer, "_compute_label_triple_barrier",
+                            lambda df, i, atr_pct: i % 3)
+
+        n = 80
+        df = pd.DataFrame({"close": np.linspace(100, 110, n)})
+        trainer.refresh_from_recent_history("TEST/USD", df, store=None, model=m)
+
+        # Rollback must restore BOTH the old classifier and its feature names.
+        assert m._clf is old_clf
+        assert len(m._feature_names) == 34
+        # And predict() with a real 34-feature vector must not hit the mismatch guard.
+        label, conf = m.predict(np.zeros(34, dtype=np.float32))
+        assert label == 2 and conf == pytest.approx(0.7)
+
+
 # ── optimize.py ready-for-live drawdown gate ─────────────────────────────────
 
 class TestReadyForLiveDrawdown:
