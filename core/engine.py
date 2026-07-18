@@ -320,6 +320,11 @@ class Engine:
                 self.strategy.on_fill(fill, self.ctx)
                 if fill.client_id in self._active_orders.get(fill.symbol, {}):
                     del self._active_orders[fill.symbol][fill.client_id]
+                # Drop the persisted open_orders row once the fill is processed —
+                # otherwise the table grows unbounded and a stale row can resolve a
+                # later empty-client_id fill to the wrong order (#134).
+                if fill.client_id:
+                    self.reconciler.remove_order(fill.client_id)
 
     def process_paper_fills(self, symbol: str, price: float):
         from execution.paper import PaperBroker
@@ -341,6 +346,10 @@ class Engine:
             if cid not in desired:
                 self.broker.cancel(cid)
                 del active[cid]
+                # Also drop the persisted open_orders row (live mode) so cancelled
+                # orders don't leak the table forever (#134).
+                if self.reconciler:
+                    self.reconciler.remove_order(cid)
 
         for cid, order in desired.items():
             if cid not in active:
@@ -475,6 +484,11 @@ class Engine:
             try:
                 # Cancel open broker orders
                 self.broker.cancel_all(sym)
+                # Drop persisted open_orders rows so a live restart doesn't reconcile
+                # against orders cancelled during emergency shutdown (#134).
+                if self.reconciler:
+                    for o in self.reconciler.get_tracked_orders(sym):
+                        self.reconciler.remove_order(o["client_id"])
                 self._active_orders[sym] = {}
 
                 # For live broker: place market sell for open positions

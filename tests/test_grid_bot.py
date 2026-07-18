@@ -182,6 +182,75 @@ class TestMLFeatures:
         assert conf == 0.8
 
 
+class TestReconcilerOrderCleanup:
+    """Regression for #134: the live reconciler's open_orders table must be pruned
+    on cancel and on fill — remove_order() had zero callers, leaking the table."""
+
+    class _StubReconciler:
+        def __init__(self):
+            self.removed = []
+            self._fills = []
+
+        def reconcile(self):
+            return self._fills
+
+        def remove_order(self, client_id):
+            self.removed.append(client_id)
+
+        def track_order(self, *a, **k):
+            pass
+
+        def get_tracked_orders(self, symbol=None):
+            return []
+
+    class _StubBroker:  # deliberately NOT a PaperBroker so live paths run
+        def __init__(self):
+            self.cancelled = []
+
+        def cancel(self, cid):
+            self.cancelled.append(cid)
+
+    class _StubStrategy:
+        _broker = None
+
+        def desired_orders(self, symbol, price, ctx):
+            return []  # nothing desired → existing active order gets cancelled
+
+        def on_fill(self, fill, ctx):
+            pass
+
+    def _engine(self, reconciler):
+        from core.engine import Engine
+        return Engine(self._StubStrategy(), self._StubBroker(), ["X/USD"],
+                      reconciler=reconciler)
+
+    def test_cancel_removes_persisted_order(self):
+        rec = self._StubReconciler()
+        eng = self._engine(rec)
+        eng._active_orders["X/USD"] = {"c1": object()}
+        eng._sync_orders("X/USD", 100.0)
+        assert eng.broker.cancelled == ["c1"]
+        assert rec.removed == ["c1"]
+
+    def test_fill_removes_persisted_order(self):
+        from core.strategy import Fill
+        rec = self._StubReconciler()
+        rec._fills = [Fill(client_id="c1", symbol="X/USD", side="buy",
+                           price=100.0, qty=1.0, fee=0.0, ts=time.time())]
+        eng = self._engine(rec)
+        eng._reconcile_fills()
+        assert rec.removed == ["c1"]
+
+    def test_reconciler_remove_order_round_trip(self, tmp_path, monkeypatch):
+        import execution.reconciler as recmod
+        monkeypatch.setattr(recmod, "_DB_PATH", tmp_path / "t.db")
+        r = recmod.Reconciler(lambda since: [])
+        r.track_order("c1", "x1", "X/USD", "buy", 100.0, 1.0)
+        assert any(o["client_id"] == "c1" for o in r.get_tracked_orders())
+        r.remove_order("c1")
+        assert r.get_tracked_orders() == []
+
+
 class TestRefreshRollbackFeatureNames:
 
     def test_rollback_restores_feature_names(self, monkeypatch):
