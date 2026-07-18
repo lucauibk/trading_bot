@@ -220,9 +220,15 @@ def refresh_from_recent_history(
         return
 
     old_f1 = model._last_oos_f1
-    # Preserve the current classifier so we can roll back if quality drops
-    old_clf         = model._clf
-    old_n_samples   = model._n_samples
+    # Preserve the current classifier so we can roll back if quality drops.
+    # _feature_names MUST be snapshotted too: train() overwrites it (model.py:99-108)
+    # to match the newly-trained feature count. If the rejected model was trained on a
+    # different feature count (e.g. the 34→16 fallback fired for the whole window),
+    # restoring _clf without _feature_names leaves them desynced and predict()'s
+    # feature-count guard trips permanently → silent (hold, 0.0) for this coin (#119).
+    old_clf            = model._clf
+    old_n_samples      = model._n_samples
+    old_feature_names  = model._feature_names
 
     X = np.array(xs, np.float32)
     y = np.array(ys, np.int32)
@@ -238,9 +244,10 @@ def refresh_from_recent_history(
             symbol, old_f1, new_f1,
         )
         with model._lock:
-            model._clf          = old_clf
-            model._n_samples    = old_n_samples
-            model._last_oos_f1  = old_f1
+            model._clf            = old_clf
+            model._n_samples      = old_n_samples
+            model._last_oos_f1    = old_f1
+            model._feature_names  = old_feature_names
         model._save()
     else:
         logger.info(
