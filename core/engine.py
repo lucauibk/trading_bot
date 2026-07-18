@@ -392,9 +392,11 @@ class Engine:
             # measures against what the user deposited, not a mid-session equity.
             # total_profit is already baked into total_equity (cash balance), so
             # adding it again would double-count it — just use total_equity.
+            # This is a drawdown-from-deposit brake, not a daily-resetting one:
+            # the baseline is anchored once and never resets per day (#132).
             baseline = self._initial_capital if self._initial_capital > 0 else total_equity
-            rm.set_daily_start(baseline)
-            dd_ok = rm.daily_drawdown_ok(total_equity)
+            rm.set_drawdown_baseline(baseline)
+            dd_ok = rm.drawdown_ok(total_equity)
             was_frozen = self.ctx.is_frozen()
             self.ctx.set_freeze(not dd_ok)
             if not dd_ok and not was_frozen:
@@ -405,7 +407,10 @@ class Engine:
                 except Exception:
                     pass
             elif dd_ok and was_frozen:
-                logger.info("Freeze lifted – new trading day")
+                # Not a "new trading day": the brake is anchored to the deposit
+                # and never resets daily (#132). Freeze lifts only when equity
+                # recovers above the deposit drawdown floor.
+                logger.info("Freeze lifted – equity recovered above the deposit drawdown floor")
                 try:
                     from dashboard.db import set_frozen
                     set_frozen(False)
