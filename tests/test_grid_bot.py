@@ -1773,10 +1773,9 @@ class TestLeverageEndpointClamp:
         assert resp.get_json()["ok"] is False
 
 
-class TestMomentumHoldReset:
-    """#165: the momentum-hold SL-delay budget must reset once price recovers
-    above the SL, so it grants N ticks of grace *per contiguous dip episode*,
-    not once over the whole position lifetime."""
+class TestTickCheckDedup:
+    """on_tick_safety + on_tick must not run the SL/directional checks twice in a
+    single engine tick, or the momentum_hold_max SL deferral is halved."""
 
     def _strategy(self, **overrides):
         from strategies.grid import GridStrategy
@@ -1816,6 +1815,14 @@ class TestMomentumHoldReset:
         assert calls == {"stops": 1, "dir": 1}
 
 
+class TestMomentumHoldReset:
+    """#165: the momentum-hold SL-delay budget must reset once price recovers
+    above the SL, so it grants N ticks of grace *per contiguous dip episode*,
+    not once over the whole position lifetime."""
+
+    def _strategy(self, **overrides):
+        from strategies.grid import GridStrategy
+        from strategies.grid_params import GridParams
         params = GridParams.from_dict(
             {"sl_mode": "floor", "leverage": 1.0,
              "momentum_hold_score": 0.35, "momentum_hold_max": 1, **overrides})
