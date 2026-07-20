@@ -1886,3 +1886,50 @@ class TestDirectionalDisabledInConfig:
         cfg = json.loads((Path(__file__).parents[1] / "config" / "grid_params.json").read_text())
         params = GridParams.from_dict(cfg)
         assert params.directional_enabled is False
+
+
+class TestPaperBalanceRestoreToggle:
+    """#193: a coin toggle (#184) or any change to the symbols list must NOT
+    discard the persisted paper balances of the unchanged coins. The restore is
+    selective (PaperBroker.load_balances ignores foreign keys), so it must run
+    even when the saved key set differs from the active symbol set — the old
+    strict `set(saved) == set(symbols)` guard reset equity to the fresh default."""
+
+    def _fresh_broker(self, symbols, initial=1000.0):
+        from execution.paper import PaperBroker
+        return PaperBroker(initial_balance=initial, symbols=symbols)
+
+    def test_disabled_coin_does_not_reset_others(self):
+        from main import _restore_paper_balances
+        # Session 1 persisted 5 coins with accumulated balances.
+        saved = {"A/USD": 250.0, "B/USD": 300.0, "C/USD": 275.0,
+                 "D/USD": 260.0, "E/USD": 190.0}
+        # Session 2: coin E disabled → active set is 4 coins.
+        symbols = ["A/USD", "B/USD", "C/USD", "D/USD"]
+        broker = self._fresh_broker(symbols)          # fresh default = 1000/4 = 250 each
+        n = _restore_paper_balances(broker, saved, symbols)
+        assert n == 4
+        # The 4 unchanged coins keep their real persisted balances, NOT the default.
+        assert broker._balances["B/USD"] == 300.0
+        assert broker._balances["C/USD"] == 275.0
+        # E is not in the broker → silently ignored, no crash.
+        assert "E/USD" not in broker._balances
+
+    def test_newly_enabled_coin_keeps_fresh_default(self):
+        from main import _restore_paper_balances
+        saved = {"A/USD": 250.0, "B/USD": 300.0}
+        symbols = ["A/USD", "B/USD", "F/USD"]          # F newly enabled
+        broker = self._fresh_broker(symbols, initial=900.0)  # default 300 each
+        n = _restore_paper_balances(broker, saved, symbols)
+        assert n == 2
+        assert broker._balances["A/USD"] == 250.0      # restored
+        assert broker._balances["F/USD"] == 300.0      # fresh default (no history)
+
+    def test_no_saved_balances_is_noop(self):
+        from main import _restore_paper_balances
+        symbols = ["A/USD", "B/USD"]
+        broker = self._fresh_broker(symbols, initial=1000.0)
+        before = dict(broker._balances)
+        assert _restore_paper_balances(broker, None, symbols) == 0
+        assert _restore_paper_balances(broker, {}, symbols) == 0
+        assert broker._balances == before             # untouched

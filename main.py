@@ -48,6 +48,29 @@ def _build_grids_config(symbols, per_coin, settings):
     return active, grids_config
 
 
+def _restore_paper_balances(broker, saved, symbols) -> int:
+    """Restore persisted per-symbol paper balances into a fresh PaperBroker (#193).
+
+    `PaperBroker.load_balances` is already selective — it only writes keys the
+    broker actually has and ignores foreign keys. So restoring must NOT be gated
+    on an *exact* symbol-set match: a single coin toggle (#184) or any change to
+    the `symbols` list changes the active set, and the old strict
+    `set(saved) == set(symbols)` guard then discarded ALL persisted balances —
+    including the unchanged coins' — resetting equity to the fresh
+    `initial/len(active)` default and wiping the drawdown baseline.
+
+    Restoring unconditionally keeps every overlapping coin's real balance; a
+    newly-enabled coin (in `symbols` but not in `saved`) correctly keeps its
+    fresh default because no history exists for it.
+
+    Returns the number of balances actually restored (overlap count).
+    """
+    if not saved:
+        return 0
+    broker.load_balances(saved)
+    return len(set(saved) & set(symbols))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Grid Trading Bot")
     parser.add_argument("--mode", choices=["paper", "live"], default="paper")
@@ -176,10 +199,12 @@ def main():
         try:
             from dashboard.db import load_paper_balances
             saved = load_paper_balances()
-            if saved and set(saved.keys()) == set(symbols):
-                broker.load_balances(saved)
-                logger.info("PaperBroker: Balances aus DB geladen: %s",
-                            {k: f"{v:.2f}" for k, v in saved.items()})
+            n_restored = _restore_paper_balances(broker, saved, symbols)
+            if n_restored:
+                logger.info("PaperBroker: %d/%d Balances aus DB restauriert: %s",
+                            n_restored, len(symbols),
+                            {k: f"{v:.2f}" for k, v in saved.items()
+                             if k in set(symbols)})
         except Exception as _e:
             logger.debug("PaperBroker balance restore skipped: %s", _e)
         reconciler = None
