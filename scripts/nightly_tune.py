@@ -108,47 +108,45 @@ def run_analysis() -> str:
 
 # ── Step 2: Parameter sweep ─────────────────────────────────────────────────────
 
+SWEEP_MIN_TRADES = 60  # default (100) never clears with current fill rates — see Issue-Fund 2026-07-21
+
+
 def run_sweep(symbols: List[str]) -> Tuple[Optional[Dict], str]:
     """
-    Run OOS sweep for each symbol.
+    Run one OOS sweep across all active symbols together (median_calmar ranking
+    needs the cross-symbol aggregate — per-symbol calls could never clear the
+    trades-constraint: even the loosest config summed to ~97 trades across all
+    5 symbols, still under the old default of 100 → every nightly sweep came
+    back empty since this was introduced. Fixed 2026-07-21.
     Returns (winner_params_dict | None, report_text).
     Does NOT write or commit anything — winner is reported as a recommendation only.
     """
-    best_calmar = -999.0
-    best_params: dict | None = None
     parts = ["## Parameter Sweep (OOS — recommendation only, no automatic apply)\n"]
+    best_params: dict | None = None
 
+    log.info("Sweep: %s…", ", ".join(symbols))
+    cmd = ["python3", "scripts/sweep.py",
+           "--days", "180", "--train-days", "120", "--jobs", "4",
+           "--min-trades", str(SWEEP_MIN_TRADES)]
     for sym in symbols:
-        log.info("Sweep: %s…", sym)
-        try:
-            r = subprocess.run(
-                ["python3", "scripts/sweep.py",
-                 "--symbol", sym,
-                 "--days", "180", "--train-days", "120", "--jobs", "4"],
-                capture_output=True, text=True, timeout=900,
-            )
-            # sweep.py loggt via logging → stderr; stdout ist praktisch leer (#128)
-            output = (r.stdout + r.stderr)[-3000:]
-            parts.append(f"### {sym}\n\n```\n{output}\n```\n")
+        cmd += ["--symbol", sym]
 
-            results_dirs = sorted((ROOT / "results").glob("sweep_*"))
-            if results_dirs:
-                winner_file = results_dirs[-1] / "winner.json"
-                meta_file = results_dirs[-1] / "winner_meta.json"
-                if winner_file.exists() and meta_file.exists():
-                    w = json.loads(winner_file.read_text())
-                    try:
-                        calmar = float(json.loads(meta_file.read_text())["median_calmar"])
-                    except (KeyError, ValueError, json.JSONDecodeError):
-                        calmar = None
-                    if calmar is not None and calmar > best_calmar:
-                        best_calmar = calmar
-                        best_params = w
-                        log.info("New best config from %s: Calmar=%.2f", sym, calmar)
-        except subprocess.TimeoutExpired:
-            parts.append(f"### {sym}\n\nTimeout (>15 min) — skipped.\n")
-        except Exception as e:
-            parts.append(f"### {sym}\n\nFailed: {e}\n")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        # sweep.py loggt via logging → stderr; stdout ist praktisch leer (#128)
+        output = (r.stdout + r.stderr)[-4000:]
+        parts.append(f"### Alle Symbole\n\n```\n{output}\n```\n")
+
+        results_dirs = sorted((ROOT / "results").glob("sweep_*"))
+        if results_dirs:
+            winner_file = results_dirs[-1] / "winner.json"
+            if winner_file.exists():
+                best_params = json.loads(winner_file.read_text())
+                log.info("Sweep winner: %s", best_params)
+    except subprocess.TimeoutExpired:
+        parts.append("Timeout (>60 min) — skipped.\n")
+    except Exception as e:
+        parts.append(f"Failed: {e}\n")
 
     return best_params, "\n".join(parts)
 
