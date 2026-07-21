@@ -298,15 +298,35 @@ Wird vom Bot nach Lesen automatisch auf NULL zurückgesetzt.
 geladen via `launchctl bootstrap gui/$(id -u) ...`) — **kein Cloud-Routine**, weil Trade-Analyse (`trades.db`) und
 Telegram-Notify lokale, gitignored Dateien (`data/trades.db`, `.env`) brauchen, auf die eine Cloud-Sandbox keinen
 Zugriff hat. Läuft nur, wenn der Mac um 05:00 wach ist. Log: `logs/nightly_tune.log`.
-1. Branch `auto-tune/YYYY-MM-DD` von main
-2. Trade-Analyse (7 Tage) + Pattern Mining
-3. OOS-Sweep je Symbol (180 Tage, 120 Train)
-4. Wenn Sweep-Winner besser: `config/grid_params.json` committen
-5. GitHub-Issue mit Findings
-6. Draft-PR nach main (User reviewed + merged manuell am nächsten Tag)
-7. Telegram-Benachrichtigung
 
-**Sanity:** Niemals main direkt, niemals Live-Bot neu starten.
+**Rein beobachtend** (Docstring-Garantie im Script): committet nichts, branched nichts, erstellt keine PRs.
+1. Trade-Analyse (7 Tage) + Pattern Mining
+2. OOS-Sweep über alle aktiven Symbole in einem `sweep.py`-Aufruf (180 Tage, 120 Train, `--min-trades 60` —
+   Default 100 klärt bei aktueller Fill-Rate strukturell nie, siehe Fix 2026-07-21/PR #201)
+3. GitHub-Issue mit Findings + Sweep-Winner (falls einer das Gate besteht) als Copy-Paste-Vorschlag für `config/grid_params.json`
+4. Telegram-Benachrichtigung
+
+**Sanity:** Niemals main direkt, niemals Live-Bot neu starten. Anwenden eines Sweep-Winners bleibt manuell.
+
+---
+
+## Daily Issue Fixer (Cloud-Routine, 19:00 UTC täglich)
+
+Läuft in der Cloud-Sandbox (kein `.env`, keine `data/*.db` — nur Code-Fixes, keine Live-Datenanalyse). Liest
+offene GitHub-Issues, triaged, fixt die Top 3-5 in eigenen `fix/issue-N-*`-Branches, PR nach main mit Label `auto-fix`.
+
+**Seit 2026-07-21 zusätzlich: Self-Merge eigener `auto-fix`-PRs.** Die Routine reviewt vor jedem Lauf ihre
+eigenen offenen `auto-fix`-PRs erneut und merged sie selbstständig, wenn der CI-Check
+(`.github/workflows/test.yml`, PR #202) grün ist, kein Merge-Konflikt vorliegt und keine offene
+Review-Änderungsanfrage von einem Menschen aussteht. Vorher war das ausschließlich manueller User-Merge — das
+gilt jetzt nur noch als Fallback, wenn eines der Kriterien nicht erfüllt ist.
+
+**Training-Mode-Gate:** Vor jedem Schritt prüft die Routine `config/config.yaml: paper_trading`. Ist der Wert
+`false` (Live-Modus), tut die Routine **gar nichts** — kein Triage, kein Fix, kein Merge, nur ein kurzer
+Statusreport. Das ist ein **weiches Signal**, kein hartes Interlock: der Wert liegt in Git und sagt nichts über
+den tatsächlichen `bot_status.mode` in der (gitignorten) `data/trades.db` — die Cloud-Sandbox kann diese DB
+nicht lesen und hat auch sonst keinen Netzwerkzugriff auf Mac oder Pi (kein Deploy, kein Bot-Neustart möglich,
+technisch ausgeschlossen). Beim echten Go-Live `paper_trading: false` bewusst committen.
 
 ---
 
