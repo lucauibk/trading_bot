@@ -282,6 +282,46 @@ class TestGridStrategy:
         sells_after = sum(1 for o in state.orders.values() if o["side"] == "sell")
         assert sells_after > sells_before
 
+    def test_per_pos_sl_max_pct_regime_override(self):
+        """Ultra-Bot-Plan Phase 2: per_pos_sl_max_pct_by_regime overrides the
+        flat cap for the listed regime and falls back to the default for
+        others (strategies/grid.py's sl_max_pct_for_regime call sites)."""
+        from core.context import MarketContext
+        from core.strategy import Fill
+        from strategies.grid import GridStrategy
+        from strategies.grid_params import GridParams
+
+        params = GridParams.from_dict({
+            "sl_mode": "per_position",
+            "per_pos_sl_step_mult": 100.0,  # force sl_pct to hit the cap, not the step value
+            "per_pos_sl_max_pct_by_regime": {"trending": 0.03},
+        })
+        strategy = GridStrategy(
+            [{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}], params=params)
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state.with_position = True
+        strategy.setup_grid("SOL/USD", 100.0, ctx)
+
+        def _fill_one_buy_and_get_sl_pct():
+            cid, order = next((c, o) for c, o in state.orders.items()
+                               if o["side"] == "buy" and not o["filled"])
+            fill = Fill(client_id=cid, symbol="SOL/USD", side="buy",
+                        price=order["price"], qty=order["qty"], fee=0.0, ts=time.time())
+            strategy.on_fill(fill, ctx)
+            sell = next(o for o in state.orders.values()
+                        if o["side"] == "sell" and o.get("bought_at") == order["price"])
+            return (order["price"] - sell["sl_price"]) / order["price"], sell
+
+        state._last_regime = "trending"
+        sl_pct_trending, sell1 = _fill_one_buy_and_get_sl_pct()
+        assert sl_pct_trending == pytest.approx(0.03, abs=1e-6)
+
+        state._last_regime = "ranging"
+        sl_pct_ranging, sell2 = _fill_one_buy_and_get_sl_pct()
+        assert sl_pct_ranging == pytest.approx(0.04, abs=1e-6)
+
     def test_per_position_sl_fires_on_tick(self):
         from core.context import MarketContext
         strategy = self._strategy()

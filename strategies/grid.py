@@ -479,7 +479,7 @@ class GridStrategy(Strategy):
             else:
                 step_pct = (sell_price - buy_price) / buy_price
                 sl_pct = max(step_pct * self.p.per_pos_sl_step_mult, self.p.per_pos_sl_min_pct)
-                sl_pct = min(sl_pct, self.p.per_pos_sl_max_pct)
+                sl_pct = min(sl_pct, self.p.sl_max_pct_for_regime(state._last_regime))
                 sl_price = buy_price * (1 - sl_pct)
             sell_cid = str(uuid.uuid4())
             state.orders[sell_cid] = {
@@ -569,8 +569,9 @@ class GridStrategy(Strategy):
         else:
             step_pct = (sell_price - buy_price) / buy_price
             sl_pct = max(step_pct * self.p.per_pos_sl_step_mult, self.p.per_pos_sl_min_pct)
-            # Hard-cap: no per-position SL can be wider than per_pos_sl_max_pct (4%)
-            sl_pct = min(sl_pct, self.p.per_pos_sl_max_pct)
+            # Hard-cap: regime-dependent (see sl_max_pct_for_regime) — trending's
+            # fewer/larger levels can otherwise exceed the $ risk budget compounded.
+            sl_pct = min(sl_pct, self.p.sl_max_pct_for_regime(state._last_regime))
             sl_price = buy_price * (1 - sl_pct)
 
         # Liegt an diesem Preis noch ein pre-seeded Sell (Platzhalter-Wall),

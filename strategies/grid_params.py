@@ -21,7 +21,15 @@ class GridParams:
     floor_sl_atr_mult: float = 1.0         # floor = grid_lower − mult × ATR
     per_pos_sl_step_mult: float = 1.5      # per_position mode: SL = step_pct × mult below buy
     per_pos_sl_min_pct: float = 0.008      # per_position mode: SL floor 0.8% below buy
-    per_pos_sl_max_pct: float = 0.04       # per_position mode: SL hard-cap 4% below buy
+    per_pos_sl_max_pct: float = 0.04       # per_position mode: SL hard-cap, default/fallback
+    # Optional regime-specific override for per_pos_sl_max_pct (Ultra-Bot-Plan
+    # Phase 2 risk audit, 2026-07-21, scripts/risk_budget_check.py): "trending"
+    # has only 6 levels_by_regime -> largest per-level notional -> a flat 4%
+    # cap can exceed max_risk_per_trade once compounded (verified: SOL/AVAX at
+    # 3x-compounded investment hit ~120% of the $ budget in trending). Empty
+    # tuple = old, uniform behaviour; regimes not listed fall back to
+    # per_pos_sl_max_pct. See sl_max_pct_for_regime().
+    per_pos_sl_max_pct_by_regime: Tuple[Tuple[str, float], ...] = ()
     momentum_hold_score: float = 0.35      # delay SL while score above this …
     momentum_hold_max: int = 2             # … at most this many ticks
 
@@ -97,20 +105,32 @@ class GridParams:
     def regime_levels(self) -> dict:
         return dict(self.levels_by_regime)
 
+    @property
+    def regime_sl_max_pct(self) -> dict:
+        return dict(self.per_pos_sl_max_pct_by_regime)
+
+    def sl_max_pct_for_regime(self, regime: str) -> float:
+        """per_pos_sl_max_pct, overridden per-regime if configured — falls
+        back to the flat per_pos_sl_max_pct for regimes not listed."""
+        return self.regime_sl_max_pct.get(regime, self.per_pos_sl_max_pct)
+
+    _TUPLE_DICT_FIELDS = ("levels_by_regime", "per_pos_sl_max_pct_by_regime")
+
     @classmethod
     def from_dict(cls, d: dict) -> "GridParams":
         """Build from a plain dict, ignoring unknown keys.
 
-        levels_by_regime may be given as a dict ({"ranging": 14, ...}).
+        levels_by_regime / per_pos_sl_max_pct_by_regime may be given as a
+        dict ({"ranging": 14, ...}) or a list of pairs.
         """
         known = {f.name for f in fields(cls)}
         kwargs = {}
         for k, v in d.items():
             if k not in known:
                 continue
-            if k == "levels_by_regime" and isinstance(v, dict):
+            if k in cls._TUPLE_DICT_FIELDS and isinstance(v, dict):
                 v = tuple(sorted(v.items()))
-            elif k == "levels_by_regime" and isinstance(v, list):
+            elif k in cls._TUPLE_DICT_FIELDS and isinstance(v, list):
                 v = tuple(tuple(pair) for pair in v)
             kwargs[k] = v
         return cls(**kwargs)
@@ -118,4 +138,5 @@ class GridParams:
     def to_dict(self) -> dict:
         d = asdict(self)
         d["levels_by_regime"] = dict(self.levels_by_regime)
+        d["per_pos_sl_max_pct_by_regime"] = dict(self.per_pos_sl_max_pct_by_regime)
         return d

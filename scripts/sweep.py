@@ -79,6 +79,94 @@ def build_param_grid(aggressive: bool = False) -> list:
     return grid
 
 
+# ── Stage A (Ultra-Bot-Plan Phase 1): Geometrie + min_step_pct erweitern ────
+#
+# levels_by_regime/range_atr_mult_* wurden noch nie gesweept — build_param_grid()
+# haelt sie immer auf dem Dataclass-Default. 3 benannte Presets statt freiem
+# Kreuzprodukt pro Regime, um die Kombinatorik nicht explodieren zu lassen.
+GEOMETRY_PRESETS = {
+    "current": {   # Ist-Zustand (GridParams-Default)
+        "levels_by_regime": {"ranging": 14, "trending": 6, "volatile": 20},
+        "range_atr_mult_trending": 2.0,
+        "range_atr_mult_volatile": 1.5,
+    },
+    "wide_few": {  # weniger, dafuer groessere Positionen -> weniger Fee-Drag
+        "levels_by_regime": {"ranging": 10, "trending": 5, "volatile": 14},
+        "range_atr_mult_trending": 2.5,
+        "range_atr_mult_volatile": 2.0,
+    },
+    "tight_many": {  # mehr, kleinere Positionen -> mehr Fills
+        "levels_by_regime": {"ranging": 18, "trending": 8, "volatile": 26},
+        "range_atr_mult_trending": 1.5,
+        "range_atr_mult_volatile": 1.2,
+    },
+}
+MIN_STEP_PCT_AXIS = [0.0, 0.006, 0.010]
+# 2 unveraenderte floor-Basis-Configs, um die sl_mode-Frage nicht ganz zu
+# verlieren, aber NICHT mit den neuen Geometrie/min_step_pct-Achsen zu
+# multiplizieren (floor erreichte im Diagnose-Lauf ohnehin nie die OOS-Phase).
+FLOOR_BASELINE_STEP_MULTS = [4.0, 6.0]
+
+
+def _load_live_baseline_config() -> dict:
+    """Aktuelle Live-Config aus config/grid_params.json, gemergt mit
+    GridParams-Defaults — als BASELINE-Zeile im Sweep-Report markiert, damit
+    'schlaegt eine Config den Status quo?' ueberhaupt beantwortbar ist."""
+    params_path = ROOT / "config" / "grid_params.json"
+    overrides = json.loads(params_path.read_text()) if params_path.exists() else {}
+    from strategies.grid_params import GridParams
+    baseline = GridParams.from_dict(overrides).to_dict()
+    baseline["leverage"] = LEVERAGE
+    baseline["_label"] = "BASELINE (live config/grid_params.json)"
+    baseline["_is_baseline"] = True
+    return baseline
+
+
+def build_param_grid_stage_a() -> list:
+    """Ultra-Bot-Plan Phase 1 / Stage A: Geometrie-Presets x min_step_pct,
+    nur fuer sl_mode=per_position (einziger Modus, der im Diagnose-Lauf die
+    OOS-Phase erreicht hat), plus 2 unveraenderte floor-Basis-Configs, plus
+    eine gelabelte Baseline-Zeile."""
+    grid = [_load_live_baseline_config()]
+
+    for preset_name, geometry in GEOMETRY_PRESETS.items():
+        for step_mult in [2.0, 3.0, 4.0, 6.0]:
+            for min_step_pct in MIN_STEP_PCT_AXIS:
+                cfg = {
+                    "sl_mode": "per_position",
+                    "runner_enabled": False,
+                    **geometry,
+                    "min_step_fee_multiple": step_mult,
+                    "min_step_pct": min_step_pct,
+                    "dca_size_mult": 1.0,
+                    "momentum_hold_max": 0,
+                    "trend_filter_enabled": True,
+                    "max_inventory_notional_mult": 1.5,
+                    "directional_enabled": False,
+                    "leverage": LEVERAGE,
+                    "_label": f"stage_a/{preset_name}/step{step_mult}/minpct{min_step_pct}",
+                }
+                grid.append(cfg)
+
+    for step_mult in FLOOR_BASELINE_STEP_MULTS:
+        grid.append({
+            "sl_mode": "floor",
+            "floor_sl_atr_mult": 1.0,
+            "runner_enabled": False,
+            "min_step_fee_multiple": step_mult,
+            "dca_size_mult": 1.0,
+            "momentum_hold_max": 0,
+            "trend_filter_enabled": True,
+            "min_step_pct": 0.006,
+            "max_inventory_notional_mult": 1.5,
+            "directional_enabled": False,
+            "leverage": LEVERAGE,
+            "_label": f"floor_baseline/step{step_mult}",
+        })
+
+    return grid
+
+
 _DFS = {}
 _TIMEFRAME = "1h"
 _REBUILD_EVERY = 1
@@ -167,6 +255,10 @@ def main():
                              "(Aggressiv-Paket; --max-dd entsprechend lockern, z.B. -35)")
     parser.add_argument("--aggressive", action="store_true",
                         help="Aggressiv-Achsen aktivieren: dca_size_mult, runner, leverage 5")
+    parser.add_argument("--grid", choices=["default", "stage_a"], default="default",
+                        help="stage_a: Ultra-Bot-Plan Phase 1 — Geometrie-Presets x "
+                             "min_step_pct statt des Standard-2-Achsen-Grids, inkl. "
+                             "gelabelter BASELINE-Zeile aus config/grid_params.json")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -200,9 +292,9 @@ def main():
     test_start = split_ts - datetime.timedelta(seconds=WARMUP_CANDLES * tf_sec)
     log.info("Train: %s → %s | Test (OOS): %s → %s", data_start, split_ts, split_ts, data_end)
 
-    grid = build_param_grid(aggressive=args.aggressive)
-    log.info("Param grid: %d configs × %d symbols = %d train runs",
-             len(grid), len(symbols), len(grid) * len(symbols))
+    grid = build_param_grid_stage_a() if args.grid == "stage_a" else build_param_grid(aggressive=args.aggressive)
+    log.info("Param grid (%s): %d configs × %d symbols = %d train runs",
+             args.grid, len(grid), len(symbols), len(grid) * len(symbols))
 
     train_jobs = [
         (i, cfg, sym, "train", data_start, split_ts)
@@ -250,6 +342,16 @@ def main():
         log.info("OOS-Phase: %d Configs (stratifiziert: %s)",
                  len(top), {m: len(v) for m, v in by_mode.items()})
 
+        # BASELINE-Zeile immer in die OOS-Phase forcieren, auch wenn sie nicht
+        # ins Top-N-Ranking faellt — sonst ist "schlaegt eine Config den Status
+        # quo?" nicht beantwortbar (Ultra-Bot-Plan Phase 1, Baseline-Pinning).
+        baseline_ids = [cid for cid, a in agg.items() if a["params"].get("_is_baseline")]
+        for cid in baseline_ids:
+            if cid not in seen:
+                top.append((cid, agg[cid]))
+                seen.add(cid)
+                log.info("BASELINE force-included in OOS-Phase (cfg %d)", cid)
+
         oos_jobs = [
             (cid, agg[cid]["params"], sym, "test", test_start, data_end)
             for cid, _ in top for sym in symbols
@@ -276,16 +378,20 @@ def main():
     lines = ["# Sweep Report (ehrliche Metriken — ohne Phantom-PnL, ab Commit e5170a4)", "",
              f"Symbole: {', '.join(symbols)} | {args.days}d @ {args.timeframe} "
              f"(Train {args.train_days}d / Test {args.days - args.train_days}d) "
-             f"| rebuild_every={rebuild_every} | Ranking: {rank_key}", "",
+             f"| rebuild_every={rebuild_every} | Ranking: {rank_key} | Grid: {args.grid}", "",
              "## Top-Configs: Train vs. OOS", "",
-             "| # | cfg | OOS Calmar | OOS Ret% | OOS worstDD | Train Calmar | Train Ret% | Params |",
-             "|---|-----|-----------|----------|-------------|--------------|------------|--------|"]
+             "| # | cfg | Label | OOS Calmar | OOS Ret% | OOS worstDD | Train Calmar | Train Ret% | Params |",
+             "|---|-----|-------|-----------|----------|-------------|--------------|------------|--------|"]
     for rank, (cid, oos) in enumerate(final, 1):
         tr = agg[cid]
         # leverage bleibt sichtbar — ist seit dem Aggressiv-Paket eine Sweep-Achse
         p = dict(oos["params"])
+        label = p.pop("_label", "")
+        p.pop("_is_baseline", None)
+        if label.startswith("BASELINE"):
+            label = f"**{label}**"
         lines.append(
-            f"| {rank} | {cid} | {oos['median_calmar']:.2f} | {oos['median_return']:.1f} "
+            f"| {rank} | {cid} | {label} | {oos['median_calmar']:.2f} | {oos['median_return']:.1f} "
             f"| {oos['worst_dd']:.1f} | {tr['median_calmar']:.2f} | {tr['median_return']:.1f} "
             f"| `{json.dumps(p)}` |")
     (out_dir / "report.md").write_text("\n".join(lines))

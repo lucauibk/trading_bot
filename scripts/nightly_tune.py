@@ -44,6 +44,18 @@ log = logging.getLogger("nightly_tune")
 TODAY = date.today().isoformat()
 REPO  = "lucauibk/trading_bot"
 
+# Gate-Bug-Fix (diagnostiziert 2026-07-21): sweep.py's aggregate() summiert
+# total_trades nur über die im selben Prozess uebergebenen Symbole. Der alte
+# Code rief sweep.py PRO SYMBOL auf (~9-27 Trades/Fenster) gegen den Default
+# --min-trades=100 — die Schwelle war so nie erreichbar, Reports blieben leer.
+# Diagnose-Lauf mit allen 5 Symbolen in einem Aufruf: 60 laesst 4/8 Configs
+# (alle sl_mode=per_position) in die OOS-Phase durch.
+SWEEP_MIN_TRADES = 60
+# Gemessener manueller Lauf (2026-07-21, --jobs 4, 8 Configs x 5 Symbole,
+# 180d/120d-Train): 7:57 min wall-clock. Timeout mit ~2.5x Marge fuer
+# langsamere OHLCV-Cache-Misses o.ae.
+SWEEP_TIMEOUT_SECONDS = 1200
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -110,47 +122,64 @@ def run_analysis() -> str:
 
 def run_sweep(symbols: List[str]) -> Tuple[Optional[Dict], str]:
     """
-    Run OOS sweep for each symbol.
-    Returns (winner_params_dict | None, report_text).
+    Run ONE combined OOS sweep across all active symbols (not per-symbol —
+    see SWEEP_MIN_TRADES comment above for why a per-symbol loop broke the
+    min-trades gate). Returns (winner_params_dict | None, report_text).
     Does NOT write or commit anything — winner is reported as a recommendation only.
     """
-    best_calmar = -999.0
-    best_params: dict | None = None
-    parts = ["## Parameter Sweep (OOS — recommendation only, no automatic apply)\n"]
-
+    cmd = [
+        "python3", "scripts/sweep.py",
+        "--days", "180", "--train-days", "120", "--jobs", "4",
+        "--min-trades", str(SWEEP_MIN_TRADES),
+    ]
     for sym in symbols:
-        log.info("Sweep: %s…", sym)
+        cmd += ["--symbol", sym]
+
+    log.info("Sweep: combined run over %s…", symbols)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=SWEEP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        return None, (
+            "## Parameter Sweep (OOS — recommendation only, no automatic apply)\n\n"
+            f"Timeout (>{SWEEP_TIMEOUT_SECONDS // 60} min) — skipped.\n"
+        )
+    except Exception as e:
+        return None, (
+            "## Parameter Sweep (OOS — recommendation only, no automatic apply)\n\n"
+            f"Failed: {e}\n"
+        )
+
+    results_dirs = sorted((ROOT / "results").glob("sweep_*"))
+    if not results_dirs:
+        # sweep.py loggt via logging → stderr; stdout ist praktisch leer (#128)
+        output = (r.stdout + r.stderr)[-3000:]
+        return None, (
+            "## Parameter Sweep (OOS — recommendation only, no automatic apply)\n\n"
+            f"No results directory produced.\n\n```\n{output}\n```\n"
+        )
+
+    out_dir = results_dirs[-1]
+    report_file = out_dir / "report.md"
+    winner_file = out_dir / "winner.json"
+
+    if report_file.exists():
+        report_text = report_file.read_text()
+    else:
+        report_text = "No report.md written — no config passed the OOS gate.\n"
+
+    sweep_section = (
+        "## Parameter Sweep (OOS — recommendation only, no automatic apply)\n\n"
+        f"{report_text}\n"
+    )
+
+    winner_params = None
+    if winner_file.exists():
         try:
-            r = subprocess.run(
-                ["python3", "scripts/sweep.py",
-                 "--symbol", sym,
-                 "--days", "180", "--train-days", "120", "--jobs", "4"],
-                capture_output=True, text=True, timeout=900,
-            )
-            # sweep.py loggt via logging → stderr; stdout ist praktisch leer (#128)
-            output = (r.stdout + r.stderr)[-3000:]
-            parts.append(f"### {sym}\n\n```\n{output}\n```\n")
+            winner_params = json.loads(winner_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            winner_params = None
 
-            results_dirs = sorted((ROOT / "results").glob("sweep_*"))
-            if results_dirs:
-                winner_file = results_dirs[-1] / "winner.json"
-                meta_file = results_dirs[-1] / "winner_meta.json"
-                if winner_file.exists() and meta_file.exists():
-                    w = json.loads(winner_file.read_text())
-                    try:
-                        calmar = float(json.loads(meta_file.read_text())["median_calmar"])
-                    except (KeyError, ValueError, json.JSONDecodeError):
-                        calmar = None
-                    if calmar is not None and calmar > best_calmar:
-                        best_calmar = calmar
-                        best_params = w
-                        log.info("New best config from %s: Calmar=%.2f", sym, calmar)
-        except subprocess.TimeoutExpired:
-            parts.append(f"### {sym}\n\nTimeout (>15 min) — skipped.\n")
-        except Exception as e:
-            parts.append(f"### {sym}\n\nFailed: {e}\n")
-
-    return best_params, "\n".join(parts)
+    return winner_params, sweep_section
 
 
 # ── Step 3: GitHub issue ────────────────────────────────────────────────────────
