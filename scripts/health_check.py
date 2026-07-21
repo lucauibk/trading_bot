@@ -59,7 +59,13 @@ def _last_equity_age() -> float | None:
         if not row or not row[0]:
             return None
         last = datetime.fromisoformat(row[0])
-        return (datetime.now() - last).total_seconds()
+        # dashboard/db.py.log_equity() stores datetime.utcnow() — comparing
+        # against local datetime.now() silently inflated every reading by
+        # the local UTC offset (found 2026-07-21: +1h during BST, which
+        # alone exceeds MAX_AGE=600s and made every check past boot-grace
+        # report HÄNGEND regardless of actual bot health — see the ~hourly
+        # watchdog restarts in logs/watchdog.log around that date).
+        return (datetime.utcnow() - last).total_seconds()
     except Exception:
         return None
 
@@ -126,7 +132,8 @@ def daily_report() -> None:
         con = sqlite3.connect(DB_PATH, timeout=10)
         cur = con.execute("SELECT capital FROM equity ORDER BY id DESC LIMIT 1").fetchone()
         equity_now = float(cur[0]) if cur else 0.0
-        yday = (datetime.now() - timedelta(hours=24)).isoformat()
+        # Same UTC-vs-local fix as _last_equity_age(): equity.timestamp is UTC.
+        yday = (datetime.utcnow() - timedelta(hours=24)).isoformat()
         cur = con.execute(
             "SELECT capital FROM equity WHERE timestamp >= ? ORDER BY id LIMIT 1",
             (yday,)).fetchone()
