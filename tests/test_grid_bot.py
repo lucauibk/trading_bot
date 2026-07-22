@@ -1886,3 +1886,34 @@ class TestDirectionalDisabledInConfig:
         cfg = json.loads((Path(__file__).parents[1] / "config" / "grid_params.json").read_text())
         params = GridParams.from_dict(cfg)
         assert params.directional_enabled is False
+
+
+class TestGetConnPragmas:
+    """#163: get_conn() must enable WAL + a non-zero busy_timeout.
+
+    Dashboard and bot are two OS processes writing data/trades.db concurrently.
+    Without journal_mode=WAL a writer blocks all readers, and with the SQLite
+    default busy_timeout=0 a second writer fails immediately ("database is
+    locked") instead of waiting — dropping bot writes (trades/equity) or
+    returning dashboard 500s. This locks the pragmas into get_conn()."""
+
+    def _conn(self, tmp_path, monkeypatch):
+        import dashboard.db as ddb
+        monkeypatch.setattr(ddb, "DB_PATH", tmp_path / "trades.db")
+        return ddb.get_conn()
+
+    def test_wal_enabled(self, tmp_path, monkeypatch):
+        con = self._conn(tmp_path, monkeypatch)
+        try:
+            mode = con.execute("PRAGMA journal_mode").fetchone()[0]
+            assert str(mode).lower() == "wal", f"expected WAL, got {mode!r}"
+        finally:
+            con.close()
+
+    def test_busy_timeout_nonzero(self, tmp_path, monkeypatch):
+        con = self._conn(tmp_path, monkeypatch)
+        try:
+            timeout = con.execute("PRAGMA busy_timeout").fetchone()[0]
+            assert int(timeout) >= 5000, f"busy_timeout must be >=5000ms, got {timeout}"
+        finally:
+            con.close()
