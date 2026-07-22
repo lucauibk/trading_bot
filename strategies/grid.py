@@ -135,6 +135,13 @@ class _GridState:
         self._hard_trend_up: bool = False   # Runner-Trigger (preisbasiert, EMA/ADX)
         self._trend_up_count: int = 0
         self._fast_drop_active: bool = False   # set on fast-drop → longer resume confirmation
+        # Ultra-Bot-Plan follow-up (2026-07-22): _buys_allowed() only ever logged
+        # the hard_trend_down gate — sell_only/with_position/inventory-cap/
+        # confidence blocks were completely silent, making a stuck-paused symbol
+        # undiagnosable from logs alone (found via LINK/USD sitting at 0 open
+        # buys for hours with no matching log line). Tracks the last reported
+        # reason so _buys_allowed() can log on transition only, not every tick.
+        self._last_buy_block_reason: Optional[str] = None
 
 
 class GridStrategy(Strategy):
@@ -282,23 +289,34 @@ class GridStrategy(Strategy):
         return total
 
     def _buys_allowed(self, state: _GridState) -> bool:
-        if state.sell_only or not state.with_position:
-            return False
-        if self.p.trend_filter_enabled and state._hard_trend_down:
-            return False
+        reason: Optional[str] = None
+        if state.sell_only:
+            reason = "sell_only"
+        elif not state.with_position:
+            reason = "with_position_false"  # ML predicted "down" (see _refresh_prediction)
+        elif self.p.trend_filter_enabled and state._hard_trend_down:
+            reason = "hard_trend_down"
         # Inventory/exposure cap: block new buys when deployed leveraged notional
         # reaches the threshold.  Auto-tightens with leverage (qty bakes in lev).
         # Covers desired_orders emission + smart-replenish + (via engine cancel-on-
         # absent) already-resting pending buys when the cap is freshly hit.
-        if self.p.max_inventory_notional_mult > 0 and \
-           self._deployed_notional(state) >= self.p.max_inventory_notional_mult * state.investment:
-            return False
+        elif self.p.max_inventory_notional_mult > 0 and \
+                self._deployed_notional(state) >= self.p.max_inventory_notional_mult * state.investment:
+            reason = "inventory_cap"
         # Optional confidence floor: skip buys if PricePredictor confidence is low.
         # Note: NOT ml/predictor.py MIN_CONFIDENCE (different, unrelated gate).
-        if self.p.min_confidence_to_buy > 0 and \
-           state._last_confidence < self.p.min_confidence_to_buy:
-            return False
-        return True
+        elif self.p.min_confidence_to_buy > 0 and \
+                state._last_confidence < self.p.min_confidence_to_buy:
+            reason = "low_confidence"
+
+        if reason != state._last_buy_block_reason:
+            if reason:
+                logger.info("[BUYS] %s paused: %s", state.symbol, reason)
+            else:
+                logger.info("[BUYS] %s resumed", state.symbol)
+            state._last_buy_block_reason = reason
+
+        return reason is None
 
     def _refresh_prediction(self, symbol: str, df: pd.DataFrame, ctx: MarketContext):
         state = self._states[symbol]
