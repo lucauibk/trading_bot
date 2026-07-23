@@ -167,6 +167,84 @@ def build_param_grid_stage_a() -> list:
     return grid
 
 
+# ── Stage B (Forschungsprogramm Phase 2, research/00-hypothesen.md H2): ─────
+#
+# Testet den bestehenden trend_filter_enabled/trend_adx_min-Mechanismus, der im
+# Sweep bisher NIE variiert wurde (immer hart auf True/25.0 gepinnt). Befund A
+# (research/01-kosten.md): Ranging verliert trotz hoher Win-Rate, Trending
+# gewinnt — Hypothese ist deshalb "lockern hilft mehr als verschärfen", aber
+# beide Richtungen werden geprüft, um das nicht vorwegzunehmen. Bewusst klein
+# gehalten (4 Configs): kein neuer Code in strategies/grid.py nötig, beide
+# Felder existieren bereits und werden bereits von grid.py gelesen.
+TREND_FILTER_AXIS = [
+    {"trend_filter_enabled": False, "_label": "stage_b/filter_off"},
+    {"trend_filter_enabled": True, "trend_adx_min": 15.0, "_label": "stage_b/adx15_strict"},
+    {"trend_filter_enabled": True, "trend_adx_min": 25.0, "_label": "stage_b/adx25_baseline"},
+    {"trend_filter_enabled": True, "trend_adx_min": 35.0, "_label": "stage_b/adx35_loose"},
+]
+
+
+def build_param_grid_stage_b() -> list:
+    """Stage B: trend_filter_enabled/trend_adx_min-Achse, sonst identisch zur
+    Live-Baseline-Geometrie (current-Preset, min_step_fee_multiple=4.0 — der
+    in Stage A ermittelte beste Kosten-Kompromiss)."""
+    grid = [_load_live_baseline_config()]
+    base_geometry = GEOMETRY_PRESETS["current"]
+    for variant in TREND_FILTER_AXIS:
+        cfg = {
+            "sl_mode": "per_position",
+            "runner_enabled": False,
+            **base_geometry,
+            "min_step_fee_multiple": 4.0,
+            "min_step_pct": 0.006,
+            "dca_size_mult": 1.0,
+            "momentum_hold_max": 0,
+            "max_inventory_notional_mult": 1.5,
+            "directional_enabled": False,
+            "leverage": LEVERAGE,
+            **variant,
+        }
+        grid.append(cfg)
+    return grid
+
+
+# ── Stage C (Forschungsprogramm Phase 2, H2 harte Variante): ────────────────
+#
+# Stage B (Trend-Filter-Schwelle) zeigte über alle 5 Symbole keinen Effekt
+# (research/02-regime.md). Stage C testet den härteren Mechanismus: neue Buys
+# komplett pausieren, wenn PricePredictor "ranging" meldet (ranging_gate_enabled,
+# additiv in strategies/grid.py::_buys_allowed ergänzt, Default aus).
+RANGING_GATE_AXIS = [
+    {"ranging_gate_enabled": False, "_label": "stage_c/gate_off_baseline"},
+    {"ranging_gate_enabled": True, "_label": "stage_c/gate_on"},
+]
+
+
+def build_param_grid_stage_c() -> list:
+    """Stage C: ranging_gate_enabled An/Aus, sonst identisch zur
+    Live-Baseline-Geometrie (current-Preset, min_step_fee_multiple=4.0)."""
+    grid = [_load_live_baseline_config()]
+    base_geometry = GEOMETRY_PRESETS["current"]
+    for variant in RANGING_GATE_AXIS:
+        cfg = {
+            "sl_mode": "per_position",
+            "runner_enabled": False,
+            **base_geometry,
+            "min_step_fee_multiple": 4.0,
+            "min_step_pct": 0.006,
+            "dca_size_mult": 1.0,
+            "momentum_hold_max": 0,
+            "trend_filter_enabled": True,
+            "trend_adx_min": 25.0,
+            "max_inventory_notional_mult": 1.5,
+            "directional_enabled": False,
+            "leverage": LEVERAGE,
+            **variant,
+        }
+        grid.append(cfg)
+    return grid
+
+
 _DFS = {}
 _TIMEFRAME = "1h"
 _REBUILD_EVERY = 1
@@ -255,14 +333,37 @@ def main():
                              "(Aggressiv-Paket; --max-dd entsprechend lockern, z.B. -35)")
     parser.add_argument("--aggressive", action="store_true",
                         help="Aggressiv-Achsen aktivieren: dca_size_mult, runner, leverage 5")
-    parser.add_argument("--grid", choices=["default", "stage_a"], default="default",
+    parser.add_argument("--grid", choices=["default", "stage_a", "stage_b", "stage_c"],
+                        default="default",
                         help="stage_a: Ultra-Bot-Plan Phase 1 — Geometrie-Presets x "
                              "min_step_pct statt des Standard-2-Achsen-Grids, inkl. "
-                             "gelabelter BASELINE-Zeile aus config/grid_params.json")
+                             "gelabelter BASELINE-Zeile aus config/grid_params.json. "
+                             "stage_b: research/00-hypothesen.md H2 — "
+                             "trend_filter_enabled/trend_adx_min-Achse (4 Configs). "
+                             "stage_c: H2 harte Variante — ranging_gate_enabled An/Aus.")
+    parser.add_argument("--leverage", type=float, default=None,
+                        help="Fixe Leverage für alle Configs (überschreibt den Default "
+                             "3.0). Für ehrliche Spot-Ökonomie (Kraken ist spot-only, "
+                             "kein reales Margin-Trading): --leverage 1.0. Ohne diesen "
+                             "Flag unverändert 3.0, damit nightly_tune.py identisch "
+                             "weiterläuft (research/00-hypothesen.md, Kill-Kriterium #1).")
+    parser.add_argument("--as-of", type=str, default=None,
+                        help="ISO-Datum (YYYY-MM-DD), auf das die Daten VOR dem Laden "
+                             "gekappt werden (df = df[df.index <= as_of]). --days zählt "
+                             "weiterhin ab 'jetzt' beim Fetch, aber alles nach --as-of "
+                             "wird vor Train/Test-Split verworfen. Schützt das Vault-"
+                             "Fenster in research/00-hypothesen.md: ohne Cap reicht das "
+                             "OOS-Testfenster immer bis heute und würde jede künftig "
+                             "verstrichene Vault-Zeit stillschweigend mit auswerten.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     log = logging.getLogger("sweep")
+
+    if args.leverage is not None:
+        global LEVERAGE
+        LEVERAGE = args.leverage
+        log.info("Leverage override: %.1f (statt Default 3.0)", LEVERAGE)
 
     out_dir = ROOT / "results" / datetime.datetime.now().strftime("sweep_%Y%m%d_%H%M")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -279,9 +380,17 @@ def main():
 
     # Pre-warm OHLCV cache serially (avoid concurrent Binance fetches)
     from backtest.data import load_ohlcv
+    as_of_ts = None
+    if args.as_of:
+        as_of_ts = datetime.datetime.fromisoformat(args.as_of).replace(
+            tzinfo=datetime.timezone.utc)
+        log.info("--as-of %s: Daten danach werden vor dem Split verworfen", args.as_of)
     dfs = {}
     for s in symbols:
-        dfs[s] = load_ohlcv(s, args.timeframe, args.days)
+        df = load_ohlcv(s, args.timeframe, args.days)
+        if as_of_ts is not None:
+            df = df[df.index <= as_of_ts]
+        dfs[s] = df
         log.info("Data %s: %d candles (%s → %s)", s, len(dfs[s]),
                  dfs[s].index[0], dfs[s].index[-1])
 
@@ -292,7 +401,14 @@ def main():
     test_start = split_ts - datetime.timedelta(seconds=WARMUP_CANDLES * tf_sec)
     log.info("Train: %s → %s | Test (OOS): %s → %s", data_start, split_ts, split_ts, data_end)
 
-    grid = build_param_grid_stage_a() if args.grid == "stage_a" else build_param_grid(aggressive=args.aggressive)
+    if args.grid == "stage_a":
+        grid = build_param_grid_stage_a()
+    elif args.grid == "stage_b":
+        grid = build_param_grid_stage_b()
+    elif args.grid == "stage_c":
+        grid = build_param_grid_stage_c()
+    else:
+        grid = build_param_grid(aggressive=args.aggressive)
     log.info("Param grid (%s): %d configs × %d symbols = %d train runs",
              args.grid, len(grid), len(symbols), len(grid) * len(symbols))
 

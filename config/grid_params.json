@@ -8,5 +8,6 @@
   "fast_drop_pct": 0.04,
   "directional_enabled": false,
   "directional_score_min": 0.15,
-  "per_pos_sl_max_pct_by_regime": {"trending": 0.03}
+  "per_pos_sl_max_pct_by_regime": {"trending": 0.03},
+  "ranging_gate_enabled": true
 }

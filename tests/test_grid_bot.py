@@ -621,6 +621,52 @@ class TestTrendFilter:
         assert state._hard_trend_down is False  # 2nd clear candle: resumed
 
 
+# ── Ranging-Gate (research/00-hypothesen.md H2, hard variant) ─────────────────
+
+class TestRangingGate:
+
+    def _strategy(self, ranging_gate_enabled=True):
+        from strategies.grid import GridStrategy
+        from strategies.grid_params import GridParams
+        params = GridParams.from_dict({
+            "trend_filter_enabled": False,
+            "ranging_gate_enabled": ranging_gate_enabled,
+            "leverage": 1.0,
+        })
+        return GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                            ml_enabled=False, params=params)
+
+    def test_ranging_regime_blocks_buys_when_gate_enabled(self):
+        from core.context import MarketContext
+        strategy = self._strategy(ranging_gate_enabled=True)
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state.with_position = True
+        state._last_regime = "ranging"
+        assert strategy._buys_allowed(state) is False
+
+    def test_trending_regime_unaffected_by_gate(self):
+        from core.context import MarketContext
+        strategy = self._strategy(ranging_gate_enabled=True)
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state.with_position = True
+        state._last_regime = "trending"
+        assert strategy._buys_allowed(state) is True
+
+    def test_ranging_regime_allowed_when_gate_disabled(self):
+        from core.context import MarketContext
+        strategy = self._strategy(ranging_gate_enabled=False)
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state.with_position = True
+        state._last_regime = "ranging"
+        assert strategy._buys_allowed(state) is True  # Default aus — bestehendes Verhalten
+
+
 # ── Fee-aware min step ────────────────────────────────────────────────────────
 
 class TestMinStep:

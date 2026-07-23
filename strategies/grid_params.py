@@ -58,6 +58,10 @@ class GridParams:
     # because ema9<ema21<ema50 lags a fast breakdown).  0 = off.
     fast_drop_candles: int = 3
     fast_drop_pct: float = 0.04
+    # Research-Programm Phase 2 (research/00-hypothesen.md H2, hard variant):
+    # pausiert neue Buys komplett, wenn PricePredictor-Regime "ranging" meldet.
+    # Default aus — ändert nichts am bestehenden Verhalten.
+    ranging_gate_enabled: bool = False
 
     # ── Leverage ───────────────────────────────────────────────────────
     leverage: float = 0.0                  # 0 = read live from dashboard DB

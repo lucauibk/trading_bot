@@ -188,6 +188,7 @@ trading-bot/
 | `per_pos_sl_max_pct` | 0.04 | Hard-Cap: kein Per-Position-SL > 4% |
 | `levels_by_regime` | ranging:14, trending:6, volatile:20 | Levels pro Regime |
 | `trend_filter_enabled` | True | EMA/ADX-Trend-Filter (Buys pausieren bei Downtrend) |
+| `ranging_gate_enabled` | True | Pausiert neue Buys komplett im "ranging"-Regime (Fee-Drag-Gegenmaßnahme, `research/02-regime.md`: Ranging verliert trotz hoher Win-Rate) |
 | `COMPOUND_EVERY_TRADES` | 3 | Gewinn-Reinvestition alle 3 Trades |
 | `MAX_INVESTMENT_MULT` | 3.0 | Compounding-Cap: max. 3× Initial-Investment |
 | `KRAKEN_FEE` | 0.0016 | Maker-Fee 0.16% — immer diese verwenden |

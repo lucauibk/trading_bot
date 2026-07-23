@@ -308,6 +308,15 @@ class GridStrategy(Strategy):
         elif self.p.min_confidence_to_buy > 0 and \
                 state._last_confidence < self.p.min_confidence_to_buy:
             reason = "low_confidence"
+        # Research-Programm Phase 2 (research/00-hypothesen.md H2, hard variant):
+        # ranging ist im Ist-Zustand das Verlust-Regime trotz hoher Win-Rate
+        # (research/01-kosten.md Befund A) — Hard-Gate pausiert neue Buys komplett
+        # statt nur die Downtrend-Schwelle zu verstellen (die Trend-Filter-Achse
+        # in research/02-regime.md zeigte über alle 5 Coins keinen Effekt).
+        # Default aus: ändert nichts am bestehenden Verhalten, solange nicht
+        # explizit im Sweep/Backtest aktiviert.
+        elif self.p.ranging_gate_enabled and state._last_regime == "ranging":
+            reason = "ranging_gate"
 
         if reason != state._last_buy_block_reason:
             if reason:
