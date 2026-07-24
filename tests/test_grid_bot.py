@@ -1890,6 +1890,42 @@ class TestDirectionalDisabledInConfig:
         assert params.directional_enabled is False
 
 
+class TestPaperBalanceRestorePartialOverlap:
+    """#193: restoring persisted paper balances must not be all-or-nothing.
+
+    A single coin toggle (#184) or any `symbols` edit changes the active set.
+    The restore path in main.py used to require `set(saved) == set(symbols)`
+    and would otherwise discard *every* balance, resetting all buckets to
+    initial/len(active) and wiping accumulated equity + the drawdown baseline.
+    The guard was dropped in favour of PaperBroker.load_balances' already
+    selective semantics — this locks that contract in."""
+
+    def _broker(self, symbols, balance=1000.0):
+        from execution.paper import PaperBroker
+        return PaperBroker(initial_balance=balance, symbols=symbols)
+
+    def test_partial_overlap_preserves_unchanged_buckets(self):
+        # Active set gained "C" and dropped "D" vs. the persisted session.
+        broker = self._broker(["A/USD", "B/USD", "C/USD"], balance=900.0)
+        fresh_default = 900.0 / 3  # 300 per active coin
+        saved = {"A/USD": 500.0, "B/USD": 620.0, "D/USD": 999.0}
+        broker.load_balances(saved)
+        # Unchanged coins restore to their persisted value…
+        assert broker._sym_balance("A/USD") == 500.0
+        assert broker._sym_balance("B/USD") == 620.0
+        # …the newly enabled coin keeps its fresh initial/len(active) default…
+        assert broker._sym_balance("C/USD") == fresh_default
+        # …and a stale key for a now-removed coin is ignored, never leaked in.
+        assert "D/USD" not in broker._balances
+
+    def test_restore_does_not_reset_to_startcapital(self):
+        # The regression: after a toggle the total equity must reflect the
+        # restored balances, not snap back to the fresh initial pool.
+        broker = self._broker(["A/USD", "B/USD"], balance=1000.0)
+        broker.load_balances({"A/USD": 700.0, "B/USD": 800.0})
+        assert broker.get_balance() == 1500.0  # not 1000.0
+
+
 class TestSLCancelsRestingBrokerOrder:
     """#192: a strategy-side floor-SL must cancel its resting broker sell order
     directly, not rely on the engine's _sync_orders cancel loop — that loop is

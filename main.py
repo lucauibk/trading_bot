@@ -176,10 +176,21 @@ def main():
         try:
             from dashboard.db import load_paper_balances
             saved = load_paper_balances()
-            if saved and set(saved.keys()) == set(symbols):
+            if saved:
+                # #193: restore whatever overlaps with the currently active symbol
+                # set — do NOT require an exact key match. A single coin toggle
+                # (#184) or any config `symbols` edit changes the active set, and a
+                # strict `set(saved) == set(symbols)` guard would then discard *all*
+                # persisted balances and reset every bucket to initial/len(active),
+                # wiping days of accumulated paper equity and the drawdown baseline.
+                # `load_balances` is already selective (only writes keys the broker
+                # knows), so unchanged coins restore correctly and newly enabled
+                # coins keep their fresh initial/len(active) default.
                 broker.load_balances(saved)
-                logger.info("PaperBroker: Balances aus DB geladen: %s",
-                            {k: f"{v:.2f}" for k, v in saved.items()})
+                restored = set(saved) & set(symbols)
+                logger.info("PaperBroker: %d/%d Balances aus DB restauriert: %s",
+                            len(restored), len(symbols),
+                            {k: f"{v:.2f}" for k, v in saved.items() if k in restored})
         except Exception as _e:
             logger.debug("PaperBroker balance restore skipped: %s", _e)
         reconciler = None
