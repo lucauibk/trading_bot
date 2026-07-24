@@ -1890,6 +1890,74 @@ class TestDirectionalDisabledInConfig:
         assert params.directional_enabled is False
 
 
+class TestWaitFillsTerminatesWithPreseededSells:
+    """#197: graceful wait_fills must self-terminate once all *real* positions
+    (filled buys with an open TP-sell) are closed.  Pre-seeded placeholder sells
+    carry a synthetic `bought_at` and are regenerated on every rebuild, so they
+    must NOT count as open inventory — otherwise the bot never stops."""
+
+    def _run_one_tick(self, monkeypatch, orders):
+        import types
+        from core.engine import Engine
+        from execution.paper import PaperBroker
+        from core.context import MarketContext
+
+        state = types.SimpleNamespace(total_profit=0.0, investment=100.0,
+                                      grid_lines=[], orders=orders)
+
+        class FakeStrategy:
+            _broker = None
+            def get_state(self, s): return state
+            def on_tick_safety(self, s, p, ctx): pass
+            def on_tick(self, s, p, ctx): pass
+            def on_candle(self, s, df, ctx): pass
+
+        broker = PaperBroker(initial_balance=100.0, symbols=["SOL/USD"])
+        eng = Engine(FakeStrategy(), broker, ["SOL/USD"],
+                     ctx=MarketContext(), initial_capital=100.0)
+        eng._waiting_for_fills = True
+
+        for name in ("_check_dashboard_stop", "_check_daily_drawdown",
+                     "_reconcile_fills", "_log_equity", "_sync_orders"):
+            monkeypatch.setattr(eng, name, lambda *a, **k: None)
+        monkeypatch.setattr(eng, "_update_dashboard", lambda s, p: None)
+        monkeypatch.setattr(eng, "_update_prediction_outcomes", lambda f: None)
+
+        import data_fetcher
+        monkeypatch.setattr(data_fetcher, "fetch_ticker", lambda s: {"last": 100.0})
+        monkeypatch.setattr(data_fetcher, "fetch_ohlcv", lambda *a, **k: None)
+        import core.engine as ce
+        monkeypatch.setattr(ce.time, "sleep", lambda *a, **k: None)
+
+        eng._loop_count = 1
+        eng._tick()
+        return eng
+
+    def test_only_preseeded_sells_terminates(self, monkeypatch):
+        # Grid full of placeholder walls, no real inventory → bot must stop.
+        orders = {
+            "c1": {"side": "sell", "price": 110.0, "qty": 1.0, "filled": False,
+                   "bought_at": 100.0, "pre_seeded": True},
+            "c2": {"side": "sell", "price": 112.0, "qty": 1.0, "filled": False,
+                   "bought_at": 100.0, "pre_seeded": True},
+        }
+        eng = self._run_one_tick(monkeypatch, orders)
+        assert eng._shutdown.is_running() is False, \
+            "wait_fills must terminate when only pre_seeded sells remain (#197)"
+
+    def test_real_open_position_keeps_running(self, monkeypatch):
+        # One genuine filled buy with an open TP-sell → must keep running.
+        orders = {
+            "c1": {"side": "sell", "price": 110.0, "qty": 1.0, "filled": False,
+                   "bought_at": 100.0, "pre_seeded": True},
+            "real": {"side": "sell", "price": 105.0, "qty": 1.0, "filled": False,
+                     "bought_at": 100.0},  # no pre_seeded → real inventory
+        }
+        eng = self._run_one_tick(monkeypatch, orders)
+        assert eng._shutdown.is_running() is True, \
+            "wait_fills must NOT terminate while a real position is still open"
+
+
 class TestGetConnPragmas:
     """#163: get_conn() must enable WAL + a non-zero busy_timeout.
 

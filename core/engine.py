@@ -254,11 +254,19 @@ class Engine:
         self._log_equity()
         self._update_prediction_outcomes(fetch_ohlcv)  # noqa: F821 (imported in _tick scope)
 
-        # wait_fills auto-termination: stop once all sell-with-bought_at positions are closed
+        # wait_fills auto-termination: stop once all *real* positions (filled buys
+        # with an open TP-sell) are closed.  Pre-seeded sells must be excluded: they
+        # are placeholder walls above the price, carry a synthetic `bought_at`
+        # (grid.py:1024), and are regenerated on every grid rebuild — which keeps
+        # running during wait_fills.  Without the `not pre_seeded` filter the
+        # still_open set is permanently non-empty and the bot never self-terminates
+        # (#197).  All other "sell + bought_at = real position" call-sites already
+        # exclude pre_seeded (grid.py:251/973, engine.py:522/641/731, backtest:130).
         if self._waiting_for_fills:
             still_open = any(
                 any(
                     not o.get("filled") and o.get("side") == "sell" and "bought_at" in o
+                    and not o.get("pre_seeded")
                     for o in (getattr(self.strategy, "get_state", lambda s: {})(sym) or type(
                         "X", (), {"orders": {}})()).orders.values()
                 )
