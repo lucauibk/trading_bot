@@ -37,7 +37,12 @@ def no_cache(response):
 def api_start():
     global _bot_process
 
-    if _bot_process and _bot_process.poll() is None:
+    # PID-File-bewusst prüfen (#162): ein via ./start.sh --bot extern gestarteter
+    # Bot ist im Dashboard-Prozess als _bot_process=None sichtbar. Ein reiner
+    # _bot_process-Guard griffe dann nicht → zweiter main.py würde gespawnt, .bot.pid
+    # mit der PID des am Singleton-Lock scheiternden Kindprozesses überschrieben,
+    # der echte Bot damit unkillbar. _is_running() liest zusätzlich .bot.pid.
+    if _is_running():
         return jsonify({"ok": False, "msg": "Bot läuft bereits"})
 
     data = request.get_json() or {}

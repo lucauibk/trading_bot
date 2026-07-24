@@ -12,6 +12,14 @@ def get_conn() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(exist_ok=True)
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
+    # Dashboard und Bot sind ZWEI OS-Prozesse, die dieselbe data/trades.db
+    # kontinuierlich beschreiben (Dashboard: leverage/coin_settings/stop_mode,
+    # Engine: trades/equity/grid_state alle 15 s). SQLite-Default-busy_timeout
+    # ist 0 → ein Writer, der die DB gesperrt vorfindet, scheitert sofort
+    # ("database is locked"). WAL erlaubt gleichzeitige Reader während eines
+    # Writers; busy_timeout lässt einen zweiten Writer warten statt zu failen. (#163)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=5000")
     _init(con)
     return con
 
