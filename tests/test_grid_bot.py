@@ -1888,3 +1888,51 @@ class TestDirectionalDisabledInConfig:
         cfg = json.loads((Path(__file__).parents[1] / "config" / "grid_params.json").read_text())
         params = GridParams.from_dict(cfg)
         assert params.directional_enabled is False
+
+
+class TestApiStartPidAware:
+    """#162: /api/bot/start must gate on _is_running() (PID-file aware), not only
+    on the in-process _bot_process handle. A bot started externally via
+    ./start.sh --bot appears as _bot_process=None in the dashboard process; a pure
+    _bot_process guard would spawn a SECOND main.py and overwrite .bot.pid with the
+    dead PID of the child that loses the singleton lock — leaving the real bot
+    unkillable while /api/status reports 'stopped'."""
+
+    def _client(self, tmp_path, monkeypatch):
+        import dashboard.app as dapp
+        monkeypatch.setattr(dapp, "_ROOT", tmp_path)
+        monkeypatch.setattr(dapp, "_bot_process", None)
+        monkeypatch.setattr(dapp, "set_status", lambda **k: None)
+        spawned = []
+
+        class _FakePopen:
+            def __init__(self, *a, **k):
+                self.pid = 424242
+                spawned.append((a, k))
+
+            def poll(self):
+                return None
+
+        monkeypatch.setattr(dapp.subprocess, "Popen", _FakePopen)
+        return dapp.app.test_client(), spawned
+
+    def test_start_refused_when_external_bot_alive(self, tmp_path, monkeypatch):
+        import os
+        client, spawned = self._client(tmp_path, monkeypatch)
+        # external bot: no in-process handle, but a live PID in .bot.pid
+        (tmp_path / ".bot.pid").write_text(str(os.getpid()))
+        resp = client.post("/api/bot/start", json={})
+        data = resp.get_json()
+        assert data["ok"] is False
+        assert not spawned, "must NOT spawn a second bot when one is already running"
+        # the real bot's PID must be left untouched (not clobbered by a dead child)
+        assert (tmp_path / ".bot.pid").read_text().strip() == str(os.getpid())
+
+    def test_start_spawns_when_nothing_running(self, tmp_path, monkeypatch):
+        client, spawned = self._client(tmp_path, monkeypatch)
+        # no .bot.pid and no in-process handle → free to start
+        resp = client.post("/api/bot/start", json={})
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert len(spawned) == 1
+        assert (tmp_path / ".bot.pid").read_text().strip() == "424242"
