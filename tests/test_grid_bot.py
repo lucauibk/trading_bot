@@ -1671,6 +1671,43 @@ class TestTickCheckDedup:
     """on_tick_safety + on_tick must not run the SL/directional checks twice in a
     single engine tick, or the momentum_hold_max SL deferral is halved."""
 
+    def _strategy(self, **overrides):
+        from strategies.grid import GridStrategy
+        from strategies.grid_params import GridParams
+        params = GridParams.from_dict({"sl_mode": "floor", "leverage": 1.0, **overrides})
+        return GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                            ml_enabled=False, params=params)
+
+    def _spy(self, strategy):
+        calls = {"stops": 0, "dir": 0}
+        strategy._check_position_stops = lambda *a, **k: calls.__setitem__("stops", calls["stops"] + 1)
+        strategy._check_directional    = lambda *a, **k: calls.__setitem__("dir", calls["dir"] + 1)
+        strategy._maybe_open_directional = lambda *a, **k: None
+        strategy._check_mtf_entry        = lambda *a, **k: None
+        strategy._update_trailing_stops  = lambda *a, **k: None
+        return calls
+
+    def test_safety_then_on_tick_runs_checks_once(self):
+        from core.context import MarketContext
+        strategy = self._strategy()
+        strategy.init(["SOL/USD"], MarketContext())
+        ctx = MarketContext()
+        calls = self._spy(strategy)
+        # Mirror the engine's per-tick order: safety first, then on_tick.
+        strategy.on_tick_safety("SOL/USD", 100.0, ctx)
+        strategy.on_tick("SOL/USD", 100.0, ctx)
+        assert calls == {"stops": 1, "dir": 1}
+
+    def test_standalone_on_tick_still_runs_checks(self):
+        from core.context import MarketContext
+        strategy = self._strategy()
+        strategy.init(["SOL/USD"], MarketContext())
+        ctx = MarketContext()
+        calls = self._spy(strategy)
+        # Called without a preceding safety tick → must run the checks itself.
+        strategy.on_tick("SOL/USD", 100.0, ctx)
+        assert calls == {"stops": 1, "dir": 1}
+
 
 # ── Confident-neutral LLM must not inflate blended confidence (#129) ───────────
 class TestLLMNeutralConfidence:
@@ -1781,41 +1818,6 @@ class TestMomentumHoldReset:
     def _strategy(self, **overrides):
         from strategies.grid import GridStrategy
         from strategies.grid_params import GridParams
-        params = GridParams.from_dict({"sl_mode": "floor", "leverage": 1.0, **overrides})
-        return GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
-                            ml_enabled=False, params=params)
-
-    def _spy(self, strategy):
-        calls = {"stops": 0, "dir": 0}
-        strategy._check_position_stops = lambda *a, **k: calls.__setitem__("stops", calls["stops"] + 1)
-        strategy._check_directional    = lambda *a, **k: calls.__setitem__("dir", calls["dir"] + 1)
-        strategy._maybe_open_directional = lambda *a, **k: None
-        strategy._check_mtf_entry        = lambda *a, **k: None
-        strategy._update_trailing_stops  = lambda *a, **k: None
-        return calls
-
-    def test_safety_then_on_tick_runs_checks_once(self):
-        from core.context import MarketContext
-        strategy = self._strategy()
-        strategy.init(["SOL/USD"], MarketContext())
-        ctx = MarketContext()
-        calls = self._spy(strategy)
-        # Mirror the engine's per-tick order: safety first, then on_tick.
-        strategy.on_tick_safety("SOL/USD", 100.0, ctx)
-        strategy.on_tick("SOL/USD", 100.0, ctx)
-        assert calls == {"stops": 1, "dir": 1}
-
-    def test_standalone_on_tick_still_runs_checks(self):
-        from core.context import MarketContext
-        strategy = self._strategy()
-        strategy.init(["SOL/USD"], MarketContext())
-        ctx = MarketContext()
-        calls = self._spy(strategy)
-        # Called without a preceding safety tick → must run the checks itself.
-        strategy.on_tick("SOL/USD", 100.0, ctx)
-        assert calls == {"stops": 1, "dir": 1}
-
-
         params = GridParams.from_dict(
             {"sl_mode": "floor", "leverage": 1.0,
              "momentum_hold_score": 0.35, "momentum_hold_max": 1, **overrides})
@@ -1954,3 +1956,82 @@ class TestWaitFillsTerminatesWithPreseededSells:
         eng = self._run_one_tick(monkeypatch, orders)
         assert eng._shutdown.is_running() is True, \
             "wait_fills must NOT terminate while a real position is still open"
+
+
+class TestGetConnPragmas:
+    """#163: get_conn() must enable WAL + a non-zero busy_timeout.
+
+    Dashboard and bot are two OS processes writing data/trades.db concurrently.
+    Without journal_mode=WAL a writer blocks all readers, and with the SQLite
+    default busy_timeout=0 a second writer fails immediately ("database is
+    locked") instead of waiting — dropping bot writes (trades/equity) or
+    returning dashboard 500s. This locks the pragmas into get_conn()."""
+
+    def _conn(self, tmp_path, monkeypatch):
+        import dashboard.db as ddb
+        monkeypatch.setattr(ddb, "DB_PATH", tmp_path / "trades.db")
+        return ddb.get_conn()
+
+    def test_wal_enabled(self, tmp_path, monkeypatch):
+        con = self._conn(tmp_path, monkeypatch)
+        try:
+            mode = con.execute("PRAGMA journal_mode").fetchone()[0]
+            assert str(mode).lower() == "wal", f"expected WAL, got {mode!r}"
+        finally:
+            con.close()
+
+    def test_busy_timeout_nonzero(self, tmp_path, monkeypatch):
+        con = self._conn(tmp_path, monkeypatch)
+        try:
+            timeout = con.execute("PRAGMA busy_timeout").fetchone()[0]
+            assert int(timeout) >= 5000, f"busy_timeout must be >=5000ms, got {timeout}"
+        finally:
+            con.close()
+
+
+class TestApiStartPidAware:
+    """#162: /api/bot/start must gate on _is_running() (PID-file aware), not only
+    on the in-process _bot_process handle. A bot started externally via
+    ./start.sh --bot appears as _bot_process=None in the dashboard process; a pure
+    _bot_process guard would spawn a SECOND main.py and overwrite .bot.pid with the
+    dead PID of the child that loses the singleton lock — leaving the real bot
+    unkillable while /api/status reports 'stopped'."""
+
+    def _client(self, tmp_path, monkeypatch):
+        import dashboard.app as dapp
+        monkeypatch.setattr(dapp, "_ROOT", tmp_path)
+        monkeypatch.setattr(dapp, "_bot_process", None)
+        monkeypatch.setattr(dapp, "set_status", lambda **k: None)
+        spawned = []
+
+        class _FakePopen:
+            def __init__(self, *a, **k):
+                self.pid = 424242
+                spawned.append((a, k))
+
+            def poll(self):
+                return None
+
+        monkeypatch.setattr(dapp.subprocess, "Popen", _FakePopen)
+        return dapp.app.test_client(), spawned
+
+    def test_start_refused_when_external_bot_alive(self, tmp_path, monkeypatch):
+        import os
+        client, spawned = self._client(tmp_path, monkeypatch)
+        # external bot: no in-process handle, but a live PID in .bot.pid
+        (tmp_path / ".bot.pid").write_text(str(os.getpid()))
+        resp = client.post("/api/bot/start", json={})
+        data = resp.get_json()
+        assert data["ok"] is False
+        assert not spawned, "must NOT spawn a second bot when one is already running"
+        # the real bot's PID must be left untouched (not clobbered by a dead child)
+        assert (tmp_path / ".bot.pid").read_text().strip() == str(os.getpid())
+
+    def test_start_spawns_when_nothing_running(self, tmp_path, monkeypatch):
+        client, spawned = self._client(tmp_path, monkeypatch)
+        # no .bot.pid and no in-process handle → free to start
+        resp = client.post("/api/bot/start", json={})
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert len(spawned) == 1
+        assert (tmp_path / ".bot.pid").read_text().strip() == "424242"
