@@ -1890,6 +1890,57 @@ class TestDirectionalDisabledInConfig:
         assert params.directional_enabled is False
 
 
+class TestSLCancelsRestingBrokerOrder:
+    """#192: a strategy-side floor-SL must cancel its resting broker sell order
+    directly, not rely on the engine's _sync_orders cancel loop — that loop is
+    skipped while the coin is frozen / emergency-stopped (#34) / disabled (#184),
+    whereas on_tick_safety (which fires the SL) always runs. A left-open sell
+    order would otherwise fill on a later price recovery over the sell level and
+    credit margin+PnL a SECOND time on top of the SL credit."""
+
+    def _setup(self, monkeypatch):
+        from strategies.grid import GridStrategy, _GridState
+        from strategies.grid_params import GridParams
+        from execution.paper import PaperBroker
+        monkeypatch.setenv("GRIDBOT_BACKTEST", "1")  # skip dashboard logging
+        strat = GridStrategy(
+            [{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+            ml_enabled=False, params=GridParams(leverage=1.0),
+        )
+        broker = PaperBroker(initial_balance=100.0, symbols=["SOL/USD"])
+        strat._broker = broker
+        # A resting sell (TP) order living on the broker, mirrored in strategy state.
+        broker.place_limit("SOL/USD", "sell", 110.0, 1.0, client_id="c1")
+        state = _GridState("SOL/USD", 100.0, 6, 0.05)
+        state.orders["c1"] = {
+            "side": "sell", "price": 110.0, "qty": 1.0, "filled": False,
+            "bought_at": 100.0, "sl_price": 99.0, "leverage": 1.0,
+            "momentum_holds": 0,
+        }
+        strat._states["SOL/USD"] = state
+        return strat, broker, state
+
+    def test_sl_cancels_broker_order(self, monkeypatch):
+        from core.context import MarketContext
+        strat, broker, state = self._setup(monkeypatch)
+        # price 98 < sl_price 99 → floor-SL fires
+        strat._check_position_stops("SOL/USD", 98.0, state, MarketContext())
+        assert broker._orders["c1"].status == "cancelled", \
+            "resting broker sell order must be cancelled by the SL"
+
+    def test_no_double_credit_on_recovery(self, monkeypatch):
+        from core.context import MarketContext
+        strat, broker, state = self._setup(monkeypatch)
+        strat._check_position_stops("SOL/USD", 98.0, state, MarketContext())
+        bal_after_sl = broker.get_balance()
+        # Price later recovers above the old sell level — the orphaned order must
+        # NOT fill (it was cancelled), so no second margin+PnL credit occurs.
+        broker.update_price("SOL/USD", 99.0)   # advance tick
+        fills = broker.update_price("SOL/USD", 111.0)
+        assert fills == [], "cancelled sell order must not fill on recovery"
+        assert broker.get_balance() == bal_after_sl, "no second credit after SL"
+
+
 class TestWaitFillsTerminatesWithPreseededSells:
     """#197: graceful wait_fills must self-terminate once all *real* positions
     (filled buys with an open TP-sell) are closed.  Pre-seeded placeholder sells

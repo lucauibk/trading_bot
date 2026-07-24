@@ -796,6 +796,20 @@ class GridStrategy(Strategy):
                             self._broker.sl_credit(symbol, credit)
                     except Exception:
                         pass
+                # #192: cancel the resting broker sell order NOW, directly — do not
+                # rely on the engine's _sync_orders cancel loop. That loop is gated
+                # behind `not is_frozen() and not block_new_risk` (engine.py:249) and
+                # is SKIPPED while the coin is frozen (daily-DD), emergency-stopped
+                # (#34) or disabled (#184), whereas on_tick_safety (which fires this
+                # SL) always runs. A left-open sell order would then fill on a later
+                # price recovery over the sell level once the block lifts, crediting
+                # margin+PnL a SECOND time on top of the sl_credit above. cancel() is
+                # idempotent (no-op if already filled/cancelled/unknown).
+                if self._broker is not None:
+                    try:
+                        self._broker.cancel(cid)
+                    except Exception:
+                        pass
                 ctx.remove_position(symbol, "grid")
                 # Remove from orders after SL
                 state.orders.pop(cid, None)
