@@ -1671,6 +1671,43 @@ class TestTickCheckDedup:
     """on_tick_safety + on_tick must not run the SL/directional checks twice in a
     single engine tick, or the momentum_hold_max SL deferral is halved."""
 
+    def _strategy(self, **overrides):
+        from strategies.grid import GridStrategy
+        from strategies.grid_params import GridParams
+        params = GridParams.from_dict({"sl_mode": "floor", "leverage": 1.0, **overrides})
+        return GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                            ml_enabled=False, params=params)
+
+    def _spy(self, strategy):
+        calls = {"stops": 0, "dir": 0}
+        strategy._check_position_stops = lambda *a, **k: calls.__setitem__("stops", calls["stops"] + 1)
+        strategy._check_directional    = lambda *a, **k: calls.__setitem__("dir", calls["dir"] + 1)
+        strategy._maybe_open_directional = lambda *a, **k: None
+        strategy._check_mtf_entry        = lambda *a, **k: None
+        strategy._update_trailing_stops  = lambda *a, **k: None
+        return calls
+
+    def test_safety_then_on_tick_runs_checks_once(self):
+        from core.context import MarketContext
+        strategy = self._strategy()
+        strategy.init(["SOL/USD"], MarketContext())
+        ctx = MarketContext()
+        calls = self._spy(strategy)
+        # Mirror the engine's per-tick order: safety first, then on_tick.
+        strategy.on_tick_safety("SOL/USD", 100.0, ctx)
+        strategy.on_tick("SOL/USD", 100.0, ctx)
+        assert calls == {"stops": 1, "dir": 1}
+
+    def test_standalone_on_tick_still_runs_checks(self):
+        from core.context import MarketContext
+        strategy = self._strategy()
+        strategy.init(["SOL/USD"], MarketContext())
+        ctx = MarketContext()
+        calls = self._spy(strategy)
+        # Called without a preceding safety tick → must run the checks itself.
+        strategy.on_tick("SOL/USD", 100.0, ctx)
+        assert calls == {"stops": 1, "dir": 1}
+
 
 # ── Confident-neutral LLM must not inflate blended confidence (#129) ───────────
 class TestLLMNeutralConfidence:
@@ -1781,41 +1818,6 @@ class TestMomentumHoldReset:
     def _strategy(self, **overrides):
         from strategies.grid import GridStrategy
         from strategies.grid_params import GridParams
-        params = GridParams.from_dict({"sl_mode": "floor", "leverage": 1.0, **overrides})
-        return GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
-                            ml_enabled=False, params=params)
-
-    def _spy(self, strategy):
-        calls = {"stops": 0, "dir": 0}
-        strategy._check_position_stops = lambda *a, **k: calls.__setitem__("stops", calls["stops"] + 1)
-        strategy._check_directional    = lambda *a, **k: calls.__setitem__("dir", calls["dir"] + 1)
-        strategy._maybe_open_directional = lambda *a, **k: None
-        strategy._check_mtf_entry        = lambda *a, **k: None
-        strategy._update_trailing_stops  = lambda *a, **k: None
-        return calls
-
-    def test_safety_then_on_tick_runs_checks_once(self):
-        from core.context import MarketContext
-        strategy = self._strategy()
-        strategy.init(["SOL/USD"], MarketContext())
-        ctx = MarketContext()
-        calls = self._spy(strategy)
-        # Mirror the engine's per-tick order: safety first, then on_tick.
-        strategy.on_tick_safety("SOL/USD", 100.0, ctx)
-        strategy.on_tick("SOL/USD", 100.0, ctx)
-        assert calls == {"stops": 1, "dir": 1}
-
-    def test_standalone_on_tick_still_runs_checks(self):
-        from core.context import MarketContext
-        strategy = self._strategy()
-        strategy.init(["SOL/USD"], MarketContext())
-        ctx = MarketContext()
-        calls = self._spy(strategy)
-        # Called without a preceding safety tick → must run the checks itself.
-        strategy.on_tick("SOL/USD", 100.0, ctx)
-        assert calls == {"stops": 1, "dir": 1}
-
-
         params = GridParams.from_dict(
             {"sl_mode": "floor", "leverage": 1.0,
              "momentum_hold_score": 0.35, "momentum_hold_max": 1, **overrides})
