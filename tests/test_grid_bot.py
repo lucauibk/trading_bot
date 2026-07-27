@@ -1533,6 +1533,89 @@ class TestEmergencySellAllCredit:
         assert after == pytest.approx(before + credit)
 
 
+class TestLeverageChangeBetweenPlaceAndFill:
+    """#206: the broker deducts a grid buy's margin using the leverage stamped on
+    the order at *placement* time (L1). The sell/SL that later returns that margin
+    must use the SAME leverage. Before the fix, _handle_buy_fill re-read the live
+    dashboard leverage at *fill* time (L2); if the user changed leverage while the
+    buy rested as a limit order, L1 != L2 and the paper cash bucket drifted by
+    bought_at*qty*(1/L1 - 1/L2) per position — corrupting the deposit-anchored
+    drawdown brake. The fix pins the return leverage to the buy's fill.meta.
+    """
+
+    def _round_trip(self, monkeypatch, change_lev_to):
+        """Full buy→sell round trip through the real broker. Leverage starts at
+        1.0; after the buy is placed (but before it fills) it is set to
+        `change_lev_to`. Returns the final SOL/USD cash bucket."""
+        from strategies.grid import GridStrategy, _GridState
+        from strategies.grid_params import GridParams
+        from execution.paper import PaperBroker
+        from core.context import MarketContext
+
+        monkeypatch.setenv("GRIDBOT_BACKTEST", "1")  # skip dashboard/notifier
+
+        strat = GridStrategy(
+            [{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+            ml_enabled=False,
+            params=GridParams(sl_mode="per_position", leverage=0.0,
+                              trend_filter_enabled=False,
+                              max_inventory_notional_mult=0.0,
+                              min_confidence_to_buy=0.0),
+        )
+        broker = PaperBroker(initial_balance=100.0, symbols=["SOL/USD"])
+        strat._broker = broker
+        ctx = MarketContext()
+
+        lev = {"v": 1.0}
+        monkeypatch.setattr(strat, "_lev", lambda: lev["v"])
+
+        state = _GridState("SOL/USD", 100.0, 6, 0.05)
+        state.grid_lines = [90.0, 100.0, 110.0]
+        state.with_position = True
+        # A resting grid buy at 100. Deliberately NO "leverage" key here: it is
+        # desired_orders that stamps the broker meta leverage from _lev() at emit
+        # time, exactly like a live grid buy that predates a rebuild-freeze.
+        buy_cid = "buy1"
+        state.orders[buy_cid] = {"side": "buy", "price": 100.0, "qty": 0.1,
+                                 "filled": False}
+        strat._states["SOL/USD"] = state
+
+        # 1. Emit + place the buy while leverage is still L1 = 1.0.
+        emitted = strat.desired_orders("SOL/USD", 100.0, ctx)
+        buy_order = next(o for o in emitted if o.client_id == buy_cid)
+        broker.place_limit(symbol="SOL/USD", side="buy", price=100.0, qty=0.1,
+                           client_id=buy_cid, meta=buy_order.meta)
+
+        # 2. User changes the dashboard leverage while the buy rests.
+        lev["v"] = change_lev_to
+
+        # 3. Buy fills — broker deducts margin using the PLACEMENT meta (L1=1.0).
+        buy_fills = broker.update_price("SOL/USD", 99.0)
+        assert len(buy_fills) == 1
+        strat.on_fill(buy_fills[0], ctx)
+
+        # 4. Emit + place the sell the buy created, then fill it at 110.
+        emitted2 = strat.desired_orders("SOL/USD", 105.0, ctx)
+        sell_order = next(o for o in emitted2 if o.side == "sell")
+        broker.place_limit(symbol="SOL/USD", side="sell", price=sell_order.price,
+                           qty=sell_order.qty, client_id=sell_order.client_id,
+                           meta=sell_order.meta)
+        sell_fills = broker.update_price("SOL/USD", 111.0)
+        assert len(sell_fills) == 1
+
+        return broker._balances["SOL/USD"]
+
+    def test_no_drift_when_leverage_changes_mid_position(self, monkeypatch):
+        # A position opened at L1=1.0 must settle identically whether or not the
+        # dashboard leverage is later bumped to 3.0 — the change must not touch a
+        # position that was already margined at the old leverage.
+        stable  = self._round_trip(monkeypatch, change_lev_to=1.0)
+        changed = self._round_trip(monkeypatch, change_lev_to=3.0)
+        assert changed == pytest.approx(stable)
+        # sanity: the round trip actually completed with a profit (sell 110 > buy 100)
+        assert stable > 100.0
+
+
 class TestPaperRestartMargin:
     """#183: normal SIGTERM/restart/crash never sells open positions, and only
     the cash balance is persisted (not the positions). Without settling them,
