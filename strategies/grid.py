@@ -430,7 +430,16 @@ class GridStrategy(Strategy):
         buy_price = fill.price
         buy_cid = fill.client_id
         order = state.orders[buy_cid]
-        lev = self._lev()
+        # #206: use the leverage the buy was actually deducted with, not the live
+        # dashboard value. The broker deducts margin using the leverage stamped on
+        # the buy order at *placement* time (engine only sends meta on first place,
+        # cid re-emits don't update it). If the dashboard leverage changed between
+        # placement and this fill, self._lev() now differs from what was deducted,
+        # so stamping the sell/SL with self._lev() would return a different margin
+        # than was taken → paper-cash drift (feeds the deposit-anchored DD brake).
+        # fill.meta carries the broker order's meta (= the deduct leverage); fall
+        # back to the frozen order value, then to live only as a last resort.
+        lev = float(fill.meta.get("leverage", order.get("leverage", self._lev())))
         qty = order["qty"]  # qty already has leverage factored in at setup
 
         try:
@@ -565,6 +574,7 @@ class GridStrategy(Strategy):
                 "price": new_buy_price,
                 "qty": new_qty,
                 "filled": False,
+                "leverage": lev,  # #206: freeze deduct leverage (matches new_qty sizing)
             }
             state.price_to_id[new_buy_price] = new_cid
 
@@ -1017,7 +1027,12 @@ class GridStrategy(Strategy):
 
             if gp < price:
                 if buys_ok:
-                    buy_order: dict = {"side": "buy", "price": gp, "qty": qty, "filled": False}
+                    # #206: freeze the leverage qty was sized with onto the order so
+                    # desired_orders emits it (via **o) as the buy's broker meta —
+                    # margin is then deducted with the same leverage the sell/SL
+                    # returns, regardless of later live-leverage changes.
+                    buy_order: dict = {"side": "buy", "price": gp, "qty": qty,
+                                       "filled": False, "leverage": lev}
                     # In per-cohort floor mode, stamp each buy with the current cohort's
                     # floor so _handle_buy_fill can assign an individual sl_price.
                     if self.p.floor_sl_per_cohort and self.p.sl_mode == "floor" and state.floor_sl > 0:
