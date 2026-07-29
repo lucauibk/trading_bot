@@ -440,7 +440,18 @@ class GridStrategy(Strategy):
         # fill.meta carries the broker order's meta (= the deduct leverage); fall
         # back to the frozen order value, then to live only as a last resort.
         lev = float(fill.meta.get("leverage", order.get("leverage", self._lev())))
-        qty = order["qty"]  # qty already has leverage factored in at setup
+        # #208: use the qty the broker actually filled, not state.orders[cid]["qty"].
+        # A resting buy that survives a grid rebuild reuses its client_id (grid.py:
+        # ~1013, because setup_grid drops unfilled buys from state.orders first) but
+        # gets re-sized to the new lev/investment, while _sync_orders never re-places
+        # an already-active cid — so the broker still holds the OLD qty. Reading
+        # order["qty"] here would stamp the sell/position with the NEW qty, crediting
+        # margin for a quantity that was never bought (feeds the deposit-anchored DD
+        # brake, same drift class as #206). fill.qty is what actually transacted; in
+        # the normal (no-rebuild) case it equals order["qty"], so behaviour is
+        # unchanged there. Together with the #206 fill.meta leverage, deduct and
+        # return then use identical (qty, lev).
+        qty = fill.qty  # qty already has leverage factored in at setup/placement
 
         try:
             idx = state.grid_lines.index(order["price"])

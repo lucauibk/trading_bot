@@ -1616,6 +1616,92 @@ class TestLeverageChangeBetweenPlaceAndFill:
         assert stable > 100.0
 
 
+class TestBuyFillQtyAfterRebuildResize:
+    """#208: residual of #206 (point 3). A resting grid buy that survives a grid
+    rebuild reuses its client_id but is re-sized to the new lev/investment in
+    state.orders, while _sync_orders never re-places an already-active cid — so
+    the broker still holds (and fills) the OLD qty. _handle_buy_fill must stamp
+    the resulting sell/position with the qty the broker ACTUALLY filled (fill.qty),
+    not state.orders[cid]["qty"] (the new rebuild qty). Otherwise the sell returns
+    margin for a quantity that was never bought → paper-cash drift feeding the
+    deposit-anchored drawdown brake. The fix uses fill.qty.
+    """
+
+    def _round_trip(self, monkeypatch, resize_qty_to):
+        """Full buy→sell round trip through the real broker. The buy is placed at
+        qty 0.1; after placement (but before it fills) state.orders[cid]["qty"] is
+        overwritten with `resize_qty_to` — emulating a rebuild that reused the cid
+        and re-sized it while the broker order still holds the original 0.1.
+        Returns the final SOL/USD cash bucket."""
+        from strategies.grid import GridStrategy, _GridState
+        from strategies.grid_params import GridParams
+        from execution.paper import PaperBroker
+        from core.context import MarketContext
+
+        monkeypatch.setenv("GRIDBOT_BACKTEST", "1")  # skip dashboard/notifier
+
+        strat = GridStrategy(
+            [{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+            ml_enabled=False,
+            params=GridParams(sl_mode="per_position", leverage=0.0,
+                              trend_filter_enabled=False,
+                              max_inventory_notional_mult=0.0,
+                              min_confidence_to_buy=0.0),
+        )
+        broker = PaperBroker(initial_balance=100.0, symbols=["SOL/USD"])
+        strat._broker = broker
+        ctx = MarketContext()
+
+        # Leverage is constant here — this test isolates the qty path (not #206's
+        # leverage path). Kept at 1.0 for both round trips.
+        monkeypatch.setattr(strat, "_lev", lambda: 1.0)
+
+        state = _GridState("SOL/USD", 100.0, 6, 0.05)
+        state.grid_lines = [90.0, 100.0, 110.0]
+        state.with_position = True
+        buy_cid = "buy1"
+        state.orders[buy_cid] = {"side": "buy", "price": 100.0, "qty": 0.1,
+                                 "filled": False, "leverage": 1.0}
+        strat._states["SOL/USD"] = state
+
+        # 1. Emit + place the buy at qty 0.1.
+        emitted = strat.desired_orders("SOL/USD", 100.0, ctx)
+        buy_order = next(o for o in emitted if o.client_id == buy_cid)
+        broker.place_limit(symbol="SOL/USD", side="buy", price=100.0, qty=0.1,
+                           client_id=buy_cid, meta=buy_order.meta)
+
+        # 2. A rebuild reuses the cid and re-sizes the resting buy in state.orders;
+        #    the already-placed broker order is NOT touched (still qty 0.1).
+        state.orders[buy_cid]["qty"] = resize_qty_to
+
+        # 3. Buy fills — broker fills its OWN order qty (0.1) and deducts for 0.1.
+        buy_fills = broker.update_price("SOL/USD", 99.0)
+        assert len(buy_fills) == 1
+        assert buy_fills[0].qty == pytest.approx(0.1)
+        strat.on_fill(buy_fills[0], ctx)
+
+        # 4. Emit + place the sell the buy created, then fill it at 110.
+        emitted2 = strat.desired_orders("SOL/USD", 105.0, ctx)
+        sell_order = next(o for o in emitted2 if o.side == "sell")
+        broker.place_limit(symbol="SOL/USD", side="sell", price=sell_order.price,
+                           qty=sell_order.qty, client_id=sell_order.client_id,
+                           meta=sell_order.meta)
+        sell_fills = broker.update_price("SOL/USD", 111.0)
+        assert len(sell_fills) == 1
+
+        return broker._balances["SOL/USD"]
+
+    def test_no_drift_when_buy_resized_mid_rest(self, monkeypatch):
+        # A position the broker actually bought at qty 0.1 must settle identically
+        # whether or not state.orders was later re-sized to 0.3 by a rebuild — the
+        # re-size must not credit margin for qty that was never purchased.
+        stable  = self._round_trip(monkeypatch, resize_qty_to=0.1)
+        resized = self._round_trip(monkeypatch, resize_qty_to=0.3)
+        assert resized == pytest.approx(stable)
+        # sanity: the round trip actually completed with a profit (sell 110 > buy 100)
+        assert stable > 100.0
+
+
 class TestPaperRestartMargin:
     """#183: normal SIGTERM/restart/crash never sells open positions, and only
     the cash balance is persisted (not the positions). Without settling them,
