@@ -2406,3 +2406,43 @@ class TestBlockedCoinStillFillsTP:
 
         assert broker._orders["tp1"].status == "filled"
         assert broker._sym_balance(sym) > bal_before
+
+    def test_blocked_coin_resting_buy_does_NOT_fill(self, monkeypatch):
+        # A blocked coin keeps its resting BUY orders (they aren't cancelled because
+        # _sync_orders stays gated).  update_price() fills any order the price crosses,
+        # so a dip must NOT be allowed to fill a resting buy — that would OPEN a fresh
+        # long on a coin whose contract is "new buys halted": averaging down into an
+        # emergency-stopped loser (#34) or buying a dashboard-disabled coin (#184).
+        # Guards against #210 over-reaching from the sell (exit) path into the buy
+        # (entry) path.  price DROPS below the resting buy → it must stay open.
+        eng, broker, strat, sym = self._engine(monkeypatch, price=95.0, disabled=True)
+        broker.place_limit(
+            symbol=sym, side="buy", price=100.0, qty=1.0, post_only=True,
+            client_id="buy1", meta={"leverage": 1.0},
+        )
+        bal_before = broker._sym_balance(sym)
+
+        eng._tick()
+
+        assert broker._orders["buy1"].status == "open", \
+            "blocked coin resting BUY must NOT fill (would open new risk)"
+        assert broker._sym_balance(sym) == bal_before, "no margin may be deducted"
+        assert strat.fills == []
+
+    def test_blocked_coin_fills_tp_but_not_buy_same_tick(self, monkeypatch):
+        # Combined: with both a resting TP-sell (below price) and a resting buy (above
+        # a rising price would not trigger it, so use a wide buy) the blocked coin fills
+        # ONLY the sell.  price=105 → TP@104 fills, buy@110 (still >= price so it would
+        # trigger as buy since 105<=110) must be skipped by sells_only.
+        eng, broker, strat, sym = self._engine(monkeypatch, price=105.0, disabled=True)
+        self._place_resting_tp(broker, sym)  # sell @ 104
+        broker.place_limit(
+            symbol=sym, side="buy", price=110.0, qty=1.0, post_only=True,
+            client_id="buy1", meta={"leverage": 1.0},
+        )
+
+        eng._tick()
+
+        assert broker._orders["tp1"].status == "filled", "TP-sell must still fill"
+        assert broker._orders["buy1"].status == "open", "resting buy must be skipped"
+        assert [f.side for f in strat.fills] == ["sell"]
