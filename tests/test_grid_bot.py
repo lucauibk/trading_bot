@@ -2084,8 +2084,11 @@ class TestPaperBalanceRestorePartialOverlap:
         assert broker._sym_balance("B/USD") == 620.0
         # …the newly enabled coin keeps its fresh initial/len(active) default…
         assert broker._sym_balance("C/USD") == fresh_default
-        # …and a stale key for a now-removed coin is ignored, never leaked in.
-        assert "D/USD" not in broker._balances
+        # …and a now-removed coin's balance is PRESERVED as an orphan bucket, not
+        # discarded: dropping it wiped real paper capital from equity and could
+        # trip the deposit-anchored drawdown FREEZE on restart (#212 supersedes the
+        # original "never leaked in" assertion — the orphan is real money, not a leak).
+        assert broker._balances["D/USD"] == 999.0
 
     def test_restore_does_not_reset_to_startcapital(self):
         # The regression: after a toggle the total equity must reflect the
@@ -2093,6 +2096,78 @@ class TestPaperBalanceRestorePartialOverlap:
         broker = self._broker(["A/USD", "B/USD"], balance=1000.0)
         broker.load_balances({"A/USD": 700.0, "B/USD": 800.0})
         assert broker.get_balance() == 1500.0  # not 1000.0
+
+
+class TestOrphanBalancePreservedOnRestart:
+    """#212: disabling a coin (#184) or removing it from config.yaml:symbols must
+    NOT wipe its accumulated paper capital from equity on the next restart.
+
+    The persisted balance of the removed coin ("orphan") was silently dropped by
+    load_balances' `if sym in self._balances` guard. With deposit-anchored drawdown
+    (#132) the resulting phantom equity drop could instantly trip the daily-drawdown
+    FREEZE and block new buys on every remaining coin — despite zero real loss.
+    """
+
+    def _broker(self, symbols, balance):
+        from execution.paper import PaperBroker
+        return PaperBroker(initial_balance=balance, symbols=symbols)
+
+    def test_orphan_capital_stays_in_equity_after_disable(self):
+        # 5 coins, 1000 deposit, all flat at 200. Disable 1 → restart with 4 active.
+        deposit = 1000.0
+        saved = {"A/USD": 200.0, "B/USD": 200.0, "C/USD": 200.0,
+                 "D/USD": 200.0, "E/USD": 200.0}
+        active = ["A/USD", "B/USD", "C/USD", "D/USD"]  # E disabled
+        broker = self._broker(active, deposit)  # fresh buckets = 1000/4 = 250 each
+        broker.load_balances(saved)
+        # Equity must stay at the true 1000, NOT fall to 800 (the phantom-loss bug).
+        assert broker.get_balance() == pytest.approx(1000.0)
+
+    def test_no_false_drawdown_freeze(self):
+        # The concrete freeze scenario from #212: baseline = deposit = 1000,
+        # max_daily_drawdown = 10%. After disable+restart the equity must not dip
+        # below the 900 freeze line purely from the orphan drop.
+        deposit = 1000.0
+        max_dd = 0.10
+        saved = {f"{c}/USD": 200.0 for c in "ABCDE"}
+        broker = self._broker(["A/USD", "B/USD", "C/USD", "D/USD"], deposit)
+        broker.load_balances(saved)
+        dd = (broker.get_balance() - deposit) / deposit
+        assert dd > -max_dd, "orphan drop must not synthesise a >10% drawdown"
+
+    def test_orphan_survives_second_restart_via_persistence(self):
+        # Persistence saves dict(broker._balances) (engine.py:719/792). The orphan
+        # must be in that dict so it is not lost on the *next* restart either.
+        saved = {f"{c}/USD": 200.0 for c in "ABCDE"}
+        broker = self._broker(["A/USD", "B/USD", "C/USD", "D/USD"], 1000.0)
+        broker.load_balances(saved)
+        persisted = dict(broker._balances)          # what engine writes to the DB
+        assert persisted.get("E/USD") == 200.0
+
+        # Second restart: same reduced active set, load the just-persisted dict.
+        broker2 = self._broker(["A/USD", "B/USD", "C/USD", "D/USD"], 1000.0)
+        broker2.load_balances(persisted)
+        assert broker2.get_balance() == pytest.approx(1000.0)
+
+    def test_reenable_restores_orphan_into_active_bucket(self):
+        # Re-enabling E (back in the active set) must restore its saved value into
+        # the tradeable bucket, not the fresh initial/len default.
+        saved = {f"{c}/USD": 200.0 for c in "ABCD"}
+        saved["E/USD"] = 260.0  # E had grown before being disabled
+        active = ["A/USD", "B/USD", "C/USD", "D/USD", "E/USD"]  # E re-enabled
+        broker = self._broker(active, 1000.0)  # fresh buckets = 200 each
+        broker.load_balances(saved)
+        assert broker._sym_balance("E/USD") == 260.0  # restored, not 200
+
+    def test_orphan_bucket_is_untraded_and_isolated(self):
+        # The orphan must NOT leak into the #149 fallback pool (_balance stays 0),
+        # so an unseeded/mismatched symbol can't transact against hidden cash.
+        saved = {"A/USD": 300.0, "GONE/USD": 500.0}
+        broker = self._broker(["A/USD"], 300.0)
+        broker.load_balances(saved)
+        assert broker._balance == 0.0
+        # An unseeded symbol still sees no cash (buys rejected), isolation intact.
+        assert broker._sym_balance("NEVER/USD") == 0.0
 
 
 class TestSLCancelsRestingBrokerOrder:

@@ -216,10 +216,29 @@ class PaperBroker(Broker):
                 if o.symbol == symbol and o.status == "open"]
 
     def load_balances(self, balances: dict) -> None:
-        """Restore per-symbol balances from a previous session."""
+        """Restore per-symbol balances from a previous session.
+
+        Active buckets are overwritten with their persisted value. A saved key that
+        is NOT in the current (possibly reduced) active set — a coin disabled via the
+        dashboard toggle (#184) or removed from ``config.yaml:symbols`` — is an
+        *orphan*: its accumulated paper capital is real and must stay in equity.
+        Discarding it (the previous ``if sym in self._balances`` guard) made the
+        deposit-anchored drawdown brake (#132) see a phantom loss of exactly that
+        bucket on restart, which could instantly FREEZE new buys on every remaining
+        coin even though nothing was actually lost (#212).
+
+        We therefore keep the orphan as its own *untraded* bucket instead of dropping
+        it: no order ever routes to it (it is not in the active symbol set), so it is
+        never debited/credited; ``get_balance()`` sums it so equity stays continuous;
+        ``dict(self._balances)`` persists it across further restarts; and a later
+        re-enable of the coin restores the saved value straight back into its active
+        bucket. Parking the orphan in ``self._balance`` instead (as the issue first
+        proposed) would resurrect the #149 hidden-pool hazard — a non-zero fallback
+        pool lets an unseeded symbol transact against full-account cash — and would
+        not survive the next save (only ``_balances`` is persisted), so it is kept
+        out of ``_balance`` on purpose."""
         for sym, val in balances.items():
-            if sym in self._balances:
-                self._balances[sym] = float(val)
+            self._balances[sym] = float(val)
 
     def sl_credit(self, symbol: str, amount: float) -> None:
         """Credit the margin + PnL back to the symbol bucket after a strategy-side SL.
