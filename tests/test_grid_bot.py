@@ -2291,3 +2291,158 @@ class TestApiStartPidAware:
         assert data["ok"] is True
         assert len(spawned) == 1
         assert (tmp_path / ".bot.pid").read_text().strip() == "424242"
+
+
+# ── #210: blocked coins must still fill resting TP-sells ─────────────────────
+
+class TestBlockedCoinStillFillsTP:
+    """#210: an emergency-stopped (#34) or dashboard-disabled (#184) coin must keep
+    filling its resting grid TP-sell limit orders — only OPENING new risk is blocked.
+
+    process_paper_fills() is the only paper path that fills resting limit sells; while
+    it lived inside the block_new_risk-gated _sync_orders, a blocked coin could exit
+    only via SL, contradicting the documented "SL/TP still active" and trapping an
+    emergency-stopped coin in a loss-only one-way street. The fix pulls the fill out of
+    the gate so it runs on block_new_risk — but NOT during the daily-drawdown freeze,
+    whose only-SL one-way liquidation is intentional (#90, parked in #171).
+    """
+
+    class _Strat:
+        """Minimal strategy: records fills, and FAILS loudly if the engine tries to
+        open new risk (on_tick) or sync orders (desired_orders) for a blocked coin."""
+        _broker = None
+
+        def __init__(self):
+            self.fills = []
+            self.allow_new_risk = True
+
+        def init(self, symbols, ctx):
+            pass
+
+        def get_state(self, sym):
+            return None
+
+        def on_tick_safety(self, sym, price, ctx):
+            pass
+
+        def on_tick(self, sym, price, ctx):
+            if not self.allow_new_risk:
+                raise AssertionError("on_tick must not run for a blocked/frozen coin")
+
+        def desired_orders(self, sym, price, ctx):
+            if not self.allow_new_risk:
+                raise AssertionError("_sync_orders must not run for a blocked/frozen coin")
+            return []
+
+        def on_fill(self, fill, ctx):
+            self.fills.append(fill)
+
+    def _engine(self, monkeypatch, price, disabled=False, frozen=False):
+        from core.engine import Engine
+        from core.context import MarketContext
+        from execution.paper import PaperBroker
+        import data_fetcher
+
+        sym = "SOL/USD"
+        broker = PaperBroker(initial_balance=1000.0, symbols=[sym])
+        ctx = MarketContext()
+        ctx.set_freeze(frozen)
+        strat = self._Strat()
+        strat.allow_new_risk = not (disabled or frozen)
+        eng = Engine(strat, broker, [sym], ctx=ctx)
+
+        # Neutralise all heavy I/O so a single _tick() runs in isolation.
+        monkeypatch.setattr(data_fetcher, "fetch_ticker", lambda s: {"last": price})
+        for m in ("_check_dashboard_stop", "_refresh_coin_settings", "_refresh_btc",
+                  "_refresh_funding", "_refresh_correlations", "_check_daily_drawdown",
+                  "_update_dashboard", "_log_equity", "_update_prediction_outcomes"):
+            monkeypatch.setattr(eng, m, lambda *a, **k: None)
+
+        if disabled:
+            eng._disabled_coins = {sym}
+        eng._loop_count = 1  # avoid the recheck(%5)/rebuild(%60) cycles
+        return eng, broker, strat, sym
+
+    def _place_resting_tp(self, broker, sym, qty=1.0, bought_at=100.0, sell_price=104.0):
+        broker.place_limit(
+            symbol=sym, side="sell", price=sell_price, qty=qty, post_only=True,
+            client_id="tp1", meta={"bought_at": bought_at, "leverage": 1.0},
+        )
+
+    def test_disabled_coin_still_fills_resting_tp_sell(self, monkeypatch):
+        # price rises above the TP → the resting sell must fill even though the coin
+        # is disabled (block_new_risk). Balance is credited margin + P&L.
+        eng, broker, strat, sym = self._engine(monkeypatch, price=105.0, disabled=True)
+        self._place_resting_tp(broker, sym)
+        bal_before = broker._sym_balance(sym)
+
+        eng._tick()
+
+        assert broker._orders["tp1"].status == "filled", "disabled coin TP-sell must fill"
+        assert broker._sym_balance(sym) > bal_before, "TP fill must credit the balance"
+        assert len(strat.fills) == 1 and strat.fills[0].side == "sell"
+
+    def test_emergency_and_frozen_semantics_diverge(self, monkeypatch):
+        # The daily-drawdown FREEZE keeps its intentional only-SL behaviour: the
+        # resting TP-sell must NOT fill while frozen (guards against over-reaching the
+        # #210 fix into the deliberately-parked #90/freeze path).
+        eng, broker, strat, sym = self._engine(monkeypatch, price=105.0, frozen=True)
+        self._place_resting_tp(broker, sym)
+        bal_before = broker._sym_balance(sym)
+
+        eng._tick()
+
+        assert broker._orders["tp1"].status == "open", "frozen coin TP-sell must NOT fill"
+        assert broker._sym_balance(sym) == bal_before
+        assert strat.fills == []
+
+    def test_normal_coin_fills_and_runs_sync(self, monkeypatch):
+        # Sanity: a non-blocked coin fills its TP and DOES run on_tick/_sync_orders.
+        eng, broker, strat, sym = self._engine(monkeypatch, price=105.0)
+        self._place_resting_tp(broker, sym)
+        bal_before = broker._sym_balance(sym)
+
+        eng._tick()  # would raise from _Strat if new-risk paths were skipped
+
+        assert broker._orders["tp1"].status == "filled"
+        assert broker._sym_balance(sym) > bal_before
+
+    def test_blocked_coin_resting_buy_does_NOT_fill(self, monkeypatch):
+        # A blocked coin keeps its resting BUY orders (they aren't cancelled because
+        # _sync_orders stays gated).  update_price() fills any order the price crosses,
+        # so a dip must NOT be allowed to fill a resting buy — that would OPEN a fresh
+        # long on a coin whose contract is "new buys halted": averaging down into an
+        # emergency-stopped loser (#34) or buying a dashboard-disabled coin (#184).
+        # Guards against #210 over-reaching from the sell (exit) path into the buy
+        # (entry) path.  price DROPS below the resting buy → it must stay open.
+        eng, broker, strat, sym = self._engine(monkeypatch, price=95.0, disabled=True)
+        broker.place_limit(
+            symbol=sym, side="buy", price=100.0, qty=1.0, post_only=True,
+            client_id="buy1", meta={"leverage": 1.0},
+        )
+        bal_before = broker._sym_balance(sym)
+
+        eng._tick()
+
+        assert broker._orders["buy1"].status == "open", \
+            "blocked coin resting BUY must NOT fill (would open new risk)"
+        assert broker._sym_balance(sym) == bal_before, "no margin may be deducted"
+        assert strat.fills == []
+
+    def test_blocked_coin_fills_tp_but_not_buy_same_tick(self, monkeypatch):
+        # Combined: with both a resting TP-sell (below price) and a resting buy (above
+        # a rising price would not trigger it, so use a wide buy) the blocked coin fills
+        # ONLY the sell.  price=105 → TP@104 fills, buy@110 (still >= price so it would
+        # trigger as buy since 105<=110) must be skipped by sells_only.
+        eng, broker, strat, sym = self._engine(monkeypatch, price=105.0, disabled=True)
+        self._place_resting_tp(broker, sym)  # sell @ 104
+        broker.place_limit(
+            symbol=sym, side="buy", price=110.0, qty=1.0, post_only=True,
+            client_id="buy1", meta={"leverage": 1.0},
+        )
+
+        eng._tick()
+
+        assert broker._orders["tp1"].status == "filled", "TP-sell must still fill"
+        assert broker._orders["buy1"].status == "open", "resting buy must be skipped"
+        assert [f.side for f in strat.fills] == ["sell"]

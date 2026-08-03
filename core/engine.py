@@ -246,6 +246,35 @@ class Engine:
                 self.strategy.setup_grid(sym, price, self.ctx)
                 self._last_rebuild[sym] = self._loop_count
 
+            # #210: fill existing paper orders against the price EVEN WHEN new risk is
+            # blocked (emergency-stop #34 / dashboard-disabled #184).
+            # process_paper_fills() is the ONLY paper path that fills resting limit
+            # orders; while it lived inside the block_new_risk-gated _sync_orders below,
+            # an emergency-stopped or disabled coin could exit only via SL — profitable
+            # TP exits were silently dropped, contradicting the documented "SL/TP still
+            # active" and trapping an emergency-stopped coin in a loss-only one-way
+            # street (its total_profit could never recover past the cap → permanent
+            # stop).  Pulling the fill out of the gate mirrors the unconditional live
+            # _reconcile_fills() above (a real exchange fills resting TPs regardless of
+            # our block state).
+            #
+            # CRUCIAL: for a blocked coin we fill resting SELLS ONLY (sells_only=
+            # block_new_risk).  A blocked coin keeps its resting BUY orders too (they
+            # are not cancelled because _sync_orders stays gated), and update_price
+            # fills any order the price crosses — so without this guard a dip would
+            # fill a resting buy and OPEN a fresh long on a coin whose contract is
+            # "new buys halted": averaging down into a stopped-out loser (#34) or
+            # buying a coin the user disabled (#184).  Filling only sells keeps the
+            # exit path open while genuinely halting new risk.  Order placement/
+            # cancellation stays gated in _sync_orders below.
+            #
+            # The daily-drawdown freeze is deliberately EXCLUDED entirely: its only-SL,
+            # one-way liquidation is intentional (see the setup_grid note above and #90,
+            # parked in the Live-Parität meta #171) — so this runs on block_new_risk
+            # (sells only) but not at all on is_frozen().
+            if not self.ctx.is_frozen():
+                self.process_paper_fills(sym, price, sells_only=block_new_risk)
+
             if not self.ctx.is_frozen() and not block_new_risk:
                 self._sync_orders(sym, price)
 
@@ -318,10 +347,11 @@ class Engine:
         self._disabled_coins = disabled
 
     def _reconcile_fills(self):
-        """Process fills from live broker via reconciler. Paper fills handled in _sync_orders."""
+        """Process fills from live broker via reconciler. Paper fills are handled by
+        process_paper_fills(), called unconditionally in _tick (#210)."""
         from execution.paper import PaperBroker
         if isinstance(self.broker, PaperBroker):
-            return  # Paper fills are processed in process_paper_fills() inside _sync_orders
+            return  # Paper fills are processed in process_paper_fills(), called in _tick
         if self.reconciler:
             fills = self.reconciler.reconcile()
             for fill in fills:
@@ -334,18 +364,19 @@ class Engine:
                 if fill.client_id:
                     self.reconciler.remove_order(fill.client_id)
 
-    def process_paper_fills(self, symbol: str, price: float):
+    def process_paper_fills(self, symbol: str, price: float, sells_only: bool = False):
         from execution.paper import PaperBroker
         if isinstance(self.broker, PaperBroker):
-            fills = self.broker.update_price(symbol, price)
+            fills = self.broker.update_price(symbol, price, sells_only=sells_only)
             for fill in fills:
                 self.strategy.on_fill(fill, self.ctx)
                 if fill.client_id in self._active_orders.get(symbol, {}):
                     del self._active_orders[symbol][fill.client_id]
 
     def _sync_orders(self, symbol: str, price: float):
-        self.process_paper_fills(symbol, price)
-
+        # #210: paper fills are now processed unconditionally in _tick (before this
+        # gate) so resting TP-sells still fill for emergency-stopped / disabled coins.
+        # _sync_orders is the new-order path only: place desired, cancel undesired.
         desired = {o.client_id: o for o in self.strategy.desired_orders(symbol, price, self.ctx)
                    if o.client_id}
         active = self._active_orders.get(symbol, {})

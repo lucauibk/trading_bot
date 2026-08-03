@@ -126,13 +126,22 @@ class PaperBroker(Broker):
                 count += 1
         return count
 
-    def update_price(self, symbol: str, price: float) -> List[Fill]:
-        """Call each tick with current price. Returns fills that occurred."""
+    def update_price(self, symbol: str, price: float, sells_only: bool = False) -> List[Fill]:
+        """Call each tick with current price. Returns fills that occurred.
+
+        `sells_only=True` fills only resting SELL orders (TP/exit) and skips resting
+        BUY orders. This is used for emergency-stopped (#34) / dashboard-disabled
+        (#184) coins: their open positions must still be able to exit via TP, but a
+        resting buy must NOT fill — that would OPEN new risk on a coin whose contract
+        is "new buys halted" (averaging down into a stopped-out loser). Default False
+        keeps the normal two-sided grid behaviour untouched (#210)."""
         self._tick += 1
         fills = []
 
         for order in list(self._orders.values()):
             if order.symbol != symbol or order.status != "open":
+                continue
+            if sells_only and order.side == "buy":
                 continue
             placed_tick = order.meta.get("placed_tick", 0)
             if placed_tick == self._tick:
