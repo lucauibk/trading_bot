@@ -2521,3 +2521,93 @@ class TestBlockedCoinStillFillsTP:
         assert broker._orders["tp1"].status == "filled", "TP-sell must still fill"
         assert broker._orders["buy1"].status == "open", "resting buy must be skipped"
         assert [f.side for f in strat.fills] == ["sell"]
+
+
+class TestPreseededSellFeeNoPhantomBuyFee:
+    """#215: filling a pre-seeded sell (an upper grid wall placed at setup WITHOUT
+    a real buy) must charge the sell-side fee ONLY. Charging a round-trip fee books
+    a phantom buy-fee (buy_price·qty·KRAKEN_FEE) into total_profit that the broker
+    never mirrors (execution/paper.py:180-182 credits sell-fee only) — a one-way
+    drift that under-reports realized P&L and biases both compounding and the
+    emergency-stop. A real grid buy→sell round trip keeps its round-trip fee.
+    """
+
+    def _strategy(self):
+        from strategies.grid import GridStrategy
+        from strategies.grid_params import GridParams
+        params = GridParams.from_dict({"sl_mode": "floor", "leverage": 1.0})
+        return GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                            ml_enabled=False, params=params)
+
+    def _setup(self, strategy, price=100.0, atr=2.0):
+        from core.context import MarketContext
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state._atr = atr
+        state.with_position = True  # mirror _refresh_prediction so buys seed too
+        strategy.setup_grid("SOL/USD", price, ctx)
+        return ctx, state
+
+    def _fill(self, strategy, ctx, cid, order, side):
+        from core.strategy import Fill
+        strategy.on_fill(Fill(client_id=cid, symbol="SOL/USD", side=side,
+                              price=order["price"], qty=order["qty"], fee=0.0,
+                              ts=time.time()), ctx)
+
+    def test_preseeded_fill_charges_sell_fee_only(self, monkeypatch):
+        monkeypatch.setenv("GRIDBOT_BACKTEST", "1")  # skip dashboard/notifier
+        from strategies.grid import KRAKEN_FEE
+        strategy = self._strategy()
+        ctx, state = self._setup(strategy)
+        cid, order = next((c, o) for c, o in state.orders.items()
+                          if o["side"] == "sell" and o.get("pre_seeded"))
+        sell_price, bought_at, qty = order["price"], order["bought_at"], order["qty"]
+        assert state.total_profit == 0.0
+
+        self._fill(strategy, ctx, cid, order, "sell")
+
+        expected = (sell_price - bought_at) * qty - sell_price * qty * KRAKEN_FEE
+        assert state.total_profit == pytest.approx(expected)
+        # The old bug charged the round-trip fee, i.e. an extra phantom buy-fee.
+        roundtrip = ((sell_price - bought_at) * qty
+                     - (sell_price + bought_at) * qty * KRAKEN_FEE)
+        phantom_buy_fee = bought_at * qty * KRAKEN_FEE
+        assert state.total_profit == pytest.approx(roundtrip + phantom_buy_fee)
+        assert state.total_profit > roundtrip  # strictly better than the buggy value
+
+    def test_preseeded_total_profit_matches_broker_credit(self, monkeypatch):
+        # The whole point of #215: the strategy running-sum must move by the same
+        # amount the PaperBroker credits for the same pre-seeded fill.
+        monkeypatch.setenv("GRIDBOT_BACKTEST", "1")
+        from strategies.grid import KRAKEN_FEE
+        strategy = self._strategy()
+        ctx, state = self._setup(strategy)
+        cid, order = next((c, o) for c, o in state.orders.items()
+                          if o["side"] == "sell" and o.get("pre_seeded"))
+        sell_price, bought_at, qty = order["price"], order["bought_at"], order["qty"]
+        self._fill(strategy, ctx, cid, order, "sell")
+        # Broker's pre-seeded credit (execution/paper.py:180-182): sell-side fee only.
+        broker_credit = (sell_price - bought_at) * qty - sell_price * qty * KRAKEN_FEE
+        assert state.total_profit == pytest.approx(broker_credit)
+
+    def test_real_position_keeps_roundtrip_fee(self, monkeypatch):
+        # Guard the else-branch: a real grid buy→sell round trip must STILL be
+        # charged the round-trip fee (its buy-fee left the broker balance at
+        # buy-fill time; total_profit only moves on the sell, so it settles here).
+        monkeypatch.setenv("GRIDBOT_BACKTEST", "1")
+        from strategies.grid import KRAKEN_FEE
+        strategy = self._strategy()
+        ctx, state = self._setup(strategy)
+        bcid, border = next((c, o) for c, o in state.orders.items()
+                            if o["side"] == "buy")
+        self._fill(strategy, ctx, bcid, border, "buy")
+        state.total_profit = 0.0  # isolate the sell leg
+        scid, sorder = next((c, o) for c, o in state.orders.items()
+                            if o["side"] == "sell" and "sl_price" in o
+                            and not o.get("pre_seeded"))
+        sell_price, bought_at, qty = sorder["price"], sorder["bought_at"], sorder["qty"]
+        self._fill(strategy, ctx, scid, sorder, "sell")
+        expected = ((sell_price - bought_at) * qty
+                    - (sell_price + bought_at) * qty * KRAKEN_FEE)
+        assert state.total_profit == pytest.approx(expected)

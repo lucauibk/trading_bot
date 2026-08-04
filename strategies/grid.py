@@ -525,7 +525,20 @@ class GridStrategy(Strategy):
         lev = order.get("leverage", self._lev())
 
         profit = (sell_price - buy_price) * qty
-        fee = (sell_price + buy_price) * qty * KRAKEN_FEE
+        # #215: a pre-seeded sell (an upper grid wall placed at setup without a real
+        # buy) never paid a buy-side fee, so it must be charged the sell-side fee
+        # ONLY — exactly how the broker credits it (execution/paper.py:180-182) and
+        # how the SL path settles it (#39, grid.py). For a *real* grid position the
+        # round-trip fee is correct: the buy-fee already left the broker balance at
+        # buy-fill time, but total_profit only moves on the sell, so charging the
+        # round-trip fee here settles that buy-fee. Charging a round-trip fee on a
+        # pre-seeded fill books a phantom buy-fee (buy_price·qty·KRAKEN_FEE) that
+        # only ever debits total_profit — under-reporting realized P&L and biasing
+        # both compounding (_maybe_compound) and the emergency-stop (engine.py:185).
+        if order.get("pre_seeded"):
+            fee = sell_price * qty * KRAKEN_FEE
+        else:
+            fee = (sell_price + buy_price) * qty * KRAKEN_FEE
         net = profit - fee
         state.total_profit += net
         state.trade_count += 1
