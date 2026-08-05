@@ -272,8 +272,18 @@ class Engine:
             # one-way liquidation is intentional (see the setup_grid note above and #90,
             # parked in the Live-Parität meta #171) — so this runs on block_new_risk
             # (sells only) but not at all on is_frozen().
+            # #214: the graceful "wait_fills" wind-down (self._waiting_for_fills)
+            # promises "no new buys" but does NOT set block_new_risk (it is neither an
+            # emergency-stop nor a disable). On the activation tick process_paper_fills
+            # runs BEFORE _sync_orders cancels the now-undesired resting BUYs, so a
+            # sells_only=False fill would open a fresh long during the shutdown (and
+            # add a TP-sell that wait_fills must then also wait on). Gate sells_only on
+            # the wait_fills latch too, mirroring the block_new_risk gate (#210).
             if not self.ctx.is_frozen():
-                self.process_paper_fills(sym, price, sells_only=block_new_risk)
+                self.process_paper_fills(
+                    sym, price,
+                    sells_only=block_new_risk or self._waiting_for_fills,
+                )
 
             if not self.ctx.is_frozen() and not block_new_risk:
                 self._sync_orders(sym, price)

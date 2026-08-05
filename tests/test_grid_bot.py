@@ -2523,6 +2523,100 @@ class TestBlockedCoinStillFillsTP:
         assert [f.side for f in strat.fills] == ["sell"]
 
 
+class TestWaitFillsBlocksRestingBuyFill:
+    """#214: the graceful "wait_fills" wind-down promises "no new buys", but it does
+    NOT set block_new_risk (it is neither an emergency-stop nor a disable). On the
+    activation tick process_paper_fills runs BEFORE _sync_orders cancels the now-
+    undesired resting BUYs, so without gating sells_only on the wait_fills latch a
+    resting BUY the price crosses would fill and OPEN a fresh long during the
+    shutdown. Resting TP-sells (the exit path) must still fill.
+    """
+
+    class _Strat:
+        """Minimal strategy: records fills. During wait_fills block_new_risk is
+        False, so on_tick / desired_orders DO run — they must not raise."""
+        _broker = None
+
+        def __init__(self):
+            self.fills = []
+
+        def init(self, symbols, ctx):
+            pass
+
+        def get_state(self, sym):
+            return None
+
+        def on_tick_safety(self, sym, price, ctx):
+            pass
+
+        def on_tick(self, sym, price, ctx):
+            pass
+
+        def desired_orders(self, sym, price, ctx):
+            # wait_fills → sell-only: no new orders desired (mirrors the sell_only latch)
+            return []
+
+        def on_fill(self, fill, ctx):
+            self.fills.append(fill)
+
+    def _engine(self, monkeypatch, price):
+        from core.engine import Engine
+        from core.context import MarketContext
+        from execution.paper import PaperBroker
+        import data_fetcher
+
+        sym = "SOL/USD"
+        broker = PaperBroker(initial_balance=1000.0, symbols=[sym])
+        ctx = MarketContext()
+        strat = self._Strat()
+        eng = Engine(strat, broker, [sym], ctx=ctx)
+
+        monkeypatch.setattr(data_fetcher, "fetch_ticker", lambda s: {"last": price})
+        for m in ("_check_dashboard_stop", "_refresh_coin_settings", "_refresh_btc",
+                  "_refresh_funding", "_refresh_correlations", "_check_daily_drawdown",
+                  "_update_dashboard", "_log_equity", "_update_prediction_outcomes"):
+            monkeypatch.setattr(eng, m, lambda *a, **k: None)
+
+        eng._waiting_for_fills = True     # graceful wait_fills latch active
+        eng._loop_count = 1               # avoid recheck(%5)/rebuild(%60) cycles
+        return eng, broker, strat, sym
+
+    def test_resting_buy_does_not_fill_during_wait_fills(self, monkeypatch):
+        # price DROPS below a resting buy on the wait_fills activation tick → it must
+        # NOT fill (would open a fresh long during the wind-down). Before the fix
+        # process_paper_fills(sells_only=False) filled it.
+        eng, broker, strat, sym = self._engine(monkeypatch, price=95.0)
+        broker.place_limit(
+            symbol=sym, side="buy", price=100.0, qty=1.0, post_only=True,
+            client_id="buy1", meta={"leverage": 1.0},
+        )
+        bal_before = broker._sym_balance(sym)
+
+        eng._tick()
+
+        assert broker._orders["buy1"].status != "filled", \
+            "resting BUY must NOT fill during wait_fills wind-down"
+        assert not any(f.side == "buy" for f in strat.fills), "no buy fill callback"
+        assert broker._sym_balance(sym) == bal_before, "no margin may be deducted"
+
+    def test_resting_tp_sell_still_fills_during_wait_fills(self, monkeypatch):
+        # The exit path must stay open: a resting TP-sell the price crosses still fills,
+        # so existing positions can close and wait_fills can self-terminate.
+        eng, broker, strat, sym = self._engine(monkeypatch, price=105.0)
+        broker.place_limit(
+            symbol=sym, side="sell", price=104.0, qty=1.0, post_only=True,
+            client_id="tp1", meta={"bought_at": 100.0, "leverage": 1.0},
+        )
+        bal_before = broker._sym_balance(sym)
+
+        eng._tick()
+
+        assert broker._orders["tp1"].status == "filled", \
+            "resting TP-sell must still fill during wait_fills"
+        assert broker._sym_balance(sym) > bal_before, "TP fill must credit the balance"
+        assert [f.side for f in strat.fills] == ["sell"]
+
+
 class TestPreseededSellFeeNoPhantomBuyFee:
     """#215: filling a pre-seeded sell (an upper grid wall placed at setup WITHOUT
     a real buy) must charge the sell-side fee ONLY. Charging a round-trip fee books
