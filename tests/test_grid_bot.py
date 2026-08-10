@@ -2705,3 +2705,122 @@ class TestPreseededSellFeeNoPhantomBuyFee:
         expected = ((sell_price - bought_at) * qty
                     - (sell_price + bought_at) * qty * KRAKEN_FEE)
         assert state.total_profit == pytest.approx(expected)
+
+
+# ── Engine rebuild-orphan fill (#218) ────────────────────────────────────────
+
+class TestRebuildOrphanFill:
+    """Regression for #218: a resting broker order that the price crosses on a
+    grid-rebuild tick must be FILLED AND BOOKED before setup_grid rebuilds
+    state.orders and orphans its client_id.
+
+    Under the old ordering (setup_grid → process_paper_fills), an out_of_range
+    rebuild firing on the tick the price crosses a resting buy let the paper
+    broker move cash (deduct margin) while GridStrategy.on_fill could no longer
+    find the cid in state.orders and returned silently — margin deducted with no
+    tracked position and no return-sell (phantom long / margin leak).
+
+    The invariant checked here: after a rebuild tick, EVERY buy the broker filled
+    is represented by exactly one tracked long position (a non-pre-seeded sell
+    carrying bought_at) in state.orders. A leaked fill breaks this equality.
+    """
+
+    def _dummy_df(self, n=60):
+        close = pd.Series(np.linspace(100, 100, n))
+        return pd.DataFrame({
+            "open": close, "high": close * 1.001,
+            "low": close * 0.999, "close": close,
+            "volume": np.full(n, 1000.0),
+        })
+
+    def _build(self, monkeypatch, tick_price):
+        import data_fetcher
+        import core.engine as eng_mod
+        from core.engine import Engine
+        from strategies.grid import GridStrategy
+        from execution.paper import PaperBroker
+
+        strat = GridStrategy(
+            [{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+            ml_enabled=False,
+        )
+        broker = PaperBroker(initial_balance=1000.0, symbols=["SOL/USD"])
+        eng = Engine(strat, broker, ["SOL/USD"])
+
+        # No network, no dashboard/DB side effects, no real sleeps.
+        monkeypatch.setattr(data_fetcher, "fetch_ticker",
+                            lambda s: {"last": tick_price})
+        monkeypatch.setattr(data_fetcher, "fetch_ohlcv",
+                            lambda s, tf, n: self._dummy_df())
+        monkeypatch.setattr(eng_mod.time, "sleep", lambda *a, **k: None)
+        for m in ("_check_dashboard_stop", "_refresh_coin_settings",
+                  "_check_daily_drawdown", "_update_dashboard", "_log_equity",
+                  "_update_prediction_outcomes"):
+            monkeypatch.setattr(eng, m, lambda *a, **k: None)
+
+        # Build the grid at 100 and place the resting orders in the broker,
+        # exactly as run()'s first pass + _sync_orders would.
+        strat.init(["SOL/USD"], eng.ctx)
+        state = strat.get_state("SOL/USD")
+        state.with_position = True  # allow buy seeding (mirrors _refresh_prediction)
+        strat.setup_grid("SOL/USD", 100.0, eng.ctx)
+        eng._sync_orders("SOL/USD", 100.0)
+        return eng, strat, broker, state
+
+    def test_rebuild_tick_books_orphan_fills_no_margin_leak(self, monkeypatch):
+        sym = "SOL/USD"
+        # A dip below the grid bottom → out_of_range rebuild fires this tick and
+        # the price crosses the resting buys.
+        eng, strat, broker, state = self._build(monkeypatch, tick_price=90.0)
+
+        resting_buys = [o for o in broker._orders.values()
+                        if o.symbol == sym and o.side == "buy" and o.status == "open"]
+        assert resting_buys, "precondition: broker holds resting buy orders"
+        low = min(o.price for o in resting_buys)
+        assert 90.0 < low, "tick price must cross at least one resting buy"
+
+        # loop_count=41 → out_of_range rebuild is allowed (41 - 0 >= 40) while
+        # avoiding the scheduled-rebuild / BTC / funding / on_candle cadences.
+        eng._loop_count = 41
+        eng._tick()
+
+        filled_buys = [o for o in broker._orders.values()
+                       if o.symbol == sym and o.side == "buy" and o.status == "filled"]
+        positions = [o for o in state.orders.values()
+                     if o.get("side") == "sell" and "bought_at" in o
+                     and not o.get("pre_seeded")]
+
+        assert filled_buys, "the dip must have filled at least one resting buy"
+        # The core invariant: no filled buy was silently dropped by on_fill.
+        assert len(positions) == len(filled_buys), (
+            f"margin leak: {len(filled_buys)} buys filled but only "
+            f"{len(positions)} positions tracked (orphaned fills)"
+        )
+
+    def test_process_paper_fills_runs_before_setup_grid(self, monkeypatch):
+        # Directly pin the ordering the fix depends on: within a rebuild tick,
+        # process_paper_fills must be invoked before setup_grid.
+        eng, strat, broker, state = self._build(monkeypatch, tick_price=90.0)
+        calls = []
+        real_fills = eng.process_paper_fills
+        real_setup = strat.setup_grid
+
+        def spy_fills(*a, **k):
+            calls.append("fills")
+            return real_fills(*a, **k)
+
+        def spy_setup(*a, **k):
+            calls.append("setup")
+            return real_setup(*a, **k)
+
+        monkeypatch.setattr(eng, "process_paper_fills", spy_fills)
+        monkeypatch.setattr(strat, "setup_grid", spy_setup)
+
+        eng._loop_count = 41
+        eng._tick()
+
+        assert "fills" in calls and "setup" in calls
+        assert calls.index("fills") < calls.index("setup"), (
+            "process_paper_fills must run before setup_grid so a rebuild cannot "
+            "orphan a fillable resting order (#218)"
+        )
