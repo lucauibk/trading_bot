@@ -226,26 +226,24 @@ class Engine:
             # For live mode: reconcile fills from exchange (paper has no reconciler)
             self._reconcile_fills()
 
-            # Scheduled rebuild (every 60 ticks) always fires.  out_of_range
-            # rebuilds are rate-limited to once per 20 ticks (~5 min) so that
-            # price hovering near the grid edge does not cause a rebuild storm.
-            rebuild_allowed = do_rebuild or (
-                out_of_range and
-                self._loop_count - self._last_rebuild.get(sym, 0) >= 40
-            )
-            if rebuild_allowed and hasattr(self.strategy, "setup_grid"):
-                # Note: setup_grid runs even during a daily-drawdown freeze because
-                # price can escape the grid while frozen.  setup_grid gates buy-seeding
-                # internally via _buys_allowed (inventory cap + trend filter).  Even if
-                # setup_grid seeds new buys, they won't be submitted to the broker while
-                # frozen because _sync_orders is blocked below (if not is_frozen()).
-                # on_tick_safety still fires SLs during freeze — intentional one-way
-                # liquidation.  The real prevention against cascade losses is the
-                # inventory cap (max_inventory_notional_mult) which stops accumulation
-                # before a cascade can form, regardless of freeze state.
-                self.strategy.setup_grid(sym, price, self.ctx)
-                self._last_rebuild[sym] = self._loop_count
-
+            # #218: fill existing paper orders BEFORE the grid rebuild below.
+            # A rebuild (setup_grid) rebuilds state.orders and DROPS the client_ids of
+            # every resting buy / pre-seeded sell that is not carried over as an open
+            # position (grid.py: `state.orders = dict(open_positions)`) — but those
+            # orders still LIVE in the broker until _sync_orders cancels them further
+            # down. If process_paper_fills ran AFTER setup_grid (the old order), an
+            # out_of_range rebuild firing on the very tick the price crosses one of
+            # those now-orphaned resting orders would let the broker fill it and move
+            # cash, while GridStrategy.on_fill can no longer find the cid in
+            # state.orders and returns silently — margin deducted with no position and
+            # no return-sell (phantom long / margin leak that feeds the deposit-anchored
+            # drawdown brake #132), or a pre-seeded sell's profit credited without
+            # bumping total_profit. Filling FIRST means every resting order settles
+            # against the still-consistent old state.orders (correct booking + TP-sell),
+            # and the rebuild then preserves the resulting real positions via
+            # open_positions. process_paper_fills must still run BEFORE _sync_orders so
+            # the #214 wait_fills / #210 block-new-risk gating below is unchanged.
+            #
             # #210: fill existing paper orders against the price EVEN WHEN new risk is
             # blocked (emergency-stop #34 / dashboard-disabled #184).
             # process_paper_fills() is the ONLY paper path that fills resting limit
@@ -269,7 +267,7 @@ class Engine:
             # cancellation stays gated in _sync_orders below.
             #
             # The daily-drawdown freeze is deliberately EXCLUDED entirely: its only-SL,
-            # one-way liquidation is intentional (see the setup_grid note above and #90,
+            # one-way liquidation is intentional (see the setup_grid note below and #90,
             # parked in the Live-Parität meta #171) — so this runs on block_new_risk
             # (sells only) but not at all on is_frozen().
             # #214: the graceful "wait_fills" wind-down (self._waiting_for_fills)
@@ -284,6 +282,26 @@ class Engine:
                     sym, price,
                     sells_only=block_new_risk or self._waiting_for_fills,
                 )
+
+            # Scheduled rebuild (every 60 ticks) always fires.  out_of_range
+            # rebuilds are rate-limited to once per 20 ticks (~5 min) so that
+            # price hovering near the grid edge does not cause a rebuild storm.
+            rebuild_allowed = do_rebuild or (
+                out_of_range and
+                self._loop_count - self._last_rebuild.get(sym, 0) >= 40
+            )
+            if rebuild_allowed and hasattr(self.strategy, "setup_grid"):
+                # Note: setup_grid runs even during a daily-drawdown freeze because
+                # price can escape the grid while frozen.  setup_grid gates buy-seeding
+                # internally via _buys_allowed (inventory cap + trend filter).  Even if
+                # setup_grid seeds new buys, they won't be submitted to the broker while
+                # frozen because _sync_orders is blocked below (if not is_frozen()).
+                # on_tick_safety still fires SLs during freeze — intentional one-way
+                # liquidation.  The real prevention against cascade losses is the
+                # inventory cap (max_inventory_notional_mult) which stops accumulation
+                # before a cascade can form, regardless of freeze state.
+                self.strategy.setup_grid(sym, price, self.ctx)
+                self._last_rebuild[sym] = self._loop_count
 
             if not self.ctx.is_frozen() and not block_new_risk:
                 self._sync_orders(sym, price)

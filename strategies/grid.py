@@ -413,6 +413,19 @@ class GridStrategy(Strategy):
         cid = fill.client_id
         order = state.orders.get(cid)
         if not order:
+            # #218 defense-in-depth: a fill for a client_id no longer in state.orders
+            # means the broker moved cash for an order the strategy already dropped
+            # (e.g. a resting order orphaned by a grid rebuild before it was cancelled).
+            # The engine now runs process_paper_fills BEFORE setup_grid so a rebuild can
+            # no longer orphan a fillable order in the paper path — this branch should
+            # therefore be unreachable in normal operation. But swallowing it silently
+            # would hide a margin leak / phantom long, so log loudly instead of quietly
+            # draining capital, making any regression (or unforeseen path) visible.
+            logger.warning(
+                "on_fill: orphaned %s fill for unknown cid %s on %s @ %.4f (qty=%.6f) "
+                "— broker already moved cash but no matching order is tracked",
+                fill.side, str(cid)[:8], fill.symbol, fill.price, fill.qty,
+            )
             return
 
         order["filled"] = True
