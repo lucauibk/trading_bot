@@ -310,9 +310,16 @@ def api_capital_set():
         return jsonify({"ok": False, "msg": "Ungültiger Wert"}), 400
     if val < 10:
         return jsonify({"ok": False, "msg": "Minimum 10 USDT"})
-    set_initial_capital(val)
-    return jsonify({"ok": True, "initial_capital": val,
-                    "msg": f"Startkapital auf {val:.0f} USDT gesetzt (wirkt beim nächsten Bot-Start)"})
+    reset = set_initial_capital(val)
+    # #220: a real capital change clears the persisted paper_balances so the next
+    # start reseeds fresh buckets and the deposit-anchored drawdown baseline
+    # matches actual cash again — tell the user the paper account starts fresh.
+    if reset:
+        msg = (f"Startkapital auf {val:.0f} USDT gesetzt — Paper-Konto wird beim "
+               f"nächsten Bot-Start mit diesem Betrag frisch aufgesetzt (#220).")
+    else:
+        msg = f"Startkapital unverändert bei {val:.0f} USDT (Paper-Balances erhalten)."
+    return jsonify({"ok": True, "initial_capital": val, "reset": reset, "msg": msg})
 
 
 @app.route("/api/coin-settings", methods=["GET"])
