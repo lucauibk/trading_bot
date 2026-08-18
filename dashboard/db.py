@@ -489,12 +489,42 @@ def get_initial_capital() -> float:
     return float(row["initial_capital"]) if row and row["initial_capital"] else 1000.0
 
 
-def set_initial_capital(value: float):
+def set_initial_capital(value: float) -> bool:
+    """Startkapital für den nächsten Bot-Start (Paper-Modus) setzen.
+
+    #220: `initial_capital` steuert im Paper-Modus ZWEI Dinge — das Per-Coin-
+    Bucket-Sizing beim Seeden frischer Buckets (`main.py`) UND die an die
+    Ersteinzahlung verankerte Drawdown-Baseline (`core/engine.py`:
+    baseline = initial_capital). Die persistierten `paper_balances` werden beim
+    Start aber ÜBER die frischen Buckets geladen. Ändert der User das Kapital,
+    ohne die Balances zu löschen, driftet die Baseline (neues Kapital) vom
+    tatsächlichen Cash (alte Balances) auseinander → sofortiger, praktisch
+    permanenter Drawdown-FREEZE bzw. `insufficient balance` beim Buy.
+
+    Deshalb: bei einer ECHTEN Kapital-Änderung die persistierten
+    `paper_balances` auf NULL setzen — der nächste Start seedet dann frische
+    Buckets == neues Kapital und die Baseline stimmt wieder mit dem Cash überein.
+    Bei unverändertem Wert (User speichert denselben Betrag erneut) bleiben die
+    Balances erhalten, damit akkumulierte Paper-Equity nicht versehentlich
+    zurückgesetzt wird.
+
+    Returns True, wenn `paper_balances` gelöscht wurden (Kapital-Änderung).
+    """
     value = max(10.0, float(value))
     con = get_conn()
-    con.execute("UPDATE bot_status SET initial_capital=? WHERE id=1", (value,))
+    row = con.execute("SELECT initial_capital FROM bot_status WHERE id=1").fetchone()
+    current = float(row["initial_capital"]) if row and row["initial_capital"] else None
+    changed = current is None or abs(current - value) > 1e-9
+    if changed:
+        con.execute(
+            "UPDATE bot_status SET initial_capital=?, paper_balances=NULL WHERE id=1",
+            (value,),
+        )
+    else:
+        con.execute("UPDATE bot_status SET initial_capital=? WHERE id=1", (value,))
     con.commit()
     con.close()
+    return changed
 
 
 def update_capital(capital: float):

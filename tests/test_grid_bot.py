@@ -2320,6 +2320,57 @@ class TestGetConnPragmas:
             con.close()
 
 
+class TestCapitalChangeClearsPaperBalances:
+    """#220: changing initial_capital in paper mode must clear the persisted
+    paper_balances, otherwise the deposit-anchored drawdown baseline (= new
+    capital) drifts from the restored old cash → instant, effectively permanent
+    drawdown FREEZE (and grids sized for the new, larger capital get rejected
+    with 'insufficient balance'). An UNCHANGED value must keep the balances so
+    accumulated paper equity is not wiped by a no-op save."""
+
+    def _db(self, tmp_path, monkeypatch):
+        import dashboard.db as ddb
+        monkeypatch.setattr(ddb, "DB_PATH", tmp_path / "trades.db")
+        return ddb
+
+    def test_capital_change_clears_persisted_balances(self, tmp_path, monkeypatch):
+        ddb = self._db(tmp_path, monkeypatch)
+        ddb.set_initial_capital(1000.0)
+        ddb.save_paper_balances({"SOL/USD": 180.0, "ETH/USD": 175.0})
+        assert ddb.load_paper_balances() is not None
+
+        changed = ddb.set_initial_capital(2000.0)   # simulate "deposit" 1000 -> 2000
+        assert changed is True
+        # the stale buckets must be gone so the next start reseeds fresh == 2000
+        assert ddb.load_paper_balances() is None
+        assert ddb.get_initial_capital() == 2000.0
+
+    def test_unchanged_capital_keeps_balances(self, tmp_path, monkeypatch):
+        ddb = self._db(tmp_path, monkeypatch)
+        ddb.set_initial_capital(1000.0)
+        ddb.save_paper_balances({"SOL/USD": 180.0, "ETH/USD": 175.0})
+
+        changed = ddb.set_initial_capital(1000.0)   # re-saving the same value
+        assert changed is False
+        # accumulated paper equity must survive a no-op save
+        assert ddb.load_paper_balances() == {"SOL/USD": 180.0, "ETH/USD": 175.0}
+
+    def test_endpoint_reports_reset_flag(self, tmp_path, monkeypatch):
+        self._db(tmp_path, monkeypatch)
+        import dashboard.app as dapp
+        dapp.app.config["TESTING"] = True
+        client = dapp.app.test_client()
+
+        client.post("/api/capital", json={"initial_capital": 1000})
+        # a genuine change → reset True (paper account starts fresh next start)
+        resp = client.post("/api/capital", json={"initial_capital": 2500})
+        data = resp.get_json()
+        assert data["ok"] is True and data["reset"] is True
+        # re-saving the same value → no reset
+        resp2 = client.post("/api/capital", json={"initial_capital": 2500})
+        assert resp2.get_json()["reset"] is False
+
+
 class TestApiStartPidAware:
     """#162: /api/bot/start must gate on _is_running() (PID-file aware), not only
     on the in-process _bot_process handle. A bot started externally via
