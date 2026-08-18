@@ -1152,7 +1152,7 @@ class TestEmergencyStopSL:
         from execution.paper import PaperBroker
         from core.context import MarketContext
 
-        calls = {"safety": 0, "on_tick": 0, "sync": 0}
+        calls = {"safety": 0, "on_tick": 0, "sync": 0, "place_new": None}
         state = types.SimpleNamespace(total_profit=total_profit,
                                       investment=100.0, grid_lines=[])
 
@@ -1173,8 +1173,12 @@ class TestEmergencyStopSL:
             monkeypatch.setattr(eng, name, lambda *a, **k: None)
         monkeypatch.setattr(eng, "_update_dashboard", lambda s, p: None)
         monkeypatch.setattr(eng, "_update_prediction_outcomes", lambda f: None)
-        monkeypatch.setattr(eng, "_sync_orders",
-                            lambda s, p: calls.__setitem__("sync", calls["sync"] + 1))
+        # #222: _sync_orders now runs even for a blocked coin (cancel half); the
+        # place_new flag records whether NEW risk was allowed on this call.
+        def _spy_sync(s, p, place_new=True):
+            calls["sync"] += 1
+            calls["place_new"] = place_new
+        monkeypatch.setattr(eng, "_sync_orders", _spy_sync)
 
         import data_fetcher
         monkeypatch.setattr(data_fetcher, "fetch_ticker", lambda s: {"last": 100.0})
@@ -1188,14 +1192,17 @@ class TestEmergencyStopSL:
 
     def test_healthy_symbol_trades_normally(self, monkeypatch):
         calls = self._run_one_tick(monkeypatch, total_profit=0.0)
-        assert calls == {"safety": 1, "on_tick": 1, "sync": 1}
+        assert (calls["safety"], calls["on_tick"], calls["sync"]) == (1, 1, 1)
+        assert calls["place_new"] is True  # healthy coin may open new risk
 
     def test_emergency_stopped_keeps_sl_blocks_orders(self, monkeypatch):
         # -12% of investment 100 = -12 → total_profit -20 trips the emergency stop.
         calls = self._run_one_tick(monkeypatch, total_profit=-20.0)
-        assert calls["safety"] == 1   # SL/TP still runs (was 0 before the fix)
-        assert calls["on_tick"] == 0  # no new buys
-        assert calls["sync"] == 0     # no new orders submitted
+        assert calls["safety"] == 1        # SL/TP still runs (was 0 before the fix)
+        assert calls["on_tick"] == 0       # no new buys
+        # #222: _sync_orders' CANCEL half runs (so stale walls are retracted) …
+        assert calls["sync"] == 1
+        assert calls["place_new"] is False  # … but the PLACE half opens no new risk
 
 
 class TestCoinSettingsLiveToggle:
@@ -1210,7 +1217,7 @@ class TestCoinSettingsLiveToggle:
         from execution.paper import PaperBroker
         from core.context import MarketContext
 
-        calls = {"safety": 0, "on_tick": 0, "sync": 0}
+        calls = {"safety": 0, "on_tick": 0, "sync": 0, "place_new": None}
         state = types.SimpleNamespace(total_profit=0.0,
                                       investment=100.0, grid_lines=[])
 
@@ -1230,8 +1237,12 @@ class TestCoinSettingsLiveToggle:
             monkeypatch.setattr(eng, name, lambda *a, **k: None)
         monkeypatch.setattr(eng, "_update_dashboard", lambda s, p: None)
         monkeypatch.setattr(eng, "_update_prediction_outcomes", lambda f: None)
-        monkeypatch.setattr(eng, "_sync_orders",
-                            lambda s, p: calls.__setitem__("sync", calls["sync"] + 1))
+        # #222: a disabled coin still runs _sync_orders' CANCEL half; place_new
+        # records whether the PLACE (new-risk) half was allowed.
+        def _spy_sync(s, p, place_new=True):
+            calls["sync"] += 1
+            calls["place_new"] = place_new
+        monkeypatch.setattr(eng, "_sync_orders", _spy_sync)
 
         # Drive _refresh_coin_settings via the real DB helper (monkeypatched).
         import dashboard.db as ddb
@@ -1253,14 +1264,17 @@ class TestCoinSettingsLiveToggle:
 
     def test_enabled_coin_trades_normally(self, monkeypatch):
         calls, eng = self._run_one_tick(monkeypatch, enabled=True)
-        assert calls == {"safety": 1, "on_tick": 1, "sync": 1}
+        assert (calls["safety"], calls["on_tick"], calls["sync"]) == (1, 1, 1)
+        assert calls["place_new"] is True  # enabled coin may open new risk
         assert eng._disabled_coins == set()
 
     def test_disabled_coin_keeps_sl_blocks_orders(self, monkeypatch):
         calls, eng = self._run_one_tick(monkeypatch, enabled=False)
-        assert calls["safety"] == 1   # SL/TP still protects open positions
-        assert calls["on_tick"] == 0  # no new buys
-        assert calls["sync"] == 0     # no new orders submitted
+        assert calls["safety"] == 1        # SL/TP still protects open positions
+        assert calls["on_tick"] == 0       # no new buys
+        # #222: CANCEL half runs (retracts stale walls) but no new risk is placed.
+        assert calls["sync"] == 1
+        assert calls["place_new"] is False
         assert eng._disabled_coins == {"SOL/USD"}
 
     def test_refresh_is_paper_only(self, monkeypatch):
@@ -2440,7 +2454,12 @@ class TestBlockedCoinStillFillsTP:
 
         def __init__(self):
             self.fills = []
-            self.allow_new_risk = True
+            # on_tick (new-risk decisions) is skipped for blocked AND frozen coins.
+            self.allow_on_tick = True
+            # #222: _sync_orders' CANCEL half now runs for a BLOCKED coin (only the
+            # PLACE half is skipped), so desired_orders may be queried while blocked.
+            # During a daily-drawdown FREEZE _sync_orders is still fully gated.
+            self.allow_sync = True
 
         def init(self, symbols, ctx):
             pass
@@ -2452,12 +2471,12 @@ class TestBlockedCoinStillFillsTP:
             pass
 
         def on_tick(self, sym, price, ctx):
-            if not self.allow_new_risk:
+            if not self.allow_on_tick:
                 raise AssertionError("on_tick must not run for a blocked/frozen coin")
 
         def desired_orders(self, sym, price, ctx):
-            if not self.allow_new_risk:
-                raise AssertionError("_sync_orders must not run for a blocked/frozen coin")
+            if not self.allow_sync:
+                raise AssertionError("_sync_orders must not run for a FROZEN coin")
             return []
 
         def on_fill(self, fill, ctx):
@@ -2474,7 +2493,8 @@ class TestBlockedCoinStillFillsTP:
         ctx = MarketContext()
         ctx.set_freeze(frozen)
         strat = self._Strat()
-        strat.allow_new_risk = not (disabled or frozen)
+        strat.allow_on_tick = not (disabled or frozen)
+        strat.allow_sync = not frozen  # #222: blocked coins run the cancel half
         eng = Engine(strat, broker, [sym], ctx=ctx)
 
         # Neutralise all heavy I/O so a single _tick() runs in isolation.
@@ -2572,6 +2592,93 @@ class TestBlockedCoinStillFillsTP:
         assert broker._orders["tp1"].status == "filled", "TP-sell must still fill"
         assert broker._orders["buy1"].status == "open", "resting buy must be skipped"
         assert [f.side for f in strat.fills] == ["sell"]
+
+
+class TestBlockedCoinCancelsStaleWalls:
+    """#222: a blocked coin (emergency-stop #34 / dashboard-disabled #184) must still
+    CANCEL stale broker orders that a grid rebuild has dropped — pre-seeded sell walls
+    are regenerated with fresh client_ids every rebuild, so the old walls become
+    orphaned relative to state.orders.  Previously _sync_orders was fully gated on the
+    block path, so the CANCEL half never ran: the old walls lingered `open` on the
+    broker and process_paper_fills filled them a tick later → on_fill orphan branch →
+    a phantom profit-only credit inflated equity while state.total_profit stayed put,
+    plus a never-terminal order leak.  The fix decouples the halves: CANCEL always
+    runs, PLACE (new risk) stays gated.  Real filled-buy TP-sells keep their cid across
+    rebuild, so they remain in `desired` and are NOT cancelled."""
+
+    class _Strat:
+        def __init__(self, desired):
+            self._desired = desired
+
+        def desired_orders(self, sym, price, ctx):
+            return list(self._desired)
+
+    def _engine(self, desired):
+        from core.engine import Engine
+        from core.context import MarketContext
+        from execution.paper import PaperBroker
+        sym = "SOL/USD"
+        broker = PaperBroker(initial_balance=1000.0, symbols=[sym])
+        eng = Engine(self._Strat(desired), broker, [sym], ctx=MarketContext())
+        return eng, broker, sym
+
+    def _fresh_wall(self, sym):
+        from core.strategy import Order
+        # a post-rebuild pre-seeded wall carrying a NEW client_id
+        return Order(symbol=sym, side="sell", price=104.0, qty=1.0,
+                     client_id="fresh", post_only=True, meta={})
+
+    def test_blocked_coin_cancels_stale_wall_without_placing_new(self):
+        sym = "SOL/USD"
+        eng, broker, sym = self._engine([self._fresh_wall(sym)])
+        # a STALE wall the rebuild dropped: tracked as active AND resting on the broker
+        stale = broker.place_limit(symbol=sym, side="sell", price=103.0, qty=1.0,
+                                   post_only=True, client_id="stale", meta={})
+        eng._active_orders[sym] = {"stale": stale}
+
+        eng._sync_orders(sym, 100.0, place_new=False)   # blocked coin path
+
+        # the stale wall is retracted → it can no longer orphan-fill a tick later
+        assert broker._orders["stale"].status == "cancelled"
+        assert "stale" not in eng._active_orders[sym]
+        # PLACE half is skipped → no new risk opened for the blocked coin
+        assert "fresh" not in broker._orders
+        assert "fresh" not in eng._active_orders[sym]
+
+    def test_unblocked_coin_places_fresh_wall(self):
+        # sanity: with place_new=True (normal coin) the fresh wall IS placed and the
+        # stale one still cancelled — proves place_new is the only gated half.
+        sym = "SOL/USD"
+        eng, broker, sym = self._engine([self._fresh_wall(sym)])
+        stale = broker.place_limit(symbol=sym, side="sell", price=103.0, qty=1.0,
+                                   post_only=True, client_id="stale", meta={})
+        eng._active_orders[sym] = {"stale": stale}
+
+        eng._sync_orders(sym, 100.0, place_new=True)
+
+        assert broker._orders["stale"].status == "cancelled"
+        assert broker._orders["fresh"].status == "open"
+        assert "fresh" in eng._active_orders[sym]
+
+    def test_real_tp_sell_survives_block_path_cancel(self):
+        # A real filled-buy TP-sell keeps its cid across rebuild, so it stays in
+        # `desired` and must NOT be cancelled on the block path — only stale walls go.
+        from core.strategy import Order
+        sym = "SOL/USD"
+        keep = Order(symbol=sym, side="sell", price=104.0, qty=1.0,
+                     client_id="tp_real", post_only=True, meta={"bought_at": 100.0})
+        eng, broker, sym = self._engine([keep])
+        tp = broker.place_limit(symbol=sym, side="sell", price=104.0, qty=1.0,
+                                post_only=True, client_id="tp_real", meta={})
+        stale = broker.place_limit(symbol=sym, side="sell", price=103.0, qty=1.0,
+                                   post_only=True, client_id="stale", meta={})
+        eng._active_orders[sym] = {"tp_real": tp, "stale": stale}
+
+        eng._sync_orders(sym, 100.0, place_new=False)
+
+        assert broker._orders["tp_real"].status == "open", "real TP-sell must survive"
+        assert "tp_real" in eng._active_orders[sym]
+        assert broker._orders["stale"].status == "cancelled", "stale wall must go"
 
 
 class TestWaitFillsBlocksRestingBuyFill:

@@ -303,8 +303,21 @@ class Engine:
                 self.strategy.setup_grid(sym, price, self.ctx)
                 self._last_rebuild[sym] = self._loop_count
 
-            if not self.ctx.is_frozen() and not block_new_risk:
-                self._sync_orders(sym, price)
+            if not self.ctx.is_frozen():
+                # #222: the CANCEL half of _sync_orders must run even for a blocked
+                # coin (emergency-stop / dashboard-disabled).  Otherwise, after a
+                # grid rebuild regenerates the pre-seeded sell walls with fresh
+                # client_ids, the OLD walls linger un-cancelled on the broker; the
+                # unconditional process_paper_fills (above) then fills them a tick
+                # later and on_fill hits the orphan branch — booking a phantom
+                # profit-only credit into the cash bucket while state.total_profit
+                # stays put, and leaking the order as permanently `open`.  Real
+                # filled-buy TP-sells keep their cid across rebuild (grid.py) and so
+                # stay in `desired` → they are NOT cancelled.  Only the PLACE half
+                # (new risk) stays gated on the block state.  Freeze needs no cancel:
+                # process_paper_fills is gated off during freeze, so no orphan fills
+                # occur there.
+                self._sync_orders(sym, price, place_new=not block_new_risk)
 
             self._update_dashboard(sym, price)
 
@@ -401,10 +414,13 @@ class Engine:
                 if fill.client_id in self._active_orders.get(symbol, {}):
                     del self._active_orders[symbol][fill.client_id]
 
-    def _sync_orders(self, symbol: str, price: float):
+    def _sync_orders(self, symbol: str, price: float, place_new: bool = True):
         # #210: paper fills are now processed unconditionally in _tick (before this
         # gate) so resting TP-sells still fill for emergency-stopped / disabled coins.
         # _sync_orders is the new-order path only: place desired, cancel undesired.
+        # #222: the CANCEL half runs unconditionally; the PLACE half is skipped when
+        # place_new is False (blocked coin) so a blocked coin retracts its stale
+        # pre-seeded walls without opening any new risk.
         desired = {o.client_id: o for o in self.strategy.desired_orders(symbol, price, self.ctx)
                    if o.client_id}
         active = self._active_orders.get(symbol, {})
@@ -417,6 +433,10 @@ class Engine:
                 # orders don't leak the table forever (#134).
                 if self.reconciler:
                     self.reconciler.remove_order(cid)
+
+        if not place_new:
+            self._active_orders[symbol] = active
+            return
 
         for cid, order in desired.items():
             if cid not in active:
