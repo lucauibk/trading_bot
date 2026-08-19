@@ -200,17 +200,26 @@ BTC/Funding-Refresh, erstes `on_candle + setup_grid` pro Coin. Dann Event-Loop (
 ### `Engine._tick()`
 Kern-Iteration (→ Flow A).
 **Invariante:** `on_tick_safety()` wird **immer** aufgerufen (auch bei freeze) — Stop-Losses
-laufen auch während DD-Freeze. `setup_grid()` läuft auch bei freeze, aber `_sync_orders()` nicht
-(neue Orders werden nicht platziert). Emergency-Stop pro Coin: `total_profit ≤ −12% × investment`
-→ Symbol-Loop `continue` (kein Order-Management mehr für diesen Coin in diesem Tick).
+laufen auch während DD-Freeze. `setup_grid()` läuft auch bei freeze, aber `_sync_orders()` bei
+freeze **gar nicht** (weder cancel noch place). Emergency-Stop pro Coin: `total_profit ≤ −12% ×
+investment` → `block_new_risk`: keine neuen Buys (kein `on_tick`), Place-Hälfte von `_sync_orders`
+aus — aber `process_paper_fills` (Sells) und die **Cancel-Hälfte** von `_sync_orders` laufen
+weiter (#210/#222).
 
-### `Engine._sync_orders(symbol, price)`
+### `Engine._sync_orders(symbol, price, place_new=True)`
 1. `process_paper_fills()` — PaperBroker: `update_price()` → Fills → `strategy.on_fill()`.
 2. `desired_orders()` vom Strategy → Set der gewünschten Client-IDs.
 3. Aktive Orders die nicht mehr im desired-Set → `broker.cancel()`.
 4. Gewünschte Orders die noch nicht aktiv → `broker.place_limit()`.
 **Invariante:** Cancel-before-place — verhindert Doppelorders. Bei live: Reconciler trackt
 Exchange-IDs.
+**#222:** Für einen **geblockten** Coin (Emergency-Stop #34 / Disabled #184) läuft die
+**Cancel-Hälfte trotzdem** (`place_new=False`), damit die bei jedem Grid-Rebuild mit neuer
+Client-ID regenerierten pre-seeded Sell-Wände nicht als verwaiste Alt-Orders auf dem Broker
+liegen bleiben (sonst füllt `process_paper_fills` sie einen Tick später → Orphan-Zweig in
+`on_fill` → Phantom-Profit-Gutschrift + Order-Leak). Nur die **Place-Hälfte** (neues Risiko)
+ist geblockt. Echte gefüllte-Buy-TP-Sells behalten ihre cid über den Rebuild → bleiben im
+desired-Set → werden **nicht** gecancelt.
 
 ### `Engine._check_daily_drawdown()`
 Baseline = `_initial_capital` (aus Config/Dashboard), nicht Mid-Session-Equity.
