@@ -2982,3 +2982,58 @@ class TestRebuildOrphanFill:
             "process_paper_fills must run before setup_grid so a rebuild cannot "
             "orphan a fillable resting order (#218)"
         )
+
+
+# ── Dashboard /api/capital running-guard (#224) ────────────────────────────────
+
+class TestCapitalRunningGuard:
+    """A capital change while the bot RUNS must be rejected, because the running
+    engine re-persists its unchanged paper_balances every tick and on shutdown,
+    which would clobber the paper_balances=NULL that #220 relies on (#224)."""
+
+    def _client(self):
+        from dashboard import app as dash_app
+        dash_app.app.config["TESTING"] = True
+        return dash_app, dash_app.app.test_client()
+
+    def test_capital_change_rejected_while_running(self, monkeypatch):
+        dash_app, client = self._client()
+        monkeypatch.setattr(dash_app, "_is_running", lambda: True)
+
+        called = {"set": False}
+
+        def _spy_set(value):
+            called["set"] = True
+            return True
+
+        # Endpoint imports set_initial_capital from dashboard.db lazily.
+        import dashboard.db as db
+        monkeypatch.setattr(db, "set_initial_capital", _spy_set)
+
+        resp = client.post("/api/capital", json={"initial_capital": 2000})
+        assert resp.status_code == 409
+        body = resp.get_json()
+        assert body["ok"] is False
+        assert not called["set"], (
+            "set_initial_capital() must NOT run while the bot is live — otherwise "
+            "the engine re-persists over the paper_balances=NULL reset (#224)"
+        )
+
+    def test_capital_change_allowed_while_stopped(self, monkeypatch):
+        dash_app, client = self._client()
+        monkeypatch.setattr(dash_app, "_is_running", lambda: False)
+
+        called = {"value": None}
+
+        def _spy_set(value):
+            called["value"] = value
+            return True
+
+        import dashboard.db as db
+        monkeypatch.setattr(db, "set_initial_capital", _spy_set)
+
+        resp = client.post("/api/capital", json={"initial_capital": 2000})
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body["ok"] is True
+        assert called["value"] == 2000.0

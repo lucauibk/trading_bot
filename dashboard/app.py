@@ -310,6 +310,21 @@ def api_capital_set():
         return jsonify({"ok": False, "msg": "Ungültiger Wert"}), 400
     if val < 10:
         return jsonify({"ok": False, "msg": "Minimum 10 USDT"})
+    # #224: set_initial_capital() clears paper_balances=NULL on a real change so the
+    # next start reseeds fresh buckets (#220). But a RUNNING engine re-persists its
+    # unchanged in-memory buckets every tick (_log_equity) and on shutdown
+    # (_cleanup) — clobbering the NULL before the next start can read it, so the
+    # #220 fix is silently undone and the deposit-anchored drawdown FREEZE returns.
+    # The engine also only reads initial_capital at start, so it never reseeds live.
+    # Reject the change while the bot runs instead of promising a reset that can't
+    # happen: the user must stop the bot first.
+    if _is_running():
+        return jsonify({
+            "ok": False,
+            "msg": ("Bot läuft — Startkapital erst nach dem Stoppen ändern. Ein "
+                    "laufender Bot überschreibt das Paper-Konto sonst weiter mit "
+                    "dem alten Guthaben (#224)."),
+        }), 409
     reset = set_initial_capital(val)
     # #220: a real capital change clears the persisted paper_balances so the next
     # start reseeds fresh buckets and the deposit-anchored drawdown baseline
