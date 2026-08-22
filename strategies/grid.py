@@ -650,9 +650,12 @@ class GridStrategy(Strategy):
         else:
             self._check_position_stops(symbol, price, state, ctx)
             self._check_directional(symbol, price, state, ctx)
+            # #227: trailing-stop ratchet moved into the safety-guarded block. In the
+            # normal engine flow on_tick_safety already ran it this tick; only re-run
+            # it here when on_tick is invoked standalone (e.g. unit tests).
+            self._update_trailing_stops(symbol, price, state)
         self._maybe_open_directional(symbol, price, state, ctx)
         self._check_mtf_entry(symbol, price, state, ctx)
-        self._update_trailing_stops(symbol, price, state)
 
         return []
 
@@ -666,8 +669,16 @@ class GridStrategy(Strategy):
             # the market dumps. _check_directional only ever *closes* a position, never
             # opens one, so it is safe on the freeze path (#104).
             self._check_directional(symbol, price, state, ctx)
+            # #227: ratchet trailing stops on the safety path too, so an open winner's
+            # SL keeps climbing to break-even / trailing even during a daily-drawdown
+            # freeze, a per-coin emergency-stop (#34) or a dashboard-disable (#184) —
+            # states where on_tick is skipped (engine.py) but the documented contract
+            # is "new buys halted, SL/TP still active". _update_trailing_stops only ever
+            # RAISES a stop, never lowers it and never opens risk, so it is safe here for
+            # the same reason _check_position_stops already runs on this path.
+            self._update_trailing_stops(symbol, price, state)
             # Mark this symbol so the paired on_tick this tick doesn't repeat the
-            # SL/directional checks (#146).
+            # SL/directional/trailing checks (#146).
             self._safety_checked.add(symbol)
 
     def _update_trailing_stops(self, symbol: str, price: float, state: _GridState):
