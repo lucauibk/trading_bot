@@ -3039,6 +3039,78 @@ class TestCapitalRunningGuard:
         assert called["value"] == 2000.0
 
 
+# ── Trailing-stop ratchets on the freeze/block safety path (#227) ───────────────
+
+class TestTrailingStopOnSafetyPath:
+    """During a daily-drawdown freeze / per-coin emergency-stop (#34) /
+    dashboard-disable (#184) the engine skips on_tick but always calls
+    on_tick_safety. The break-even/trail ratchet must still run there, or an open
+    winner's SL never climbs and it gives back its whole book profit to the floor
+    exactly when it matters most (#227)."""
+
+    def _strategy(self, **overrides):
+        from strategies.grid import GridStrategy
+        from strategies.grid_params import GridParams
+        params = GridParams.from_dict({"sl_mode": "floor", "leverage": 1.0, **overrides})
+        return GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+                            ml_enabled=False, params=params)
+
+    def test_on_tick_safety_ratchets_trailing_stop(self):
+        from core.context import MarketContext
+        strategy = self._strategy()
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state._atr = 2.0  # ATR = $2
+
+        cid = str(uuid.uuid4())
+        state.orders[cid] = {
+            "side": "sell", "price": 110.0, "qty": 1.0,
+            "filled": False, "bought_at": 100.0,
+            "sl_price": 96.0, "trailing_activated": False,
+        }
+
+        # Price is +1×ATR above entry (buy=100, ATR=2 → 102). on_tick_safety is the
+        # ONLY hook the engine runs during a freeze/block. Before the #227 fix it did
+        # not touch the trailing stop, so the SL stayed at 96.0.
+        strategy.on_tick_safety("SOL/USD", 102.5, ctx)
+        assert state.orders[cid]["trailing_activated"] is True, (
+            "trailing stop must activate on the safety path during freeze/block (#227)"
+        )
+        assert state.orders[cid]["sl_price"] >= 100.0, (
+            "SL must ratchet to break-even on on_tick_safety, not stay at the floor (#227)"
+        )
+
+    def test_safety_then_on_tick_ratchets_trailing_once(self):
+        """The paired on_tick this same tick must not double-run the ratchet (#146)."""
+        from core.context import MarketContext
+        strategy = self._strategy()
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+
+        calls = {"trail": 0}
+        strategy._update_trailing_stops = lambda *a, **k: calls.__setitem__(
+            "trail", calls["trail"] + 1)
+
+        strategy.on_tick_safety("SOL/USD", 100.0, ctx)
+        strategy.on_tick("SOL/USD", 100.0, ctx)
+        assert calls["trail"] == 1, "trailing ratchet must run exactly once per tick (#146/#227)"
+
+    def test_standalone_on_tick_still_ratchets_trailing(self):
+        """on_tick called without a preceding safety tick still runs the ratchet."""
+        from core.context import MarketContext
+        strategy = self._strategy()
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+
+        calls = {"trail": 0}
+        strategy._update_trailing_stops = lambda *a, **k: calls.__setitem__(
+            "trail", calls["trail"] + 1)
+
+        strategy.on_tick("SOL/USD", 100.0, ctx)
+        assert calls["trail"] == 1
+
+
 # ── Smart-replenish never places a buy above market (#226) ──────────────────────
 
 class TestReplenishNotAboveMarket:
