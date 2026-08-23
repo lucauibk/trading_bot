@@ -295,7 +295,9 @@ class Engine:
                 # price can escape the grid while frozen.  setup_grid gates buy-seeding
                 # internally via _buys_allowed (inventory cap + trend filter).  Even if
                 # setup_grid seeds new buys, they won't be submitted to the broker while
-                # frozen because _sync_orders is blocked below (if not is_frozen()).
+                # frozen because the PLACE half of _sync_orders is gated off during
+                # freeze below (place_new=... and not is_frozen()); only its CANCEL half
+                # runs while frozen (#230).
                 # on_tick_safety still fires SLs during freeze — intentional one-way
                 # liquidation.  The real prevention against cascade losses is the
                 # inventory cap (max_inventory_notional_mult) which stops accumulation
@@ -303,21 +305,32 @@ class Engine:
                 self.strategy.setup_grid(sym, price, self.ctx)
                 self._last_rebuild[sym] = self._loop_count
 
-            if not self.ctx.is_frozen():
-                # #222: the CANCEL half of _sync_orders must run even for a blocked
-                # coin (emergency-stop / dashboard-disabled).  Otherwise, after a
-                # grid rebuild regenerates the pre-seeded sell walls with fresh
-                # client_ids, the OLD walls linger un-cancelled on the broker; the
-                # unconditional process_paper_fills (above) then fills them a tick
-                # later and on_fill hits the orphan branch — booking a phantom
-                # profit-only credit into the cash bucket while state.total_profit
-                # stays put, and leaking the order as permanently `open`.  Real
-                # filled-buy TP-sells keep their cid across rebuild (grid.py) and so
-                # stay in `desired` → they are NOT cancelled.  Only the PLACE half
-                # (new risk) stays gated on the block state.  Freeze needs no cancel:
-                # process_paper_fills is gated off during freeze, so no orphan fills
-                # occur there.
-                self._sync_orders(sym, price, place_new=not block_new_risk)
+            # #222/#230: the CANCEL half of _sync_orders must run even for a blocked
+            # coin (emergency-stop / dashboard-disabled) AND during a daily-drawdown
+            # freeze.  Otherwise, after a grid rebuild regenerates the pre-seeded sell
+            # walls / resting buys with fresh client_ids, the OLD orders linger
+            # un-cancelled on the broker; process_paper_fills then fills them and
+            # on_fill hits the orphan branch — booking a phantom profit-only credit
+            # into the cash bucket while state.total_profit stays put (stale sell), or
+            # deducting margin for a position that is never tracked (stale buy →
+            # phantom long / margin leak), and leaking the order as permanently `open`.
+            # Real filled-buy TP-sells keep their cid across rebuild (grid.py) and so
+            # stay in `desired` → they are NOT cancelled.  Only the PLACE half (new
+            # risk) stays gated on the block/freeze state.
+            #
+            # #230: the freeze case is NOT exempt.  process_paper_fills is gated off
+            # *during* the freeze, but a rebuild that runs during a multi-tick freeze
+            # regenerates cids while _sync_orders (previously fully freeze-gated) never
+            # cancels the stale broker orders — so they survive to the freeze-LIFT tick,
+            # where process_paper_fills runs (line ~280) BEFORE this cancel and fills
+            # them against a cid state.orders no longer knows (orphan).  Running the
+            # cancel half unconditionally retracts those stale orders while the freeze
+            # is still active, closing the gap.  Placing is still fully suppressed
+            # during freeze via place_new=False, so no new risk is opened.
+            self._sync_orders(
+                sym, price,
+                place_new=not block_new_risk and not self.ctx.is_frozen(),
+            )
 
             self._update_dashboard(sym, price)
 
