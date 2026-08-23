@@ -3109,3 +3109,58 @@ class TestTrailingStopOnSafetyPath:
 
         strategy.on_tick("SOL/USD", 100.0, ctx)
         assert calls["trail"] == 1
+
+
+# ── Smart-replenish never places a buy above market (#226) ──────────────────────
+
+class TestReplenishNotAboveMarket:
+    """The bullish smart-replenish branch placed the follow-up buy one grid line
+    ABOVE the just-filled sell (= above market). A buy limit above market is
+    immediately marketable and the PaperBroker fills it at the worse limit price,
+    opening the new long already in the red. The replenish must be clamped to the
+    sell fill price so it is never above market (#226)."""
+
+    def _strategy(self, **overrides):
+        from strategies.grid import GridStrategy
+        from strategies.grid_params import GridParams
+        params = GridParams.from_dict({"sl_mode": "floor", "leverage": 1.0, **overrides})
+        return GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 5}],
+                            ml_enabled=False, params=params)
+
+    def _fill_sell(self, direction_score):
+        from core.context import MarketContext
+        from core.strategy import Fill
+        strategy = self._strategy()
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state.grid_lines = [98.0, 100.0, 102.0, 104.0, 106.0]
+        state.usdt_per_grid = 20.0
+        state._direction_score = direction_score
+        # Ensure the replenish branch actually runs regardless of trend-filter state.
+        strategy._buys_allowed = lambda s: True
+
+        sell_price = 102.0  # grid line idx 2; next higher line is 104.0 (above market)
+        cid = str(uuid.uuid4())
+        state.orders[cid] = {
+            "side": "sell", "price": sell_price, "qty": 1.0,
+            "filled": False, "bought_at": 100.0,
+        }
+        strategy.on_fill(Fill(client_id=cid, symbol="SOL/USD", side="sell",
+                              price=sell_price, qty=1.0, fee=0.0, ts=time.time()), ctx)
+        buys = [o for o in state.orders.values() if o["side"] == "buy"]
+        assert len(buys) == 1, "exactly one replenish buy expected"
+        return buys[0]["price"], sell_price
+
+    def test_bullish_replenish_not_above_market(self):
+        buy_price, sell_price = self._fill_sell(direction_score=0.5)
+        assert buy_price <= sell_price, (
+            f"replenish buy @ {buy_price} must not be placed above the market "
+            f"(sell fill @ {sell_price}) — a buy limit above market fills at the "
+            f"worse limit price (#226)"
+        )
+
+    def test_neutral_replenish_at_entry(self):
+        # Non-bullish path is unchanged: replenish at the original entry (below market).
+        buy_price, sell_price = self._fill_sell(direction_score=0.0)
+        assert buy_price == 100.0

@@ -594,11 +594,19 @@ class GridStrategy(Strategy):
             new_cid = str(uuid.uuid4())
             replenish_usdt = state.usdt_per_grid
             if state._direction_score > 0.1:
-                # Follow trend upward: place replenish at next higher level
+                # Follow trend upward: replenish one level higher than the closed
+                # lot's entry. #226: clamp to the sell fill price so the buy is never
+                # placed ABOVE the market. A buy limit above market is immediately
+                # marketable and the PaperBroker fills it at the (worse) limit price
+                # next tick, opening the new long already in the red. sell_price is the
+                # price the market reached to trigger this sell (the live tick is not
+                # passed into on_fill), so it is the correct at-or-below-market anchor;
+                # the replenish still sits above the original buy_price in a bullish
+                # regime (trend-follow intent preserved) but never above market.
                 try:
                     current_idx = state.grid_lines.index(order["price"])
                     if current_idx < len(state.grid_lines) - 1:
-                        new_buy_price = state.grid_lines[current_idx + 1]
+                        new_buy_price = min(state.grid_lines[current_idx + 1], sell_price)
                     else:
                         new_buy_price = buy_price
                 except (ValueError, IndexError):
