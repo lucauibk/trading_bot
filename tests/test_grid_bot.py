@@ -2456,9 +2456,10 @@ class TestBlockedCoinStillFillsTP:
             self.fills = []
             # on_tick (new-risk decisions) is skipped for blocked AND frozen coins.
             self.allow_on_tick = True
-            # #222: _sync_orders' CANCEL half now runs for a BLOCKED coin (only the
-            # PLACE half is skipped), so desired_orders may be queried while blocked.
-            # During a daily-drawdown FREEZE _sync_orders is still fully gated.
+            # #222/#230: _sync_orders' CANCEL half runs for a BLOCKED coin AND during a
+            # daily-drawdown FREEZE (only the PLACE half is skipped), so desired_orders
+            # may be queried in both states.  It is skipped only in a hypothetical state
+            # where the engine chooses not to sync at all (kept for explicitness).
             self.allow_sync = True
 
         def init(self, symbols, ctx):
@@ -2476,7 +2477,7 @@ class TestBlockedCoinStillFillsTP:
 
         def desired_orders(self, sym, price, ctx):
             if not self.allow_sync:
-                raise AssertionError("_sync_orders must not run for a FROZEN coin")
+                raise AssertionError("_sync_orders was not expected to run here")
             return []
 
         def on_fill(self, fill, ctx):
@@ -2494,7 +2495,9 @@ class TestBlockedCoinStillFillsTP:
         ctx.set_freeze(frozen)
         strat = self._Strat()
         strat.allow_on_tick = not (disabled or frozen)
-        strat.allow_sync = not frozen  # #222: blocked coins run the cancel half
+        # #222/#230: the cancel half of _sync_orders runs for blocked coins AND while
+        # frozen, so desired_orders is queried in every state.
+        strat.allow_sync = True
         eng = Engine(strat, broker, [sym], ctx=ctx)
 
         # Neutralise all heavy I/O so a single _tick() runs in isolation.
@@ -2531,7 +2534,9 @@ class TestBlockedCoinStillFillsTP:
     def test_emergency_and_frozen_semantics_diverge(self, monkeypatch):
         # The daily-drawdown FREEZE keeps its intentional only-SL behaviour: the
         # resting TP-sell must NOT fill while frozen (guards against over-reaching the
-        # #210 fix into the deliberately-parked #90/freeze path).
+        # #210 fix into the deliberately-parked #90/freeze path).  #230: the cancel
+        # half of _sync_orders now runs while frozen (retracting stale rebuilt walls),
+        # but process_paper_fills stays gated off, so no resting order fills here.
         eng, broker, strat, sym = self._engine(monkeypatch, price=105.0, frozen=True)
         self._place_resting_tp(broker, sym)
         bal_before = broker._sym_balance(sym)
@@ -2677,6 +2682,117 @@ class TestBlockedCoinCancelsStaleWalls:
         eng._sync_orders(sym, 100.0, place_new=False)
 
         assert broker._orders["tp_real"].status == "open", "real TP-sell must survive"
+        assert "tp_real" in eng._active_orders[sym]
+        assert broker._orders["stale"].status == "cancelled", "stale wall must go"
+
+
+class TestFreezeCancelsStaleWalls:
+    """#230: the SAME stale-wall orphan hazard as #222, but across the daily-drawdown
+    FREEZE boundary.  During a freeze, process_paper_fills is gated off (correct), but
+    setup_grid keeps rebuilding — regenerating pre-seeded walls / resting buys with
+    fresh cids — while _sync_orders (the only canceller) used to be fully freeze-gated.
+    So the OLD broker orders survived the multi-tick freeze un-cancelled and, on the
+    freeze-LIFT tick, process_paper_fills (which runs BEFORE the cancel) filled them
+    against a cid state.orders no longer knew → on_fill orphan branch: a stale sell
+    books a phantom profit-only credit while total_profit stays put; a stale buy
+    deducts margin for a position that is never tracked (phantom long / margin leak).
+
+    The fix runs the CANCEL half of _sync_orders unconditionally (even while frozen)
+    and gates only the PLACE half on freeze, so stale orders are retracted while the
+    freeze is still active and cannot orphan-fill at lift.  Mirrors #222 for the
+    block path; the freeze case was the remaining gap."""
+
+    class _Strat:
+        def __init__(self, desired):
+            self._desired = desired
+
+        def desired_orders(self, sym, price, ctx):
+            return list(self._desired)
+
+    def _engine(self, desired, frozen):
+        from core.engine import Engine
+        from core.context import MarketContext
+        from execution.paper import PaperBroker
+        sym = "SOL/USD"
+        broker = PaperBroker(initial_balance=1000.0, symbols=[sym])
+        ctx = MarketContext()
+        ctx.set_freeze(frozen)
+        eng = Engine(self._Strat(desired), broker, [sym], ctx=ctx)
+        return eng, broker, sym
+
+    def _fresh_wall(self, sym):
+        from core.strategy import Order
+        return Order(symbol=sym, side="sell", price=104.0, qty=1.0,
+                     client_id="fresh", post_only=True, meta={})
+
+    def test_frozen_coin_cancels_stale_wall_without_placing_new(self):
+        # place_new must be False while frozen (the caller passes
+        # place_new = not block_new_risk and not is_frozen()); the cancel half still
+        # runs, so the stale wall is retracted but no fresh wall is placed.
+        sym = "SOL/USD"
+        eng, broker, sym = self._engine([self._fresh_wall(sym)], frozen=True)
+        stale = broker.place_limit(symbol=sym, side="sell", price=103.0, qty=1.0,
+                                   post_only=True, client_id="stale", meta={})
+        eng._active_orders[sym] = {"stale": stale}
+
+        eng._sync_orders(sym, 100.0, place_new=False)   # frozen coin path
+
+        assert broker._orders["stale"].status == "cancelled", \
+            "stale wall must be retracted during freeze so it cannot orphan-fill at lift"
+        assert "stale" not in eng._active_orders[sym]
+        assert "fresh" not in broker._orders, "no new risk may be placed while frozen"
+
+    def test_full_tick_while_frozen_cancels_stale_wall(self, monkeypatch):
+        # End-to-end via _tick(): a frozen coin's _sync_orders cancel half runs, so a
+        # stale tracked wall is retracted and never orphan-fills.  The stale sell sits
+        # ABOVE the price so process_paper_fills would not fill it this tick anyway; the
+        # point is that it is GONE from the broker after the frozen tick.
+        from core.engine import Engine
+        from core.context import MarketContext
+        from execution.paper import PaperBroker
+        import data_fetcher
+
+        sym = "SOL/USD"
+        broker = PaperBroker(initial_balance=1000.0, symbols=[sym])
+        ctx = MarketContext()
+        ctx.set_freeze(True)
+        # desired is empty (rebuild dropped the wall) → the tracked stale wall is undesired
+        eng = Engine(self._Strat([]), broker, [sym], ctx=ctx)
+
+        monkeypatch.setattr(data_fetcher, "fetch_ticker", lambda s: {"last": 100.0})
+        for m in ("_check_dashboard_stop", "_refresh_coin_settings", "_refresh_btc",
+                  "_refresh_funding", "_refresh_correlations", "_check_daily_drawdown",
+                  "_update_dashboard", "_log_equity", "_update_prediction_outcomes"):
+            monkeypatch.setattr(eng, m, lambda *a, **k: None)
+        eng._loop_count = 1  # avoid recheck/rebuild cycles
+
+        stale = broker.place_limit(symbol=sym, side="sell", price=104.0, qty=1.0,
+                                   post_only=True, client_id="stale", meta={})
+        eng._active_orders[sym] = {"stale": stale}
+
+        eng._tick()
+
+        assert broker._orders["stale"].status == "cancelled", \
+            "stale wall must be cancelled on the frozen tick (#230)"
+        assert "stale" not in eng._active_orders.get(sym, {})
+
+    def test_real_tp_sell_survives_freeze_path_cancel(self):
+        # A real filled-buy TP-sell keeps its cid across rebuild → stays in `desired`
+        # and must NOT be cancelled on the freeze path, so the exit stays open.
+        from core.strategy import Order
+        sym = "SOL/USD"
+        keep = Order(symbol=sym, side="sell", price=104.0, qty=1.0,
+                     client_id="tp_real", post_only=True, meta={"bought_at": 100.0})
+        eng, broker, sym = self._engine([keep], frozen=True)
+        tp = broker.place_limit(symbol=sym, side="sell", price=104.0, qty=1.0,
+                                post_only=True, client_id="tp_real", meta={})
+        stale = broker.place_limit(symbol=sym, side="sell", price=103.0, qty=1.0,
+                                   post_only=True, client_id="stale", meta={})
+        eng._active_orders[sym] = {"tp_real": tp, "stale": stale}
+
+        eng._sync_orders(sym, 100.0, place_new=False)
+
+        assert broker._orders["tp_real"].status == "open", "real TP-sell must survive freeze"
         assert "tp_real" in eng._active_orders[sym]
         assert broker._orders["stale"].status == "cancelled", "stale wall must go"
 
