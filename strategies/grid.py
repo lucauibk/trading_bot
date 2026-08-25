@@ -515,6 +515,15 @@ class GridStrategy(Strategy):
             "leverage": lev,
             "trailing_activated": False,
             "momentum_holds": 0,
+            # #105: stamp the position-open time on the sell order so
+            # _handle_sell_fill can measure the real holding duration. Without
+            # this key `order.get("entry_ts", time.time())` fell back to now on
+            # every fill → holding_seconds ≈ 0 for every grid trade, corrupting
+            # the hold-time analytics the optimizer/nightly-tuner read. This is
+            # the buy-fill moment (the position opens here), and the smart-
+            # replenish chain inherits it automatically: each replenish buy
+            # creates a fresh sell through this same path on its own fill.
+            "entry_ts": time.time(),
         }
         state.price_to_id[sell_price] = sell_cid
         logger.info("[GRID] BUY fill %s @ %.4f | SL=%.4f | -> sell @ %.4f",
@@ -1107,6 +1116,11 @@ class GridStrategy(Strategy):
                 state.orders[cid] = {
                     "side": "sell", "price": gp, "qty": sell_qty, "filled": False,
                     "bought_at": price, "pre_seeded": True,
+                    # #105: a pre-seeded wall has no real buy, so use the grid
+                    # build time as the entry reference. When it fills,
+                    # holding_seconds then reflects how long the wall rested
+                    # instead of collapsing to ~0.
+                    "entry_ts": time.time(),
                 }
                 state.price_to_id[gp] = cid
 
