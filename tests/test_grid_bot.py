@@ -3338,3 +3338,83 @@ class TestHoldingSecondsEntryTs:
         assert new_sells, "a buy fill must create a matching TP sell order"
         assert all(o.get("entry_ts", 0) > 0 for o in new_sells), \
             "the sell created on a buy fill must carry a positive entry_ts (#105)"
+
+
+class TestRemovePositionSingleLot:
+    """#159: closing ONE grid lot (sell fill or stop-loss) must remove exactly
+    that lot from the risk context, not the whole DCA cohort.
+
+    ``remove_position(symbol, "grid")`` used to drop *every* grid position for
+    the symbol, so after the first sell/SL RiskManager saw 0 open lots while
+    several DCA buys were still open — ``open_position_count`` and
+    ``symbol_position_usdt`` under-counted and the exposure/correlation caps
+    were silently defeated. The fix keys each lot by its TP sell order's cid and
+    removes only the matching one.
+    """
+
+    def _strategy(self, **overrides):
+        from strategies.grid import GridStrategy
+        from strategies.grid_params import GridParams
+        params = GridParams.from_dict({"sl_mode": "floor", "leverage": 1.0, **overrides})
+        return GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 5}],
+                            ml_enabled=False, params=params)
+
+    def _fill_two_buys(self):
+        """Open two independent grid lots via buy fills; return (strategy, state, ctx)."""
+        from core.context import MarketContext
+        from core.strategy import Fill
+        strategy = self._strategy()
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state.grid_lines = [96.0, 98.0, 100.0, 102.0, 104.0]
+        state.usdt_per_grid = 20.0
+        strategy._buys_allowed = lambda s: True
+
+        for buy_price in (96.0, 98.0):
+            cid = str(uuid.uuid4())
+            state.orders[cid] = {"side": "buy", "price": buy_price, "qty": 1.0,
+                                 "filled": False, "leverage": 1.0}
+            strategy.on_fill(Fill(client_id=cid, symbol="SOL/USD", side="buy",
+                                  price=buy_price, qty=1.0, fee=0.0, ts=time.time()), ctx)
+        return strategy, state, ctx
+
+    def test_two_buys_register_two_lots(self):
+        _, _, ctx = self._fill_two_buys()
+        assert ctx.open_position_count() == 2
+        assert ctx.symbol_position_usdt("SOL/USD") == pytest.approx(96.0 + 98.0)
+
+    def test_sell_fill_removes_only_its_lot(self):
+        from core.strategy import Fill
+        strategy, state, ctx = self._fill_two_buys()
+
+        # Fill the TP sell belonging to the 96.0 lot only.
+        sell_cid = next(cid for cid, o in state.orders.items()
+                        if o["side"] == "sell" and o.get("bought_at") == 96.0)
+        sell_price = state.orders[sell_cid]["price"]
+        strategy.on_fill(Fill(client_id=sell_cid, symbol="SOL/USD", side="sell",
+                              price=sell_price, qty=1.0, fee=0.0, ts=time.time()), ctx)
+
+        # The 98.0 lot must still be tracked (bug: cohort wiped -> count 0).
+        assert ctx.open_position_count() == 1, \
+            "closing one lot must not wipe the whole cohort (#159)"
+        remaining = ctx.get_positions("SOL/USD")
+        assert len(remaining) == 1 and remaining[0].entry_price == pytest.approx(98.0)
+
+    def test_stop_loss_removes_only_its_lot(self):
+        strategy, state, ctx = self._fill_two_buys()
+
+        # Arrange SL levels so ONLY the 96.0 lot stops out at the test price:
+        # 96.0 lot SL just below market (fires at 94.0), 98.0 lot SL well below
+        # (does not fire) — isolating a single-lot stop.
+        for cid, o in state.orders.items():
+            if o["side"] != "sell" or "bought_at" not in o:
+                continue
+            o["sl_price"] = 95.0 if o["bought_at"] == 96.0 else 90.0
+        state._direction_score = 0.0  # no momentum-hold delay
+        strategy._check_position_stops("SOL/USD", 94.0, state, ctx)
+
+        assert ctx.open_position_count() == 1, \
+            "a stop-loss on one lot must not wipe the whole cohort (#159)"
+        remaining = ctx.get_positions("SOL/USD")
+        assert len(remaining) == 1 and remaining[0].entry_price == pytest.approx(98.0)
