@@ -3280,3 +3280,61 @@ class TestReplenishNotAboveMarket:
         # Non-bullish path is unchanged: replenish at the original entry (below market).
         buy_price, sell_price = self._fill_sell(direction_score=0.0)
         assert buy_price == 100.0
+
+
+class TestHoldingSecondsEntryTs:
+    """#105: every grid sell order must carry an ``entry_ts`` so
+    ``_handle_sell_fill`` can measure a real holding duration.
+
+    The original fix (commit 2b6f08c, 2026-07-02) regressed out of the tree in a
+    lost merge batch, and the issue was wrongly closed as completed. Without the
+    ``entry_ts`` key, ``order.get("entry_ts", time.time())`` fell back to *now*
+    on every fill -> ``holding_seconds`` collapsed to ~0 for every ``grid_fill``
+    trade, silently corrupting the hold-time analytics the optimizer and nightly
+    tuner consume (``scripts/optimize.py`` wins_ht/loss_ht averaging).
+    """
+
+    def _strategy(self):
+        from strategies.grid import GridStrategy
+        return GridStrategy([{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}])
+
+    def test_grid_build_stamps_entry_ts_on_preseeded_sells(self):
+        from core.context import MarketContext
+        strategy = self._strategy()
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        strategy.setup_grid("SOL/USD", 100.0, ctx)
+        state = strategy.get_state("SOL/USD")
+
+        preseeded = [o for o in state.orders.values()
+                     if o["side"] == "sell" and o.get("pre_seeded")]
+        assert preseeded, "grid build must create pre-seeded sell walls"
+        assert all(o.get("entry_ts", 0) > 0 for o in preseeded), \
+            "every pre-seeded sell must carry a positive entry_ts (#105)"
+
+    def test_buy_fill_stamps_entry_ts_on_sell(self):
+        from core.context import MarketContext
+        from core.strategy import Fill
+        strategy = self._strategy()
+        ctx = MarketContext()
+        strategy.init(["SOL/USD"], ctx)
+        state = strategy.get_state("SOL/USD")
+        state.with_position = True  # buys only seed when with_position (mirrors _refresh_prediction)
+        strategy.setup_grid("SOL/USD", 100.0, ctx)
+
+        buy_orders = [(cid, o) for cid, o in state.orders.items() if o["side"] == "buy"]
+        assert buy_orders, "grid build must create resting buy orders"
+        cid, order = buy_orders[0]
+        sells_before = {c for c, o in state.orders.items() if o["side"] == "sell"}
+
+        strategy.on_fill(
+            Fill(client_id=cid, symbol="SOL/USD", side="buy",
+                 price=order["price"], qty=order["qty"], fee=0.0, ts=time.time()),
+            ctx,
+        )
+
+        new_sells = [o for c, o in state.orders.items()
+                     if o["side"] == "sell" and c not in sells_before]
+        assert new_sells, "a buy fill must create a matching TP sell order"
+        assert all(o.get("entry_ts", 0) > 0 for o in new_sells), \
+            "the sell created on a buy fill must carry a positive entry_ts (#105)"
