@@ -21,6 +21,7 @@ the simple full-notional model (backward-compatible with tests that don't set me
 import logging
 import time
 import uuid
+from collections import deque
 from typing import Dict, List, Optional
 
 from core.strategy import Fill, Order
@@ -30,6 +31,14 @@ logger = logging.getLogger(__name__)
 
 KRAKEN_FEE   = 0.0016   # 0.16% maker fee
 SLIPPAGE_BPS = 3        # 3 basis points slippage
+
+# #135: cap how many *terminal* (filled/cancelled) orders are retained in
+# ``_orders`` for queryability. Open orders are never subject to this cap — they
+# live in ``_open_orders`` and are removed only when they go terminal. Production
+# never reads a terminal order back (``cancel()`` is an idempotent no-op on an
+# absent id), so this only bounds memory; the window is large enough that any
+# same-tick read of a just-terminated order (as the tests do) is always served.
+TERMINAL_RETAIN = 5000
 
 
 class PaperBroker(Broker):
@@ -55,9 +64,32 @@ class PaperBroker(Broker):
         # buy affordability guard rejects any unseeded-symbol buy instead.
         self._balance: float = 0.0 if self._balances else initial_balance
 
+        # #135: ``_orders`` is the full (open + recently-terminal) map kept for
+        # queryability; ``_open_orders`` holds ONLY resting orders and is the one
+        # the per-tick price scan iterates, so update_price is O(open orders) per
+        # symbol instead of O(every order ever placed). ``_terminal_ids`` is a
+        # bounded FIFO of terminal client_ids: when it overflows, the oldest
+        # terminal order is evicted from ``_orders`` so memory stays bounded.
         self._orders:          Dict[str, BrokerOrder] = {}
+        self._open_orders:     Dict[str, BrokerOrder] = {}
+        self._terminal_ids:    deque                  = deque(maxlen=TERMINAL_RETAIN)
         self._fill_callbacks:  list                   = []
         self._tick:            int                    = 0
+
+    # ── Internal order-lifecycle helpers ──────────────────────────────────
+
+    def _retire(self, order: BrokerOrder) -> None:
+        """Move an order out of the open set once it is filled/cancelled (#135).
+
+        The order stays in ``_orders`` (queryable) until it is pushed out of the
+        bounded ``_terminal_ids`` FIFO, at which point it is dropped to keep the
+        map from growing without bound over a long-running session.
+        """
+        self._open_orders.pop(order.client_id, None)
+        if len(self._terminal_ids) == self._terminal_ids.maxlen:
+            evicted = self._terminal_ids[0]  # about to be pushed out by append
+            self._orders.pop(evicted, None)
+        self._terminal_ids.append(order.client_id)
 
     # ── Internal balance helpers ──────────────────────────────────────────
 
@@ -106,6 +138,7 @@ class PaperBroker(Broker):
             meta={"sl": sl_price, "tp": tp_price, "placed_tick": self._tick, **extra},
         )
         self._orders[client_id] = order
+        self._open_orders[client_id] = order
         logger.debug("[PAPER] placed %s %s %s qty=%.6f @ %.4f",
                      symbol, side, client_id[:8], qty, price)
         return order
@@ -114,15 +147,18 @@ class PaperBroker(Broker):
         order = self._orders.get(client_id)
         if order and order.status == "open":
             order.status = "cancelled"
+            self._retire(order)
             logger.debug("[PAPER] cancelled %s", client_id[:8])
             return True
         return False
 
     def cancel_all(self, symbol: str) -> int:
         count = 0
-        for order in self._orders.values():
+        # Iterate only resting orders (a copy, since _retire mutates the dict).
+        for order in list(self._open_orders.values()):
             if order.symbol == symbol and order.status == "open":
                 order.status = "cancelled"
+                self._retire(order)
                 count += 1
         return count
 
@@ -138,7 +174,8 @@ class PaperBroker(Broker):
         self._tick += 1
         fills = []
 
-        for order in list(self._orders.values()):
+        # #135: scan only resting orders (was: every order ever placed).
+        for order in list(self._open_orders.values()):
             if order.symbol != symbol or order.status != "open":
                 continue
             if sells_only and order.side == "buy":
@@ -190,6 +227,7 @@ class PaperBroker(Broker):
 
                 order.status     = "filled"
                 order.filled_qty = order.qty
+                self._retire(order)  # #135: drop from the open-order scan set
 
                 fill = Fill(
                     client_id=order.client_id,
@@ -212,7 +250,8 @@ class PaperBroker(Broker):
         return []
 
     def get_open_orders(self, symbol: str) -> List[BrokerOrder]:
-        return [o for o in self._orders.values()
+        # #135: iterate only the resting-order index.
+        return [o for o in self._open_orders.values()
                 if o.symbol == symbol and o.status == "open"]
 
     def load_balances(self, balances: dict) -> None:
