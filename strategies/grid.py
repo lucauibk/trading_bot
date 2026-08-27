@@ -545,11 +545,31 @@ class GridStrategy(Strategy):
         sell_price = fill.price
         sell_cid = fill.client_id
         order = state.orders[sell_cid]
-        buy_price = order.get("bought_at", sell_price)
-        qty = order["qty"]
-        # #57: log the leverage the position was entered with, not the live
-        # value (which may have been changed via the dashboard mid-position).
-        lev = order.get("leverage", self._lev())
+        # #235: source the booked values from what the broker ACTUALLY transacted
+        # (fill.qty / fill.meta), not the possibly-rewritten state.orders entry —
+        # the symmetric counterpart of the #206/#208 fix in _handle_buy_fill.
+        # A pre-seeded upper wall that survives a 15-min grid rebuild reuses its
+        # client_id: setup_grid excludes pre_seeded sells from open_positions
+        # (grid.py:~1062), so its cid is absent from the freshly-rebuilt
+        # state.orders and gets recycled (grid.py:~1088) while its bought_at/qty
+        # are re-written to the CURRENT price/leverage. But _sync_orders never
+        # re-places an already-active cid, so the broker keeps the ORIGINAL
+        # bought_at/qty and credits paper cash from them (execution/paper.py:
+        # 176-189). Reading state here would move state.total_profit by a
+        # different amount than the broker moved cash → the deposit-anchored
+        # drawdown brake (reads total_equity = cash + MTM) and the emergency-stop
+        # / compounding (read total_profit) then see divergent realities, a
+        # directional drift that accumulates per recurring wall. fill.meta is a
+        # copy of the broker order's meta and fill.qty is the broker's own qty
+        # (execution/paper.py:194-203), so they carry exactly the OLD values the
+        # cash credit used. The normal no-rebuild case is bit-identical: there
+        # fill.qty == order["qty"] and fill.meta's bought_at/leverage == state's.
+        qty = fill.qty
+        buy_price = float(fill.meta.get("bought_at", order.get("bought_at", sell_price)))
+        # #57/#235: the leverage the position was entered with (broker order meta),
+        # not the live dashboard value; state value as a fallback for callers that
+        # supply no meta.
+        lev = float(fill.meta.get("leverage", order.get("leverage", self._lev())))
 
         profit = (sell_price - buy_price) * qty
         # #215: a pre-seeded sell (an upper grid wall placed at setup without a real
