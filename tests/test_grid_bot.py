@@ -3340,6 +3340,69 @@ class TestHoldingSecondsEntryTs:
             "the sell created on a buy fill must carry a positive entry_ts (#105)"
 
 
+class TestPaperBrokerOrderGC:
+    """#135: PaperBroker used to keep every order it ever placed in ``_orders``
+    forever and re-scan the whole map on every ``update_price`` tick -> unbounded
+    memory growth and an O(all-orders-ever) per-tick scan in long paper/sweep
+    runs. Terminal orders are now retired from the scanned open set and the
+    retained-terminal map is bounded by a FIFO window.
+    """
+
+    def _broker(self):
+        from execution.paper import PaperBroker
+        return PaperBroker(initial_balance=1000.0, symbols=["SOL/USD"])
+
+    def test_open_set_shrinks_on_fill_and_cancel(self):
+        b = self._broker()
+        b.place_limit("SOL/USD", "sell", 100.0, 1.0, client_id="s1",
+                      meta={"bought_at": 90.0, "leverage": 1.0})
+        b.place_limit("SOL/USD", "buy", 50.0, 1.0, client_id="b1",
+                      meta={"leverage": 1.0})
+        assert set(b._open_orders) == {"s1", "b1"}
+
+        # Sell fills (price >= 100), the buy @50 does not (price 105 > 50).
+        fills = b.update_price("SOL/USD", 105.0)
+        assert [f.client_id for f in fills] == ["s1"]
+        assert "s1" not in b._open_orders
+        assert b._orders["s1"].status == "filled"  # still queryable
+        assert b.get_open_orders("SOL/USD") == [b._orders["b1"]]
+
+        # Cancel the resting buy → leaves the open set, stays queryable.
+        assert b.cancel("b1") is True
+        assert b._open_orders == {}
+        assert b._orders["b1"].status == "cancelled"
+        # cancel() is an idempotent no-op on an already-terminal id.
+        assert b.cancel("b1") is False
+
+    def test_terminal_map_is_bounded(self):
+        from collections import deque
+        b = self._broker()
+        b._terminal_ids = deque(maxlen=10)  # shrink for a fast, deterministic test
+        for i in range(50):
+            cid = f"c{i}"
+            b.place_limit("SOL/USD", "buy", 1.0, 1.0, client_id=cid, meta={"leverage": 1.0})
+            b.cancel(cid)
+        assert len(b._open_orders) == 0
+        assert len(b._orders) <= 10, "retained terminal orders must be bounded (#135)"
+        # The most recent terminal order is still queryable within the window.
+        assert "c49" in b._orders and b._orders["c49"].status == "cancelled"
+        # cancel() on an evicted id is a harmless no-op (guards the #192 SL path).
+        assert b.cancel("c0") is False
+
+    def test_live_order_still_fills_after_many_terminals(self):
+        from collections import deque
+        b = self._broker()
+        b._terminal_ids = deque(maxlen=5)
+        for i in range(20):
+            cid = f"t{i}"
+            b.place_limit("SOL/USD", "buy", 1.0, 1.0, client_id=cid, meta={"leverage": 1.0})
+            b.cancel(cid)
+        b.place_limit("SOL/USD", "sell", 100.0, 1.0, client_id="live",
+                      meta={"bought_at": 90.0, "leverage": 1.0})
+        fills = b.update_price("SOL/USD", 101.0)
+        assert [f.client_id for f in fills] == ["live"]
+
+
 class TestRemovePositionSingleLot:
     """#159: closing ONE grid lot (sell fill or stop-loss) must remove exactly
     that lot from the risk context, not the whole DCA cohort.
