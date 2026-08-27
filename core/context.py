@@ -43,6 +43,11 @@ class Position:
     sl: Optional[float] = None
     entry_ts: float = 0.0
     momentum_holds: int = 0
+    # Stable per-lot identity so remove_position() can drop exactly the closed
+    # lot instead of the whole cohort (#159). For grid lots this is the TP
+    # sell order's client_id, which survives grid rebuilds (setup_grid keeps
+    # the open sell order under its existing cid).
+    key: Optional[str] = None
 
 
 class MarketContext:
@@ -96,11 +101,30 @@ class MarketContext:
         with self._lock:
             self.positions.setdefault(pos.symbol, []).append(pos)
 
-    def remove_position(self, symbol: str, side: str):
+    def remove_position(self, symbol: str, side: str, key: Optional[str] = None):
+        """Remove positions for a symbol.
+
+        #159: when ``key`` is given, drop exactly ONE position matching both
+        ``side`` and ``key`` (the closed lot). The previous behaviour dropped
+        *every* position of that side, so the first grid sell/SL wiped the whole
+        DCA cohort from the context — RiskManager's ``open_position_count`` and
+        ``symbol_position_usdt`` then under-counted exposure and the position/
+        correlation caps were silently defeated after the first fill.
+
+        When ``key`` is None the old cohort-wide behaviour is preserved (used by
+        any bulk-close path that has no per-lot identity). On a key miss nothing
+        is removed — over-counting is the safe direction for a risk gate, while
+        under-counting is the very bug this fixes.
+        """
         with self._lock:
-            self.positions[symbol] = [
-                p for p in self.positions.get(symbol, []) if p.side != side
-            ]
+            lst = self.positions.get(symbol, [])
+            if key is None:
+                self.positions[symbol] = [p for p in lst if p.side != side]
+                return
+            for i, p in enumerate(lst):
+                if p.side == side and p.key == key:
+                    del lst[i]
+                    break
 
     def open_position_count(self) -> int:
         with self._lock:
