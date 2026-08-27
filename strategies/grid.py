@@ -534,6 +534,11 @@ class GridStrategy(Strategy):
             entry_price=buy_price, qty=qty,
             usdt_value=buy_price * qty,
             leverage=lev,
+            # #159: key the risk-context lot by its TP sell order's client_id so
+            # the matching sell/SL removes exactly THIS lot, not the whole grid
+            # cohort. The cid survives grid rebuilds (setup_grid preserves the
+            # open sell under its existing cid).
+            key=sell_cid,
         ))
 
     def _handle_sell_fill(self, fill: Fill, state: _GridState, ctx: MarketContext):
@@ -633,7 +638,9 @@ class GridStrategy(Strategy):
             state.price_to_id[new_buy_price] = new_cid
 
         if not order.get("pre_seeded"):
-            ctx.remove_position(fill.symbol, "grid")
+            # #159: drop exactly this lot (keyed by the sell order's cid), not
+            # the whole grid cohort.
+            ctx.remove_position(fill.symbol, "grid", key=sell_cid)
         self._maybe_compound(sell_price, state)
 
     def _maybe_compound(self, price: float, state: _GridState):
@@ -885,7 +892,9 @@ class GridStrategy(Strategy):
                         self._broker.cancel(cid)
                     except Exception:
                         pass
-                ctx.remove_position(symbol, "grid")
+                # #159: drop exactly this lot (keyed by the sell order's cid),
+                # not the whole grid cohort.
+                ctx.remove_position(symbol, "grid", key=cid)
                 # Remove from orders after SL
                 state.orders.pop(cid, None)
             elif order.get("momentum_holds"):
