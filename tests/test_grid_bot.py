@@ -2981,6 +2981,110 @@ class TestPreseededSellFeeNoPhantomBuyFee:
         assert state.total_profit == pytest.approx(expected)
 
 
+class TestSellFillPreseededDriftAfterRebuild:
+    """#235: a pre-seeded upper wall that survives a 15-min grid rebuild reuses
+    its client_id while its bought_at/qty are re-written in state.orders to the
+    CURRENT price/leverage — but the PaperBroker keeps (and credits paper cash
+    from) the ORIGINAL values, because _sync_orders never re-places an already-
+    active cid. _handle_sell_fill must book state.total_profit from what the
+    broker ACTUALLY transacted (fill.qty / fill.meta), not the rewritten state
+    entry, or total_profit and paper cash diverge — feeding the deposit-anchored
+    drawdown brake (reads cash+MTM) and the emergency-stop / compounding (read
+    total_profit) inconsistent realities. This is the sell-side counterpart of
+    the #206/#208 buy-side fix.
+    """
+
+    def _setup(self, monkeypatch):
+        from strategies.grid import GridStrategy, _GridState
+        from strategies.grid_params import GridParams
+        from execution.paper import PaperBroker
+        from core.context import MarketContext
+
+        monkeypatch.setenv("GRIDBOT_BACKTEST", "1")  # skip dashboard/notifier
+        strat = GridStrategy(
+            [{"symbol": "SOL/USD", "investment": 100.0, "levels": 6}],
+            ml_enabled=False,
+            params=GridParams(sl_mode="floor", leverage=1.0,
+                              trend_filter_enabled=False),
+        )
+        broker = PaperBroker(initial_balance=100.0, symbols=["SOL/USD"])
+        strat._broker = broker
+        ctx = MarketContext()
+        monkeypatch.setattr(strat, "_lev", lambda: 1.0)
+
+        state = _GridState("SOL/USD", 100.0, 6, 0.05)
+        state.grid_lines = [95.0, 100.0, 105.0]
+        strat._states["SOL/USD"] = state
+        return strat, broker, ctx, state
+
+    def test_total_profit_matches_broker_cash_after_wall_rebuild(self, monkeypatch):
+        from strategies.grid import KRAKEN_FEE
+        strat, broker, ctx, state = self._setup(monkeypatch)
+
+        gp, cid = 105.0, "wall1"
+        # ORIGINAL pre-seeded wall: first seeded when price=100 → bought_at=100.
+        # This is the value the broker holds and credits paper cash from.
+        orig_bought_at, orig_qty = 100.0, 0.10
+        state.orders[cid] = {"side": "sell", "price": gp, "qty": orig_qty,
+                             "filled": False, "bought_at": orig_bought_at,
+                             "pre_seeded": True}
+        state.price_to_id[gp] = cid
+        # Place it in the broker exactly as desired_orders would (order dict → meta),
+        # so the broker credit uses these ORIGINAL values.
+        broker.place_limit(symbol="SOL/USD", side="sell", price=gp, qty=orig_qty,
+                           client_id=cid,
+                           meta={"bought_at": orig_bought_at, "pre_seeded": True,
+                                 "leverage": 1.0})
+
+        # A later rebuild recurs the same grid line, reuses the cid, and re-writes
+        # bought_at to the CURRENT (drifted) price and qty to the current sizing.
+        # The already-placed broker order is NOT touched (still 100.0 / 0.10).
+        state.orders[cid]["bought_at"] = 104.0
+        state.orders[cid]["qty"] = 0.30
+
+        cash_before = broker._balances["SOL/USD"]
+        fills = broker.update_price("SOL/USD", gp)   # wall triggers at 105
+        assert len(fills) == 1 and fills[0].client_id == cid
+        cash_delta = broker._balances["SOL/USD"] - cash_before
+        fill_price = fills[0].price   # broker applies 3bps sell slippage
+
+        assert state.total_profit == 0.0
+        strat.on_fill(fills[0], ctx)
+
+        # total_profit must move by exactly what the broker credited to cash.
+        assert state.total_profit == pytest.approx(cash_delta)
+        # …which equals the broker-consistent value from the ORIGINAL qty/bought_at.
+        expected = (fill_price - orig_bought_at) * orig_qty - fill_price * orig_qty * KRAKEN_FEE
+        assert state.total_profit == pytest.approx(expected)
+        # The OLD bug booked from the rewritten state (bought_at 104, qty 0.30):
+        # a materially different number. Guard against regressing to it.
+        buggy = (fill_price - 104.0) * 0.30 - fill_price * 0.30 * KRAKEN_FEE
+        assert abs(state.total_profit - buggy) > 1e-3
+
+    def test_no_rebuild_case_is_unchanged(self, monkeypatch):
+        # When state.orders was NOT rewritten (the common case), fill.qty/fill.meta
+        # equal the state values, so booking is bit-identical to the old code path.
+        from strategies.grid import KRAKEN_FEE
+        strat, broker, ctx, state = self._setup(monkeypatch)
+
+        gp, cid = 105.0, "wall2"
+        bought_at, qty = 100.0, 0.10
+        state.orders[cid] = {"side": "sell", "price": gp, "qty": qty,
+                             "filled": False, "bought_at": bought_at,
+                             "pre_seeded": True}
+        state.price_to_id[gp] = cid
+        broker.place_limit(symbol="SOL/USD", side="sell", price=gp, qty=qty,
+                           client_id=cid,
+                           meta={"bought_at": bought_at, "pre_seeded": True,
+                                 "leverage": 1.0})
+
+        fills = broker.update_price("SOL/USD", gp)
+        fill_price = fills[0].price   # broker applies 3bps sell slippage
+        strat.on_fill(fills[0], ctx)
+        expected = (fill_price - bought_at) * qty - fill_price * qty * KRAKEN_FEE
+        assert state.total_profit == pytest.approx(expected)
+
+
 # ── Engine rebuild-orphan fill (#218) ────────────────────────────────────────
 
 class TestRebuildOrphanFill:
