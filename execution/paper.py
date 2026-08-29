@@ -73,6 +73,10 @@ class PaperBroker(Broker):
         self._orders:          Dict[str, BrokerOrder] = {}
         self._open_orders:     Dict[str, BrokerOrder] = {}
         self._terminal_ids:    deque                  = deque(maxlen=TERMINAL_RETAIN)
+        # #237: O(1) membership companion to _terminal_ids so place_limit can
+        # cheaply detect (and clear) a reused-cid's stale terminal entry without
+        # scanning the deque on every placement.
+        self._terminal_set:    set                    = set()
         self._fill_callbacks:  list                   = []
         self._tick:            int                    = 0
 
@@ -88,8 +92,18 @@ class PaperBroker(Broker):
         self._open_orders.pop(order.client_id, None)
         if len(self._terminal_ids) == self._terminal_ids.maxlen:
             evicted = self._terminal_ids[0]  # about to be pushed out by append
-            self._orders.pop(evicted, None)
+            # #237: NEVER drop a cid that is currently OPEN again. client_ids are
+            # reused across grid rebuilds (setup_grid recycles a level's cid), so a
+            # level's OLD terminal cid can still sit in this FIFO while _sync_orders
+            # has re-placed the SAME cid as a live resting order. Popping it from
+            # _orders here would make cancel() a silent no-op on that live order,
+            # which then fills anyway → orphan fill (engine.py) or the #192 SL
+            # double-credit. _open_orders is the authority for "still live".
+            if evicted not in self._open_orders:
+                self._orders.pop(evicted, None)
+            self._terminal_set.discard(evicted)
         self._terminal_ids.append(order.client_id)
+        self._terminal_set.add(order.client_id)
 
     # ── Internal balance helpers ──────────────────────────────────────────
 
@@ -137,6 +151,18 @@ class PaperBroker(Broker):
             ts_placed=time.time(),
             meta={"sl": sl_price, "tp": tp_price, "placed_tick": self._tick, **extra},
         )
+        # #237: a reused client_id (grid rebuild recycles a level's cid) may still
+        # carry a stale entry in the terminal FIFO. Clear it on re-placement so the
+        # FIFO doesn't accumulate duplicate cids (which shrink the effective
+        # retention window) and so a later overflow can never target this now-live
+        # order. The _open_orders guard in _retire already makes eviction safe; this
+        # keeps the FIFO honest as well.
+        if client_id in self._terminal_set:
+            self._terminal_set.discard(client_id)
+            try:
+                self._terminal_ids.remove(client_id)
+            except ValueError:
+                pass
         self._orders[client_id] = order
         self._open_orders[client_id] = order
         logger.debug("[PAPER] placed %s %s %s qty=%.6f @ %.4f",
@@ -144,7 +170,12 @@ class PaperBroker(Broker):
         return order
 
     def cancel(self, client_id: str) -> bool:
-        order = self._orders.get(client_id)
+        # #237: _open_orders is the source of truth for whether an order is live
+        # and fillable. A terminal-order GC eviction (#135) can drop a still-open
+        # reused cid from _orders but NEVER from _open_orders, so consult it first —
+        # otherwise cancel() silently no-ops on a live order and it fills again
+        # (orphan fill / #192 SL double-credit).
+        order = self._open_orders.get(client_id) or self._orders.get(client_id)
         if order and order.status == "open":
             order.status = "cancelled"
             self._retire(order)

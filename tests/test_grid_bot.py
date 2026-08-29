@@ -3507,6 +3507,98 @@ class TestPaperBrokerOrderGC:
         assert [f.client_id for f in fills] == ["live"]
 
 
+class TestPaperBrokerReusedCidGC:
+    """#237: the #135 terminal-order GC evicts the oldest terminal cid from
+    ``_orders`` when the FIFO overflows, on the (false-for-this-codebase)
+    assumption that a terminal cid is never read back. But client_ids ARE reused:
+    ``setup_grid`` recycles a level's cid across rebuilds and ``_sync_orders``
+    re-places it, so a cid can be OPEN again while an OLD terminal entry for the
+    same cid still sits in the FIFO. Evicting it dropped the live order from
+    ``_orders`` → ``cancel()`` silently no-oped on a still-fillable order → orphan
+    fill (engine cancel-on-absent) or the #192 SL double-credit (a retracted sell
+    fills a second time). A reused-and-live cid must stay cancellable regardless
+    of GC pressure.
+    """
+
+    def _broker(self):
+        from execution.paper import PaperBroker
+        return PaperBroker(initial_balance=1000.0, symbols=["SOL/USD"])
+
+    def test_reused_cid_stays_cancellable_after_gc_pressure(self):
+        """End-to-end reproduction: place X, retire it, re-place X as a live
+        resting order, then churn a full FIFO window of terminal orders. cancel(X)
+        must still retract the live order (returned False on the old GC)."""
+        from collections import deque
+        b = self._broker()
+        b._terminal_ids = deque(maxlen=5)
+
+        # 1) Level gets cid X, then becomes undesired → cancelled → X goes terminal.
+        b.place_limit("SOL/USD", "buy", 90.0, 1.0, client_id="X", meta={"leverage": 1.0})
+        assert b.cancel("X") is True
+
+        # 2) A later rebuild re-creates the level and reuses X as a live resting sell.
+        b.place_limit("SOL/USD", "sell", 100.0, 1.0, client_id="X",
+                      meta={"bought_at": 90.0, "leverage": 1.0})
+
+        # 3) A full FIFO window of unrelated terminal orders churns through.
+        for i in range(12):
+            cid = f"c{i}"
+            b.place_limit("SOL/USD", "buy", 1.0, 1.0, client_id=cid, meta={"leverage": 1.0})
+            b.cancel(cid)
+
+        # X is still live and must be cancellable — the whole point of the SL/orphan
+        # cancel paths (#192 / #218 / #222 / #230) rely on this working.
+        assert "X" in b._open_orders
+        assert b.cancel("X") is True
+        assert b._orders["X"].status == "cancelled"
+        assert "X" not in b._open_orders
+        # And once retracted it must NOT fill on a later price cross.
+        assert b.update_price("SOL/USD", 101.0) == []
+
+    def test_retire_never_evicts_a_live_reused_cid(self):
+        """Directly exercise the _retire guard: force the pathological state where a
+        cid sits in the terminal FIFO while ALSO being open, then trip an eviction.
+        The live order must survive in ``_orders``."""
+        from collections import deque
+        b = self._broker()
+        b._terminal_ids = deque(maxlen=3)
+
+        # Live resting sell under cid X.
+        b.place_limit("SOL/USD", "sell", 100.0, 1.0, client_id="X",
+                      meta={"bought_at": 90.0, "leverage": 1.0})
+        # Simulate a stale terminal entry for the SAME cid still sitting in the FIFO
+        # (as it would before the place_limit cleanup, when a rebuild recycled it).
+        b._terminal_ids.appendleft("X")
+        b._terminal_set.add("X")
+
+        # Fill the FIFO and trip an overflow so X reaches the eviction slot.
+        for i in range(3):
+            cid = f"t{i}"
+            b.place_limit("SOL/USD", "buy", 1.0, 1.0, client_id=cid, meta={"leverage": 1.0})
+            b.cancel(cid)
+
+        # The live X order must NOT have been dropped from _orders.
+        assert "X" in b._open_orders
+        assert "X" in b._orders and b._orders["X"].status == "open"
+        assert b.cancel("X") is True
+
+    def test_cancel_falls_back_to_open_orders(self):
+        """Even if a queryability eviction has already removed a live cid from
+        ``_orders``, cancel() must still retract it via ``_open_orders`` so it
+        cannot fill again and double-credit (#192)."""
+        b = self._broker()
+        b.place_limit("SOL/USD", "sell", 100.0, 1.0, client_id="X",
+                      meta={"bought_at": 90.0, "leverage": 1.0})
+        # Simulate the #135 eviction having dropped the live order from _orders.
+        b._orders.pop("X", None)
+        assert "X" in b._open_orders  # still live and fillable
+
+        assert b.cancel("X") is True
+        assert b._open_orders == {}
+        # Retracted → a later cross must not produce a (double-crediting) fill.
+        assert b.update_price("SOL/USD", 101.0) == []
+
+
 class TestRemovePositionSingleLot:
     """#159: closing ONE grid lot (sell fill or stop-loss) must remove exactly
     that lot from the risk context, not the whole DCA cohort.
