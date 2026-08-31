@@ -145,4 +145,102 @@ eigenen Paritäts-Tests.
 
 ## Befunde
 
-_(wird nach den Läufen mit Datum angehängt — nicht rückwirkend editieren)_
+### 2026-08-31 — Refactor + Regressions-Check
+
+`scripts/trend_breakout_backtest.py` um `--side {long,short}`, `--as-of`,
+`--split-days`, `--leverage`, `--carry-daily`, Block-Bootstrap-CI und IS/OOS-Split
+nach `entry_ts` erweitert; `scripts/short_sleeve_portfolio.py` neu (H5b).
+
+**Regressions-Check** (`--side long --days 400 --leverage 3.0`): Trade-Zahlen exakt
+identisch zur alten Fassung (LB=20/3.0/J: 597 = 447 IS + 150 OOS; LB=55/4.0/J:
+319 = 247 + 72; LB=10/2.5/J: 886 = 653 + 233). Alte Fassung auf heutigen 400d-Daten:
+alle 6 Configs PF 0,44–0,71 (protokolliertes Band `PROGRESS.md` 0,46–0,74).
+→ Long-Pfad verhaltensidentisch, Refactor bestätigt.
+
+### 2026-08-31 — H5a Standalone-Short (vorregistrierter Lauf)
+
+`--side short --as-of 2026-07-22 --days 405 --split-days 300 --leverage 1.0
+--carry-daily 0.0 --bootstrap 10000 --block-days 21`
+
+Datenfenster je Symbol: 2025-07-22 → **2026-07-22 00:00:00+00:00** (8747 Kerzen,
+Vault unberührt). IS-dev bis 2026-05-18, OOS-dev 2026-05-18 → 2026-07-22.
+
+| Config | N_is | PF_is | N_oos | PF_oos | WR_oos | Ø-R | Tot% |
+|--------|------|-------|-------|--------|--------|-----|------|
+| **PRIMARY** LB=20/3.0/J | 536 | 0,75 | 119 | **0,52** | 33 % | −0,11 | −70,9 |
+| LB=20/3.0/N | 616 | 0,76 | 135 | 0,50 | 30 % | −0,12 | −81,6 |
+| LB=55/3.0/J | 359 | 0,76 | 79 | 0,64 | 41 % | −0,05 | −35,4 |
+| LB=20/4.0/J | 446 | 0,75 | 87 | 0,99 | 36 % | +0,24 | −1,4 |
+| LB=55/4.0/J | 306 | 0,71 | 58 | 1,23 | 36 % | +0,30 | +21,5 |
+| LB=10/2.5/J | 797 | 0,70 | 179 | 0,42 | 28 % | −0,13 | −111,9 |
+
+Primary-Config OOS-dev (N=119):
+- **Block-Bootstrap-CI (GATE): point −0,00596, [−0,01121, −0,00074]** — schließt 0
+  aus, **auf der NEGATIVEN Seite** (n_blocks=4). Der Sleeve verliert mit
+  statistischer Konfidenz.
+- i.i.d.-CI: [−0,00992, −0,00180] (etwas enger, wie erwartet).
+- Median-der-6 OOS-PF: 0,58. OOS-Drittel: [−, −, −] (3/3 qualifizierend, 0 positiv).
+
+**VERDICT H5a:** S1 PASS (lev 1×) · **S2 FAIL** (Block-CI schließt 0 aus, negativ) ·
+S3 PASS (N=119) · **S4 FAIL** (PF 0,52, alle Drittel negativ) · S5 hinfällig.
+**OVERALL: DEAD.**
+
+**Einordnung:** Bestätigt „zwei Seiten derselben Münze" aus
+`project_directional_disabled` — das Alt-Regime ist mean-reverting/choppy, also
+scheitert Donchian-Trend-Following in BEIDE Richtungen (long OOS-PF ~0,6–0,9, short
+OOS-PF 0,52). Die zwei Sekundär-Configs mit OOS-PF > 1 (LB=55/4.0, LB=20/4.0) sind
+der Max von 6 verrauschten Ziehungen bei N=58–87 — das LINK-Artefakt-Muster, per
+Pre-Registration nicht verwertbar.
+
+### 2026-08-31 — H5b Portfolio-Overlap
+
+`scripts/short_sleeve_portfolio.py --as-of 2026-07-22 --days 405 --split-days 300
+--leverage 1.0 --dd-threshold 0.05 --top-k 5`
+
+| Symbol | Grid return | Grid maxDD | Grid PF | Short-Trades |
+|--------|-------------|------------|---------|--------------|
+| SOL/USD | −2,1 % | **−2,7 %** | 0,27 | 133 |
+| ETH/USD | −0,4 % | −1,1 % | 0,82 | 115 |
+| AVAX/USD | −2,2 % | −2,4 % | 0,07 | 135 |
+| LINK/USD | −1,0 % | −1,9 % | 0,58 | 125 |
+| XRP/USD | −1,9 % | −1,9 % | 0,20 | 147 |
+
+- **P1: keine einzige Grid-Drawdown-Episode < −5 %** über alle 5 Symbole. Die
+  Grid-Equity ist im OOS-Fenster faktisch eingefroren (SOL: konstant 195,75 über
+  alle 1547 OOS-Punkte) — bei Lev 1× mit `ranging_gate` + `hard_trend_down` handelt
+  der Grid kaum, also gibt es keine Kaskade zu hedgen. **P1 GATE: FAIL** (nichts zu
+  messen).
+- **P2:** kombinierte OOS-Equity Grid+Sleeve vs. Grid-allein — der verlierende
+  Sleeve zieht die kombinierte Kurve in **allen 5** Symbolen um −5 % bis −22 %
+  runter. **P2 GATE: FAIL (0/5).**
+- **P3:** H5a ist DEAD (< break-even) → **FAIL**.
+
+**VERDICT H5b: DEAD** (P1 + P2 + P3 alle FAIL).
+
+**Zentraler Nebenbefund:** Die Payoff-Asymmetrie-„Floor-Kaskade", die diese
+Hypothese motiviert hat, ist ein **Leverage-Phänomen.** Bei echter Spot-Ökonomie
+(Lev 1×, Kill-Kriterium S1) zieht der Long-Grid nur −1 bis −3 % Drawdown und handelt
+kaum (Grid-Equity im OOS-Fenster faktisch eingefroren) — es gibt keinen
+Kaskaden-Verlust, den ein Short-Sleeve in Profit drehen könnte. Die −4,4 bis −4,8 %
+OOS-Verluste und −4,5 bis −6,4 % Drawdowns aus der Sweep-Historie waren durchweg
+Lev 3× — ein Regime, das das Forschungsprogramm als Nicht-Spot-Ökonomie ablehnt.
+Ein Lev-3×-Kontrolllauf würde also nur eine Asymmetrie hedgen, die es bei ehrlicher
+Ökonomie nicht gibt; er ist für das Urteil nicht nötig und wurde abgebrochen.
+
+## Gesamtfazit Phase 5
+
+**H5a und H5b sind beide tot.** Short-Trend-Following (Donchian-Breakdown +
+Chandelier) hat bei echter Spot-Ökonomie eine OOS-Per-Trade-Expectancy, deren
+21-Tage-Block-Bootstrap-CI die Null **auf der negativen Seite** ausschließt — der
+Sleeve verliert mit statistischer Konfidenz, nicht bloß „im Rauschen". Das bestätigt
+`project_directional_disabled`: das Alt-Regime ist mean-reverting/choppy, Breakout-
+Trend-Following scheitert in BEIDE Richtungen. Der Portfolio-Hedge-Gedanke bricht
+zusätzlich daran, dass die Grid-Verlust-Kaskade ein Leverage-Artefakt ist und bei
+Lev 1× gar nicht auftritt.
+
+OOS-dev-Fenster (2026-05-18 → 2026-07-22) gilt für diese Hypothesen als
+**verbraucht**. Vault (`>= 2026-07-23`) bleibt unberührt.
+
+**Letzter unberührter Hebel mit plausiblem Mechanismus:** echtes Market-Making
+(dreht das Vorzeichen der Kostenseite) — braucht L2-Orderbuch-Daten und ein eigenes
+Pre-Reg. **Nicht** verfolgt ohne separate Entscheidung.
