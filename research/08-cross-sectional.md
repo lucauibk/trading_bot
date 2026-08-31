@@ -162,8 +162,43 @@ L=4W schwach. Der Trend-Switch saß 2026 fast durchgehend in USDT (MaxDD −0,1 
     hoch, nicht Rendite hoch,
   - mit 500 USDT trivial umsetzbar (1 Asset, wenige Trades/Jahr, Fee-irrelevant).
 
-**Nächste Schritte (falls gewünscht):** (a) PIT-Universum für H8a (CoinGecko
-historische Market-Caps, rate-limited, eigenes Skript) — der ehrliche Test.
-(b) H8b als Paper-Overlay auf einer kleinen Long-BTC/ETH-Position, 3–6 Monate
-Forward, gegen Buy-and-Hold. Kein Grid, kein Directional.
+### 2026-08-31 — Point-in-time-Universum-Nachtest H8a (`scripts/cs_momentum_pit.py`)
+
+Universum nach Market-Cap-Proxy (aktuelle circ. Menge × historischer Preis;
+Supply-Match für 48/57 Coins). Residual-Bias benannt: Supply-Proxy überschätzt
+frühe Mcap emissionsstarker Coins; komplett von Binance delistete Coins fehlen
+weiter. Drei Universums-Definitionen, jeweils CS-Mom L=4/8/12W Q, Fees identisch.
+
+| Universum | Dev-Ergebnis | Isoliertes Vault 2026 |
+|-----------|--------------|------------------------|
+| **[1] DYN top-30** (jedes Rebalance top-30 nach Mcap-Proxy) | L=8W +59 % Δsh +0,29 **PASS**, L=12W +49 % Δsh +0,21 **PASS**, L=4W fail → M5 **PASS (2/3)** | **L=4W −69 %, L=8W −45 %, L=12W −45 %** — alle stark negativ |
+| **[2] DYN top-15** (large-cap, kleinster Bias) | L=4W +Δsh −0,44, L=8W +4 % Δsh −0,26, L=12W Δsh −0,44 → M5 **FAIL (0/3)** | −22 bis −65 % |
+| **[3] FROZEN top-30** (fix per 2022-07, = 4-Jahre-Überlebende) | L=8W +65 % **PASS**, L=12W +63 % **PASS** → M5 **PASS (2/3)** | L=8W +52 %, L=12W +69 % |
+
+### VERDICT H8a nach PIT-Test: **TOT**
+
+Drei sich widersprechende Bilder — und die Widersprüche sind selbst die Antwort:
+
+1. **Large-Cap (top-15) hat KEINEN Edge** — versagt in Dev *und* Vault (L=8W +4 %
+   vs BTC +24 %). Der scheinbare Momentum-Effekt lebt komplett im Small/Mid-Cap-
+   Schwanz — genau dort, wo Survivorship/Delisting-Loch am größten und der
+   Supply-Proxy am unzuverlässigsten ist.
+2. **DYN top-30** (methodisch am nächsten an echtem point-in-time): besteht Dev,
+   aber der Edge **kehrt sich im Vault brutal um (−45 %)**. Das ist das Gegenteil
+   einer Validierung — Momentum-Crash im choppy 2026-Alt-Markt (kauft den Pump,
+   frisst den Dump).
+3. **FROZEN top-30** sieht in Dev *und* Vault gut aus — ist aber per Konstruktion
+   die Menge der Coins, die 4 Jahre überlebt haben. Der Vault-„Erfolg" ist ein
+   Survivorship-Artefakt, kein Edge.
+
+**Der eine handelbare, saubere Befund: kein Edge in Large-Caps; im Tail
+universums-abhängig und OOS-umkehrend.** H8a ist damit stärker widerlegt als nach
+dem Dev-Gate allein — jetzt mit OOS-Umkehr-Evidenz, nicht nur Rosinenpickerei.
+**Kein point-in-time-Live-Test gerechtfertigt.**
+
+### Verbleibt aus Phase 8
+
+Nur **H8b (BTC 200D-SMA-Trend-Switch)** — Dev PASS, Vault bestätigt, kein Alpha
+sondern Drawdown-Overlay. Nächster Schritt: Paper-Overlay-Ledger, forward vs
+Buy-and-Hold (`scripts/trend_overlay_paper.py`).
 
