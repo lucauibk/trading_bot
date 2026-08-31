@@ -242,7 +242,14 @@ def main():
                          "Portfolio-Ø aus research/04: -0.00003.")
     ap.add_argument("--bootstrap", type=int, default=10000)
     ap.add_argument("--block-days", type=int, default=21)
+    ap.add_argument("--fee", type=float, default=None,
+                    help="Überschreibt FEE (0.0016). --fee 0 = Brutto-Test ohne Gebühren.")
     args = ap.parse_args()
+
+    global FEE
+    if args.fee is not None:
+        FEE = args.fee
+        logger.info("FEE überschrieben → %.4f", FEE)
 
     as_of_ts = None
     if args.as_of:

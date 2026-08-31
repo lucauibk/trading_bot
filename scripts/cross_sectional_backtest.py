@@ -176,7 +176,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vault", action="store_true")
     ap.add_argument("--refetch", action="store_true")
+    ap.add_argument("--fee", type=float, default=None,
+                    help="Überschreibt FEE_PER_SIDE (0.0015). --fee 0 = Brutto-Test.")
     args = ap.parse_args()
+
+    global FEE_PER_SIDE
+    if args.fee is not None:
+        FEE_PER_SIDE = args.fee
+        log.info("FEE_PER_SIDE überschrieben → %.4f", FEE_PER_SIDE)
 
     px = load_data(force=args.refetch)
     px = px.dropna(axis=1, thresh=MIN_DAYS)
