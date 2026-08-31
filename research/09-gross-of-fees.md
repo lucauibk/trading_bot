@@ -52,3 +52,44 @@ wurde in 9 Phasen nicht gefunden.
 Für **500 € auf öffentlichen Daten** gibt es keine Zutaten-Kombination mit
 positiver Erwartung. Das ist jetzt empirisch (Brutto-Test), nicht nur strukturell
 argumentiert.
+
+---
+
+## Nachtrag 2026-08-31 — die zwei noch offenen Zweige zu Ende getestet
+
+### Zweig „mehr Kapital": Funding-Carry mit Budget (`scripts/funding_carry_scale.py`)
+
+Delta-neutral long Spot / short Perp, **900 Tage** (2,5 Jahre), Majors + liquide
+Alts, Low-Fee-Venue-Annahme (Round-Trip 0,14 %). Always-on-Hedge.
+
+| Sym | netto Funding 900d | annualisiert | neg. 8h-Perioden | maxDD (Funding-Leg) |
+|-----|--------------------|--------------|-------------------|----------------------|
+| BTC | +14,3 % | **+5,6 %** | 16 % | −0,4 % |
+| ETH | +14,4 % | +5,6 % | 17 % | −0,6 % |
+| LINK | +16,4 % | +6,3 % | 18 % | −0,2 % |
+| DOGE | +14,5 % | +5,6 % | 24 % | −0,5 % |
+| XRP | +11,6 % | +4,6 % | 29 % | −1,2 % |
+| SOL | +7,1 % | +2,8 % | 34 % | −2,6 % |
+| AVAX | +5,2 % | +2,1 % | 35 % | −2,4 % |
+| BNB | −0,6 % | −0,2 % | 13 % | −3,7 % |
+| **Portfolio (gleichgewichtet)** | | **+4,0 %/Jahr** | | |
+
+**Anders als der 180-Tage-Test (`research/04`: −0,54 %) ist die Carry über 2,5 Jahre
+universumsweit positiv** (7/8 Coins) — Fenster fing eine funding-positive Phase.
+**Aber:** ~4 %/Jahr Portfolio-Carry ist ungefähr Stablecoin-Lending-Niveau, mit
+deutlich mehr operativer Komplexität. Und die niedrige „maxDD" hier misst NUR die
+Funding-Zahlungen — die echten Risiken (Basis-Blowout / Short-Leg-Liquidation im
+Bull, Venue-Solvenz, Rebalance-Slippage, volatiles Collateral mit Margin-Management)
+stehen nicht in dieser Zahl. Regime-abhängig: über einen vollen Zyklus inkl. 2022er
+Bär eher 2–6 %.
+
+**Urteil Zweig „mehr Kapital":** eine **echte, aber dünne Risikoprämie** — ~2–6 %/Jahr
+bei $10–20k = $200–1200/Jahr brutto der obigen Risiken. Über Sparkonto, aber knapp,
+und kein Weg zu „spürbarem monatlichem Einkommen". Kein Backtesting-Problem mehr —
+eine Kapital- + Risiko-Toleranz-Entscheidung.
+
+### Zweig „alle Grid-Parameter": breiter Sweep bei FEE=0
+
+`scratchpad/grid_wide_gross.py` — 36 Configs (min_step_fee_multiple × levels ×
+sl_mode × leverage), FEE=0, IS (erste ~62 %) / OOS-Split, 5 Symbole.
+_(Ergebnis folgt.)_
