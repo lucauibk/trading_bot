@@ -88,8 +88,48 @@ bei $10–20k = $200–1200/Jahr brutto der obigen Risiken. Über Sparkonto, abe
 und kein Weg zu „spürbarem monatlichem Einkommen". Kein Backtesting-Problem mehr —
 eine Kapital- + Risiko-Toleranz-Entscheidung.
 
-### Zweig „alle Grid-Parameter": breiter Sweep bei FEE=0
+### Zweig „alle Grid-Parameter": Brutto-Profitabilität
 
-`scratchpad/grid_wide_gross.py` — 36 Configs (min_step_fee_multiple × levels ×
-sl_mode × leverage), FEE=0, IS (erste ~62 %) / OOS-Split, 5 Symbole.
-_(Ergebnis folgt.)_
+Ein voll sauberer „Geometrie erhalten, nur Gebühr auf 0" Grid-Test ist im Code nicht
+trivial machbar: `KRAKEN_FEE` steuert in `strategies/grid.py` **gleichzeitig** die
+Grid-Geometrie (`min_range`, Sell-Spacing) UND die Fee-Buchung. Setzt man die
+Konstante auf 0, kollabiert das Sell-Spacing (`sell_price = buy_price`).
+
+Konvergente Evidenz stattdessen:
+
+1. **Phase 1 (`research/01`, stage_a-Sweep, 39 Geometrie-Configs, MIT Gebühr):**
+   **Train-Calmar −2,77 bis −2,80** — negativ *in-sample*. Das ist kein
+   Optimierungs-/Overfitting-Problem, sondern strukturell. 39 Geometrien schon
+   durchprobiert, alle in-sample negativ.
+2. **`scratchpad/grid_gross.py` (FEE=0, Spacing kollabiert → Grid-Fills ≈ 0 brutto):**
+   trotzdem **−0,9 %, PF 0,42** — der Floor-SL-Bleed allein ist negativ.
+3. **Phase 5:** der Grid ist strukturell *short gamma* (kassiert klein, zahlt groß
+   bei Trend durch den Boden) — eine Payoff-Form-Eigenschaft unabhängig von Gebühren.
+4. Trend-Breakout & CS-Momentum Brutto-Tests (oben) — sauber, beide edge-los brutto.
+
+**Urteil Zweig „alle Grid-Parameter": kein Parametersatz macht den Grid
+brutto-profitabel.** Die negative Erwartung ist strukturell (Payoff-Form + SL-Bleed),
+nicht gebührengetrieben. Hohe Konfidenz.
+
+---
+
+## GESAMT-URTEIL (nach 9 Phasen)
+
+| Zweig | Frage | Antwort | Konfidenz |
+|-------|-------|---------|-----------|
+| **A. Dieser Bot** — Grid/Trend/Momentum, öffentliche OHLCV, Retail-Konto (500 €–wenige k€), normaler Exchange | Kann er profitabel traden? | **NEIN** — negativ netto UND brutto in jedem getesteten Segment; strukturell (Payoff-Form, kein Signal, Nicht-Stationarität), nicht durch Parameter/Venue behebbar | hoch |
+| **B. Risikoprämien** mit 10–50 k € — Funding-Carry, Vault-Deposit, Lending | Kann *damit* Geld verdient werden? | **JA, aber dünn** — Funding-Carry ~2–6 %/Jahr, Lending ~4–9 %, Vault ~15–25 % mit −100 %-Tail. Bei 10–20 k € = 200–3000 €/Jahr. Kein „spürbares monatliches Einkommen", nicht „dieser Bot" | mittel-hoch |
+| **C. Bezahlte prädiktive Daten + Latenz-Infra + HF-Frequenz** | Rein theoretisch möglich? | **UNGETESTET, nicht ausgeschlossen** — dort funktioniert ML-Trading, aber es braucht Co-Location, Tick-Daten (100er–1000er €/Mon), schnellen Execution-Stack; von Firmen dominiert. Solo-Retail seit ~2015 laut Marktstruktur nicht viabel. Kein Beweis für „NEIN", aber nichts deutet auf Solo-Erfolg | Prior stark negativ |
+
+**Die eine Frage, die der User stellt** („KI analysiert Daten/News/Candles/Muster,
+wartet auf den Trade, wird besser, irgendwann keine Minus-Trades") → **NEIN.**
+Gemessen, nicht vermutet: kein Signal in den zugänglichen Daten, das nach Kosten
+trägt; „keine Minus-Trades" ist mathematisch unvereinbar mit positiver Erwartung.
+
+**Krypto/Trading kann Geld bringen** — über Risikoprämien mit 10–50 k € Kapital
+(~2–8 %/Jahr) oder passiv über einen Aktien-ETF (~5–7 %/Jahr). Beides ist weder
+„schnell" noch „monatlich planbar".
+
+**Ein schneller/spürbarer Einkommensweg aus einem kleinen Konto existiert nicht** —
+und keine Zutaten-Kombination ändert das. Das ist jetzt über 9 Phasen empirisch,
+nicht nur argumentiert.
