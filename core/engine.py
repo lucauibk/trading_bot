@@ -105,6 +105,25 @@ class Engine:
 
         self.strategy.init(self.symbols, self.ctx)
 
+        # #239: restore the per-coin accounting counters (total_profit /
+        # trade_count / compounded investment) that drive the per-coin emergency
+        # stop and compounding. strategy.init() rebuilds every _GridState fresh
+        # (total_profit=0), which would silently re-arm the kill switch to allow
+        # another full EMERGENCY_STOP_PCT of loss on every restart. The realized
+        # loss itself already persists via the paper cash bucket, so we only
+        # restore the counter that measures it. Paper only (self.reconciler is
+        # None ⟺ paper; live accounting comes from the exchange).
+        if self.reconciler is None and hasattr(self.strategy, "restore_paper_state"):
+            try:
+                from dashboard.db import load_grid_states
+                saved = load_grid_states()
+                if saved:
+                    n = self.strategy.restore_paper_state(saved)
+                    logger.info("Engine: restored per-coin state for %d/%d symbols",
+                                n, len(self.symbols))
+            except Exception as e:
+                logger.debug("per-coin state restore skipped: %s", e)
+
         # Initialise equity so daily-drawdown brake has a valid baseline
         if self._initial_capital > 0:
             self.ctx.set_equity(self._initial_capital)

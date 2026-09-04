@@ -191,6 +191,57 @@ class GridStrategy(Strategy):
 
         logger.info("GridStrategy initialized for %d symbols", len(symbols))
 
+    def restore_paper_state(self, saved: dict) -> int:
+        """Restore per-coin accounting (total_profit / trade_count / compounded
+        investment) from persisted `grid_state` rows after a (paper) restart.
+
+        Without this, `_GridState.__init__` resets `total_profit` to 0.0 on every
+        start, which silently disarms the per-coin emergency stop (#239): a coin
+        that had already realized e.g. -11% would resume with its loss counter at
+        0 and be allowed to lose a further EMERGENCY_STOP_PCT before the kill
+        switch re-engages. The realized loss itself already survives via the
+        persisted cash bucket (`load_paper_balances`), so only the counter that
+        measures it against the threshold was being forgotten.
+
+        `investment` is restored to its (possibly compounded) value so the
+        emergency threshold `investment * EMERGENCY_STOP_PCT` stays faithful to
+        the pre-restart state. To avoid re-compounding already-compounded profit,
+        `_compounded_profit` / `_last_compound_at` are marked as caught up to the
+        restored values; only *future* gains compound further. `_initial_investment`
+        stays at the config value so the MAX_INVESTMENT_MULT cap is unchanged.
+
+        Returns the number of symbols actually restored.
+        """
+        if not saved:
+            return 0
+        restored = 0
+        for sym, vals in saved.items():
+            state = self._states.get(sym)
+            if state is None:
+                continue
+            try:
+                inv = float(vals["investment"])
+                tp = float(vals["total_profit"])
+                tc = int(vals["trade_count"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if inv <= 0:
+                continue
+            state.investment = inv
+            state.total_profit = tp
+            state.trade_count = tc
+            state.usdt_per_grid = inv / max(state.levels, 1)
+            # Mark compounding as already caught up so persisted profit is not
+            # compounded a second time on top of the already-compounded investment.
+            state._compounded_profit = tp
+            state._last_compound_at = tc
+            restored += 1
+            logger.info(
+                "[RESTORE] %s total_profit=%.2f trade_count=%d investment=%.2f",
+                sym, tp, tc, inv,
+            )
+        return restored
+
     def on_candle(self, symbol: str, df: pd.DataFrame, ctx: MarketContext) -> None:
         state = self._states.get(symbol)
         if not state:

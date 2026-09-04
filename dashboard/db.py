@@ -608,6 +608,41 @@ def load_paper_balances():
     return None
 
 
+def load_grid_states():
+    """Return the last-persisted per-coin accounting fields, keyed by symbol.
+
+    Used on (paper) restart to restore the in-memory per-coin state that the
+    emergency-stop and compounding logic rely on. The `grid_state` row is
+    upserted from `state.total_profit` / `state.trade_count` / `state.investment`
+    every tick (see `update_grid_state`), so this is an exact round-trip of the
+    values that would otherwise reset to 0 on process start (#239).
+
+    Returns {symbol: {"investment": float, "total_profit": float,
+    "trade_count": int}} for rows with a positive investment, or None if the
+    table is empty / unavailable.
+    """
+    con = get_conn()
+    try:
+        rows = con.execute(
+            "SELECT symbol, investment, total_profit, trade_count FROM grid_state"
+        ).fetchall()
+    except Exception:
+        return None
+    finally:
+        con.close()
+    out = {}
+    for r in rows or []:
+        inv = r["investment"]
+        if inv is None or inv <= 0:
+            continue
+        out[r["symbol"]] = {
+            "investment": float(inv),
+            "total_profit": float(r["total_profit"] or 0.0),
+            "trade_count": int(r["trade_count"] or 0),
+        }
+    return out or None
+
+
 def update_mtf_state(symbol: str, bias: dict, setup: dict = None):
     """UPSERT den aktuellen MTF-Status (Bias + optionale Retest-Zone) für ein Symbol."""
     from datetime import datetime
