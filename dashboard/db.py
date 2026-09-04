@@ -520,6 +520,13 @@ def set_initial_capital(value: float) -> bool:
             "UPDATE bot_status SET initial_capital=?, paper_balances=NULL WHERE id=1",
             (value,),
         )
+        # #239: the per-coin accounting persisted in grid_state (total_profit /
+        # trade_count / compounded investment) is now restored on restart to keep
+        # the per-coin emergency stop armed. It must reset together with the cash
+        # buckets on a real capital change — otherwise the next fresh-capital start
+        # would reinstate a stale loss counter (and a stale compounded investment)
+        # onto a brand-new account. Rows are recreated per-tick on the next start.
+        con.execute("DELETE FROM grid_state")
     else:
         con.execute("UPDATE bot_status SET initial_capital=? WHERE id=1", (value,))
     con.commit()
@@ -606,6 +613,41 @@ def load_paper_balances():
     if row and row["paper_balances"]:
         return json.loads(row["paper_balances"])
     return None
+
+
+def load_grid_states():
+    """Return the last-persisted per-coin accounting fields, keyed by symbol.
+
+    Used on (paper) restart to restore the in-memory per-coin state that the
+    emergency-stop and compounding logic rely on. The `grid_state` row is
+    upserted from `state.total_profit` / `state.trade_count` / `state.investment`
+    every tick (see `update_grid_state`), so this is an exact round-trip of the
+    values that would otherwise reset to 0 on process start (#239).
+
+    Returns {symbol: {"investment": float, "total_profit": float,
+    "trade_count": int}} for rows with a positive investment, or None if the
+    table is empty / unavailable.
+    """
+    con = get_conn()
+    try:
+        rows = con.execute(
+            "SELECT symbol, investment, total_profit, trade_count FROM grid_state"
+        ).fetchall()
+    except Exception:
+        return None
+    finally:
+        con.close()
+    out = {}
+    for r in rows or []:
+        inv = r["investment"]
+        if inv is None or inv <= 0:
+            continue
+        out[r["symbol"]] = {
+            "investment": float(inv),
+            "total_profit": float(r["total_profit"] or 0.0),
+            "trade_count": int(r["trade_count"] or 0),
+        }
+    return out or None
 
 
 def update_mtf_state(symbol: str, bias: dict, setup: dict = None):
