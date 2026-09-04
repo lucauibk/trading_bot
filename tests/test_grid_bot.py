@@ -3790,3 +3790,30 @@ class TestLoadGridStatesDB:
             range_pct=0.05, investment=0.0,
             total_profit=-5.0, trade_count=2, prediction="neutral")
         assert db.load_grid_states() is None
+
+    def test_real_capital_change_clears_grid_state(self, monkeypatch, tmp_path):
+        # #239: a real capital change resets the cash buckets (paper_balances=NULL);
+        # the per-coin accounting must reset with them so restart does not restore a
+        # stale loss counter onto a fresh account.
+        db = self._db(monkeypatch, tmp_path)
+        db.set_initial_capital(1000.0)
+        db.update_grid_state(
+            "SOL/USD", current_price=100.0, orders={},
+            range_pct=0.05, investment=150.0,
+            total_profit=-11.0, trade_count=7, prediction="neutral")
+        assert db.load_grid_states() is not None  # persisted while unchanged
+        changed = db.set_initial_capital(2000.0)  # real change
+        assert changed is True
+        assert db.load_grid_states() is None       # per-coin state wiped
+
+    def test_unchanged_capital_keeps_grid_state(self, monkeypatch, tmp_path):
+        db = self._db(monkeypatch, tmp_path)
+        db.set_initial_capital(1000.0)
+        db.update_grid_state(
+            "SOL/USD", current_price=100.0, orders={},
+            range_pct=0.05, investment=150.0,
+            total_profit=-11.0, trade_count=7, prediction="neutral")
+        changed = db.set_initial_capital(1000.0)  # same value → no reset
+        assert changed is False
+        saved = db.load_grid_states()
+        assert saved is not None and saved["SOL/USD"]["total_profit"] == pytest.approx(-11.0)

@@ -520,6 +520,13 @@ def set_initial_capital(value: float) -> bool:
             "UPDATE bot_status SET initial_capital=?, paper_balances=NULL WHERE id=1",
             (value,),
         )
+        # #239: the per-coin accounting persisted in grid_state (total_profit /
+        # trade_count / compounded investment) is now restored on restart to keep
+        # the per-coin emergency stop armed. It must reset together with the cash
+        # buckets on a real capital change — otherwise the next fresh-capital start
+        # would reinstate a stale loss counter (and a stale compounded investment)
+        # onto a brand-new account. Rows are recreated per-tick on the next start.
+        con.execute("DELETE FROM grid_state")
     else:
         con.execute("UPDATE bot_status SET initial_capital=? WHERE id=1", (value,))
     con.commit()
