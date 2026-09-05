@@ -3677,3 +3677,143 @@ class TestRemovePositionSingleLot:
             "a stop-loss on one lot must not wipe the whole cohort (#159)"
         remaining = ctx.get_positions("SOL/USD")
         assert len(remaining) == 1 and remaining[0].entry_price == pytest.approx(98.0)
+
+
+# ── Per-coin state persistence across restart (#239) ──────────────────────────
+
+class TestPerCoinStateRestore:
+    """The per-coin emergency stop reads state.total_profit, which is rebuilt to
+    0.0 on every process start. Without restoring it, a coin that had already
+    realized a near-cap loss resumes with its loss counter at 0 and may lose a
+    further EMERGENCY_STOP_PCT before the kill switch re-engages (#239). The
+    realized loss itself already survives via the persisted cash bucket, so only
+    the counter that measures it against the threshold needs restoring.
+    """
+
+    def _fresh_strategy(self, monkeypatch):
+        from strategies.grid import GridStrategy
+        from strategies.grid_params import GridParams
+        from core.context import MarketContext
+        monkeypatch.setenv("GRIDBOT_BACKTEST", "1")  # skip dashboard logging
+        strat = GridStrategy(
+            [{"symbol": "SOL/USD", "investment": 100.0, "levels": 5}],
+            ml_enabled=False,
+            params=GridParams(leverage=1.0),
+        )
+        strat.init(["SOL/USD"], MarketContext())
+        return strat
+
+    def test_init_alone_resets_counter(self, monkeypatch):
+        # Baseline: init() rebuilds state fresh — this is exactly the bug surface.
+        strat = self._fresh_strategy(monkeypatch)
+        assert strat._states["SOL/USD"].total_profit == 0.0
+
+    def test_restore_reinstates_loss_counter(self, monkeypatch):
+        strat = self._fresh_strategy(monkeypatch)
+        saved = {"SOL/USD": {"investment": 100.0,
+                             "total_profit": -11.0, "trade_count": 7}}
+        n = strat.restore_paper_state(saved)
+        state = strat._states["SOL/USD"]
+        assert n == 1
+        assert state.total_profit == -11.0
+        assert state.trade_count == 7
+        assert state.investment == 100.0
+        assert state.usdt_per_grid == pytest.approx(100.0 / 5)
+
+    def test_restored_counter_trips_emergency_stop(self, monkeypatch):
+        # After restore the engine gate `total_profit <= -(investment*0.12)` must
+        # see the persisted near-cap loss. -13 <= -(100*0.12)=-12 → stopped.
+        from core.engine import EMERGENCY_STOP_PCT
+        strat = self._fresh_strategy(monkeypatch)
+        strat.restore_paper_state(
+            {"SOL/USD": {"investment": 100.0,
+                         "total_profit": -13.0, "trade_count": 4}})
+        state = strat._states["SOL/USD"]
+        assert state.total_profit <= -(state.investment * EMERGENCY_STOP_PCT)
+
+    def test_restore_does_not_double_compound(self, monkeypatch):
+        # Restored `investment` already reflects past compounding; the persisted
+        # profit must not be compounded a second time on the next _compound().
+        strat = self._fresh_strategy(monkeypatch)
+        strat.restore_paper_state(
+            {"SOL/USD": {"investment": 150.0,
+                         "total_profit": 60.0, "trade_count": 9}})
+        state = strat._states["SOL/USD"]
+        inv_before = state.investment
+        strat._maybe_compound(150.0, state)  # trades_since 9-9=0 → no compound
+        assert state.investment == inv_before
+        assert state._compounded_profit == 60.0
+        assert state._last_compound_at == 9
+
+    def test_restore_ignores_unknown_or_zero_investment(self, monkeypatch):
+        strat = self._fresh_strategy(monkeypatch)
+        n = strat.restore_paper_state({
+            "SOL/USD": {"investment": 0.0, "total_profit": -5.0, "trade_count": 2},
+            "ETH/USD": {"investment": 40.0, "total_profit": -3.0, "trade_count": 1},
+        })
+        # ETH not in _states (not configured) → skipped; SOL has inv<=0 → skipped.
+        assert n == 0
+        assert strat._states["SOL/USD"].total_profit == 0.0
+
+    def test_restore_empty_is_noop(self, monkeypatch):
+        strat = self._fresh_strategy(monkeypatch)
+        assert strat.restore_paper_state(None) == 0
+        assert strat.restore_paper_state({}) == 0
+
+
+class TestLoadGridStatesDB:
+    """load_grid_states() must round-trip exactly what update_grid_state wrote,
+    and skip rows with non-positive investment."""
+
+    def _db(self, monkeypatch, tmp_path):
+        from pathlib import Path
+        import dashboard.db as db
+        monkeypatch.setattr(db, "DB_PATH", Path(tmp_path) / "trades.db")
+        return db  # get_conn() auto-creates the schema via _init()
+
+    def test_roundtrip(self, monkeypatch, tmp_path):
+        db = self._db(monkeypatch, tmp_path)
+        db.update_grid_state(
+            "SOL/USD", current_price=100.0, orders={},
+            range_pct=0.05, investment=150.0,
+            total_profit=-11.5, trade_count=7, prediction="neutral")
+        saved = db.load_grid_states()
+        assert saved is not None
+        assert saved["SOL/USD"]["total_profit"] == pytest.approx(-11.5)
+        assert saved["SOL/USD"]["trade_count"] == 7
+        assert saved["SOL/USD"]["investment"] == pytest.approx(150.0)
+
+    def test_nonpositive_investment_skipped(self, monkeypatch, tmp_path):
+        db = self._db(monkeypatch, tmp_path)
+        db.update_grid_state(
+            "SOL/USD", current_price=100.0, orders={},
+            range_pct=0.05, investment=0.0,
+            total_profit=-5.0, trade_count=2, prediction="neutral")
+        assert db.load_grid_states() is None
+
+    def test_real_capital_change_clears_grid_state(self, monkeypatch, tmp_path):
+        # #239: a real capital change resets the cash buckets (paper_balances=NULL);
+        # the per-coin accounting must reset with them so restart does not restore a
+        # stale loss counter onto a fresh account.
+        db = self._db(monkeypatch, tmp_path)
+        db.set_initial_capital(1000.0)
+        db.update_grid_state(
+            "SOL/USD", current_price=100.0, orders={},
+            range_pct=0.05, investment=150.0,
+            total_profit=-11.0, trade_count=7, prediction="neutral")
+        assert db.load_grid_states() is not None  # persisted while unchanged
+        changed = db.set_initial_capital(2000.0)  # real change
+        assert changed is True
+        assert db.load_grid_states() is None       # per-coin state wiped
+
+    def test_unchanged_capital_keeps_grid_state(self, monkeypatch, tmp_path):
+        db = self._db(monkeypatch, tmp_path)
+        db.set_initial_capital(1000.0)
+        db.update_grid_state(
+            "SOL/USD", current_price=100.0, orders={},
+            range_pct=0.05, investment=150.0,
+            total_profit=-11.0, trade_count=7, prediction="neutral")
+        changed = db.set_initial_capital(1000.0)  # same value → no reset
+        assert changed is False
+        saved = db.load_grid_states()
+        assert saved is not None and saved["SOL/USD"]["total_profit"] == pytest.approx(-11.0)
