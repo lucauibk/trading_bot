@@ -233,7 +233,12 @@ class GridStrategy(Strategy):
             state.usdt_per_grid = inv / max(state.levels, 1)
             # Mark compounding as already caught up so persisted profit is not
             # compounded a second time on top of the already-compounded investment.
-            state._compounded_profit = tp
+            # The base must be the profit already *folded into* `investment`
+            # (= investment - initial), NOT the current total_profit (#241).
+            # Using total_profit over-compounds an underwater coin on recovery
+            # (a prior loss is re-counted as compoundable gain) and under-compounds
+            # a coin whose gain has drifted past the last compound boundary.
+            state._compounded_profit = max(0.0, inv - state._initial_investment)
             state._last_compound_at = tc
             restored += 1
             logger.info(

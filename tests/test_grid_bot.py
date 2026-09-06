@@ -3734,6 +3734,9 @@ class TestPerCoinStateRestore:
     def test_restore_does_not_double_compound(self, monkeypatch):
         # Restored `investment` already reflects past compounding; the persisted
         # profit must not be compounded a second time on the next _compound().
+        # The compound base is the profit already folded into `investment`
+        # (= investment - initial = 150 - 100 = 50), NOT total_profit (#241).
+        # The 10 of total_profit not yet folded (60 - 50) stays compoundable.
         strat = self._fresh_strategy(monkeypatch)
         strat.restore_paper_state(
             {"SOL/USD": {"investment": 150.0,
@@ -3742,8 +3745,27 @@ class TestPerCoinStateRestore:
         inv_before = state.investment
         strat._maybe_compound(150.0, state)  # trades_since 9-9=0 → no compound
         assert state.investment == inv_before
-        assert state._compounded_profit == 60.0
+        assert state._compounded_profit == 50.0
         assert state._last_compound_at == 9
+
+    def test_restore_underwater_does_not_over_compound(self, monkeypatch):
+        # #241: a coin that restarts underwater (never compounded, investment ==
+        # initial, total_profit < 0) must NOT treat the prior loss as compoundable
+        # gain on recovery. Base must be 0, so only the *real* recovered profit
+        # compounds — exactly as if no restart had happened.
+        from strategies.grid import COMPOUND_EVERY_TRADES
+        strat = self._fresh_strategy(monkeypatch)
+        strat.restore_paper_state(
+            {"SOL/USD": {"investment": 100.0,
+                         "total_profit": -30.0, "trade_count": 20}})
+        state = strat._states["SOL/USD"]
+        assert state._compounded_profit == 0.0  # not -30.0
+        # Coin recovers to +15 after a few more trades → compound the real +15 only.
+        state.total_profit = 15.0
+        state.trade_count = 20 + COMPOUND_EVERY_TRADES
+        strat._maybe_compound(100.0, state)
+        # delta = 15 - 0 = 15 → investment = 100 + 15 = 115 (NOT 100 + 45 = 145).
+        assert state.investment == pytest.approx(115.0)
 
     def test_restore_ignores_unknown_or_zero_investment(self, monkeypatch):
         strat = self._fresh_strategy(monkeypatch)
