@@ -30,6 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
+(ROOT / "logs").mkdir(parents=True, exist_ok=True)  # FileHandler can't create it
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [nightly_tune] %(message)s",
