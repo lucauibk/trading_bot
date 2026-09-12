@@ -348,12 +348,20 @@ class TestSweepCLI:
     def test_parser_accepts_symbol(self):
         """Regression for #101: nightly_tune passes --symbol; sweep.py's parser must
         accept it (previously it aborted with SystemExit(2), killing every nightly
-        sweep)."""
+        sweep). Since #201 --symbol is repeatable, so it collects into a list."""
         from scripts.sweep import build_parser
         args = build_parser().parse_args(
             ["--symbol", "SOL/USD", "--days", "180", "--train-days", "120", "--jobs", "4"])
-        assert args.symbol == "SOL/USD"
+        assert args.symbol == ["SOL/USD"]
         assert args.days == 180 and args.train_days == 120 and args.jobs == 4
+
+    def test_parser_accepts_multiple_symbols(self):
+        """Regression for #201: a single invocation must be able to carry the whole
+        active-symbol set so the cross-symbol min-trades aggregation is meaningful."""
+        from scripts.sweep import build_parser
+        args = build_parser().parse_args(
+            ["--symbol", "SOL/USD", "--symbol", "ETH/USD", "--symbol", "XRP/USD"])
+        assert args.symbol == ["SOL/USD", "ETH/USD", "XRP/USD"]
 
     def test_parser_symbol_optional(self):
         from scripts.sweep import build_parser
@@ -380,6 +388,60 @@ class TestSweepCLI:
         monkeypatch.setattr(bt, "run_backtest", fake_run_backtest)
         optimize.cmd_run_sweep("SOL/USD")
         assert captured["ml_enabled"] is False
+
+
+class TestNightlyRunSweep:
+    """Regression for #201: nightly_tune.run_sweep looped one --symbol call per coin,
+    but sweep.py's min-trades gate aggregates across the symbols of a single call, so
+    a per-coin call could never clear it — the nightly sweep report was structurally
+    always empty. It also scraped the winning Calmar out of stdout, but sweep.py logs
+    to stderr, so best_params stayed None even when a winner.json was written."""
+
+    def test_single_cross_symbol_invocation(self, tmp_path, monkeypatch):
+        import json
+        from types import SimpleNamespace
+        from scripts import nightly_tune
+
+        monkeypatch.setattr(nightly_tune, "ROOT", tmp_path)
+        # sweep.py writes winner.json into a fresh results/sweep_* dir; the winner
+        # is only discoverable via that file — never via the (stderr) log stream.
+        wdir = tmp_path / "results" / "sweep_20260101_0000"
+        wdir.mkdir(parents=True)
+        (wdir / "winner.json").write_text(json.dumps({"step_pct": 0.7, "levels": 12}))
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            # mirror reality: sweep.py logs to stderr, stdout is empty
+            return SimpleNamespace(stdout="", stderr="WINNER cfg 3 …")
+
+        monkeypatch.setattr(nightly_tune.subprocess, "run", fake_run)
+
+        symbols = ["SOL/USD", "ETH/USD", "XRP/USD"]
+        params, report = nightly_tune.run_sweep(symbols)
+
+        # exactly one invocation, not one per coin
+        assert len(calls) == 1
+        cmd = calls[0]
+        assert cmd.count("scripts/sweep.py") == 1
+        # every active symbol is carried into that single call
+        assert [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--symbol"] == symbols
+        # the min-trades gate is lowered to the verified reachable threshold
+        assert cmd[cmd.index("--min-trades") + 1] == str(nightly_tune.SWEEP_MIN_TRADES)
+        # winner is read from winner.json despite empty stdout (the stderr-parse bug)
+        assert params == {"step_pct": 0.7, "levels": 12}
+
+    def test_no_symbols_skips_cleanly(self, monkeypatch):
+        from scripts import nightly_tune
+
+        def boom(*a, **k):
+            raise AssertionError("subprocess must not run without symbols")
+
+        monkeypatch.setattr(nightly_tune.subprocess, "run", boom)
+        params, report = nightly_tune.run_sweep([])
+        assert params is None
+        assert "skipped" in report.lower()
 
 
 # ── MLPredictor error path (#117) ────────────────────────────────────────────

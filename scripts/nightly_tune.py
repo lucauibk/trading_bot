@@ -30,6 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
+(ROOT / "logs").mkdir(parents=True, exist_ok=True)  # FileHandler can't create it
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [nightly_tune] %(message)s",
@@ -43,6 +44,14 @@ log = logging.getLogger("nightly_tune")
 
 TODAY = date.today().isoformat()
 REPO  = "lucauibk/trading_bot"
+
+# sweep.py aggregates the min-trades gate over the trades of a single invocation.
+# 60 was verified against the live 120-day fill rate in #201 (a single all-symbol
+# run reached only ~97 aggregate trades for the best config, so the default 100
+# gated everything out). Recommendation-only + OOS-Calmar-gated + manually applied,
+# so this is a robustness threshold, not a live-risk parameter.
+SWEEP_MIN_TRADES = 60
+SWEEP_TIMEOUT_SEC = 3600  # one all-symbol run (was 900s per coin, serial)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -110,44 +119,50 @@ def run_analysis() -> str:
 
 def run_sweep(symbols: List[str]) -> Tuple[Optional[Dict], str]:
     """
-    Run OOS sweep for each symbol.
+    Run ONE OOS sweep across all active symbols (real cross-symbol aggregation).
+
+    This used to loop one ``--symbol`` invocation per coin, but sweep.py evaluates
+    its ``min_trades`` gate on the trade count *aggregated across the symbols of a
+    single invocation*. A per-coin call only ever sees that coin's ~9-27 trades, so
+    no config could clear the (default 100) gate — the nightly report was
+    structurally always empty (#201). On top of that the old code tried to read the
+    winning Calmar out of ``r.stdout``, but sweep.py logs to stderr, so the parse
+    never matched and best_params stayed None even when a winner.json existed.
+
+    We now do a single invocation over the full active set and read winner.json
+    directly (sweep.py already picks the single best cross-symbol config).
+
     Returns (winner_params_dict | None, report_text).
     Does NOT write or commit anything — winner is reported as a recommendation only.
     """
-    best_calmar = -999.0
-    best_params: dict | None = None
     parts = ["## Parameter Sweep (OOS — recommendation only, no automatic apply)\n"]
+    if not symbols:
+        parts.append("No active symbols — sweep skipped.\n")
+        return None, "\n".join(parts)
 
+    cmd = ["python3", "scripts/sweep.py",
+           "--days", "180", "--train-days", "120", "--jobs", "4",
+           "--min-trades", str(SWEEP_MIN_TRADES)]
     for sym in symbols:
-        log.info("Sweep: %s…", sym)
-        try:
-            r = subprocess.run(
-                ["python3", "scripts/sweep.py",
-                 "--symbol", sym,
-                 "--days", "180", "--train-days", "120", "--jobs", "4"],
-                capture_output=True, text=True, timeout=900,
-            )
-            parts.append(f"### {sym}\n\n```\n{r.stdout[-3000:]}\n```\n")
+        cmd += ["--symbol", sym]
 
-            results_dirs = sorted((ROOT / "results").glob("sweep_*"))
-            if results_dirs:
-                winner_file = results_dirs[-1] / "winner.json"
-                if winner_file.exists():
-                    w = json.loads(winner_file.read_text())
-                    for line in r.stdout.splitlines():
-                        if "median calmar" in line.lower():
-                            try:
-                                calmar = float(line.split()[-1])
-                                if calmar > best_calmar:
-                                    best_calmar = calmar
-                                    best_params = w
-                                    log.info("New best config from %s: Calmar=%.2f", sym, calmar)
-                            except Exception:
-                                pass
-        except subprocess.TimeoutExpired:
-            parts.append(f"### {sym}\n\nTimeout (>15 min) — skipped.\n")
-        except Exception as e:
-            parts.append(f"### {sym}\n\nFailed: {e}\n")
+    log.info("Sweep: %s (single cross-symbol run)…", ", ".join(symbols))
+    best_params: Optional[dict] = None
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=SWEEP_TIMEOUT_SEC)
+        tail = ((r.stdout or "")[-2000:] + (r.stderr or "")[-2000:]).strip()
+        parts.append(f"### {', '.join(symbols)}\n\n```\n{tail}\n```\n")
+
+        results_dirs = sorted((ROOT / "results").glob("sweep_*"))
+        if results_dirs:
+            winner_file = results_dirs[-1] / "winner.json"
+            if winner_file.exists():
+                best_params = json.loads(winner_file.read_text())
+                log.info("Sweep winner: %s", best_params)
+    except subprocess.TimeoutExpired:
+        parts.append(f"Timeout (>{SWEEP_TIMEOUT_SEC // 60} min) — sweep skipped.\n")
+    except Exception as e:
+        parts.append(f"Sweep failed: {e}\n")
 
     return best_params, "\n".join(parts)
 

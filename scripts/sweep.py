@@ -122,10 +122,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--max-dd", type=float, default=-15.0)
     parser.add_argument("--min-trades", type=int, default=100)
-    # nightly_tune.run_sweep() invokes this per symbol with --symbol; without this
-    # argument argparse aborted every nightly sweep with SystemExit(2) (#101).
-    parser.add_argument("--symbol", type=str, default=None,
-                        help="Restrict the sweep to a single symbol (default: all SYMBOLS)")
+    # nightly_tune.run_sweep() invokes this with --symbol; without this argument
+    # argparse aborted every nightly sweep with SystemExit(2) (#101). Repeatable
+    # so the caller can request the exact active-symbol set in a single run — the
+    # min-trades gate aggregates trades across the symbols of one invocation, so
+    # a per-coin call could never clear it (#201).
+    parser.add_argument("--symbol", type=str, action="append", default=None,
+                        help="Restrict the sweep to these symbols (repeatable; "
+                             "default: all SYMBOLS)")
     return parser
 
 
@@ -135,9 +139,11 @@ def main():
 
     global SYMBOLS
     if args.symbol:
-        if args.symbol not in SYMBOLS:
-            parser.error(f"unknown --symbol {args.symbol!r}; known: {', '.join(SYMBOLS)}")
-        SYMBOLS = [args.symbol]
+        unknown = [s for s in args.symbol if s not in SYMBOLS]
+        if unknown:
+            parser.error(f"unknown --symbol {unknown}; known: {', '.join(SYMBOLS)}")
+        # dedupe while preserving order
+        SYMBOLS = list(dict.fromkeys(args.symbol))
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     log = logging.getLogger("sweep")
