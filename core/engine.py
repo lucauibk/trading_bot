@@ -93,15 +93,39 @@ class Engine:
         # no new buys, but SL/TP stays active. Tracks state for log-once/resume.
         self._disabled_coins: set = set()
 
-    def run(self):
-        logger.info("Engine starting | symbols=%s", self.symbols)
+    def _clear_stale_session_flags(self):
+        """Null out per-session DB flags that a previous run may have left set,
+        before the first tick.
 
-        # Clear any stale stop_mode from previous session before first tick
+        Both flags are written only on a *transition* (stop_mode on the graceful
+        stop request, frozen on a daily-drawdown freeze/unfreeze edge) and the
+        in-memory context always starts fresh, so a flag that outlived an unclean
+        exit (kill -9, OOM, crash, sandbox reclaim) would otherwise stay pinned
+        in the DB even though the bot trades normally on restart:
+
+        - stop_mode: a stale 'sell_all'/'wait_fills' would block or short-circuit
+          the new session.
+        - frozen (#244): a stale frozen=1 pins the dashboard's red FREEZE banner
+          even while on_tick keeps placing buys (the trade gate reads the
+          in-memory ctx.is_frozen(), not the DB column). The first
+          _check_daily_drawdown tick re-arms frozen=1 immediately if equity is
+          still under the deposit drawdown floor, so no real freeze is lost.
+        """
         try:
             from dashboard.db import set_stop_mode
             set_stop_mode(None)
         except Exception:
             pass
+        try:
+            from dashboard.db import set_frozen
+            set_frozen(False)
+        except Exception:
+            pass
+
+    def run(self):
+        logger.info("Engine starting | symbols=%s", self.symbols)
+
+        self._clear_stale_session_flags()
 
         self.strategy.init(self.symbols, self.ctx)
 

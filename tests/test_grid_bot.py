@@ -3901,3 +3901,54 @@ class TestLoadGridStatesDB:
         assert changed is False
         saved = db.load_grid_states()
         assert saved is not None and saved["SOL/USD"]["total_profit"] == pytest.approx(-11.0)
+
+
+# ── #244: stale session flags cleared on engine start ────────────────────────
+
+class TestEngineStaleSessionFlags:
+    """Regression for #244: an unclean prior exit (kill -9 / OOM / crash /
+    sandbox reclaim) never reaches the clean-shutdown path, so bot_status flags
+    written on a *transition* (frozen on a daily-drawdown edge, stop_mode on a
+    graceful stop) survive into the next session. On restart the in-memory
+    context starts fresh, so the freeze re-arm branch never fires for a stale
+    flag and the dashboard shows a permanent red FREEZE banner while the bot
+    trades normally. The engine must null both flags before the first tick."""
+
+    def _db(self, tmp_path, monkeypatch):
+        import dashboard.db as ddb
+        monkeypatch.setattr(ddb, "DB_PATH", tmp_path / "trades.db")
+        return ddb
+
+    def test_stale_frozen_and_stop_mode_cleared_on_start(self, tmp_path, monkeypatch):
+        import types
+        from core.engine import Engine
+        ddb = self._db(tmp_path, monkeypatch)
+
+        # Simulate the DB state an unclean kill leaves behind: running + a
+        # daily-drawdown FREEZE that was never lifted + a stale graceful-stop.
+        ddb.set_status(running=True)              # creates bot_status id=1 row
+        ddb.set_frozen(True, "Daily drawdown >10%")
+        ddb.set_stop_mode("wait_fills")
+
+        con = ddb.get_conn()
+        row = con.execute(
+            "SELECT frozen, frozen_reason, stop_mode FROM bot_status WHERE id=1"
+        ).fetchone()
+        con.close()
+        assert row["frozen"] == 1 and row["stop_mode"] == "wait_fills"
+
+        eng = Engine(
+            strategy=types.SimpleNamespace(),
+            broker=types.SimpleNamespace(),
+            symbols=["SOL/USD"],
+        )
+        eng._clear_stale_session_flags()
+
+        con = ddb.get_conn()
+        row = con.execute(
+            "SELECT frozen, frozen_reason, stop_mode FROM bot_status WHERE id=1"
+        ).fetchone()
+        con.close()
+        assert row["frozen"] == 0, "stale FREEZE must be cleared on start (#244)"
+        assert row["frozen_reason"] is None, "frozen_reason must be nulled with the flag"
+        assert row["stop_mode"] is None, "stale stop_mode must be cleared on start"
