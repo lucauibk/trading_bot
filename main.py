@@ -59,6 +59,16 @@ def main():
 
     # Live safety check
     if not paper:
+        # Hard live-lock (#171/#248): refuse to start live until Paper/Live parity
+        # is established. This mirrors execution.kraken.LIVE_PARITY_OK and gives a
+        # clean operator message before anything else (API keys, broker build).
+        from execution.kraken import LIVE_PARITY_OK
+        if not LIVE_PARITY_OK:
+            logger.error(
+                "Live trading is hard-locked (LIVE_PARITY_OK=False). Paper/Live "
+                "parity not established — aborting. See CLAUDE.md / issue #171/#248."
+            )
+            sys.exit(1)
         api_key = os.getenv("KRAKEN_API_KEY", os.getenv("BINANCE_API_KEY", ""))
         api_secret = os.getenv("KRAKEN_API_SECRET", os.getenv("BINANCE_API_SECRET", ""))
         if not api_key:
