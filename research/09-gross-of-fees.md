@@ -133,3 +133,13 @@ trägt; „keine Minus-Trades" ist mathematisch unvereinbar mit positiver Erwart
 **Ein schneller/spürbarer Einkommensweg aus einem kleinen Konto existiert nicht** —
 und keine Zutaten-Kombination ändert das. Das ist jetzt über 9 Phasen empirisch,
 nicht nur argumentiert.
+
+### Nachtrag 2026-10-04 — Phase 10 (Copy-Trading offengelegter Trades)
+
+Neuer Zweig, getestet in `research/10-disclosed-trades.md`: **US-Aktien kopieren nach
+Senate-PTRs bzw. Insider-Clusterkäufen (Form 4)**, kostenlose Daten, Retail-Kosten
+0,35 %/Seite. Senate (2015–17, 182 Positionen): **FAIL** (geringe Teststärke).
+Insider-Cluster (2013–23): formal **INCONCLUSIVE** (Kurs-Abdeckung 48 % wegen Delistings
+und Ticker-Umbenennungen), auf der messbaren Hälfte netto und brutto ≤ 0, FF5-α ≈ 0.
+→ Fällt unter Zweig A (öffentliche Daten, Retail): **kein Edge belegt**. House/Pelosi und
+Insider mit bezahlten point-in-time-Kursen bleiben ungetestet (Zweig C, Prior negativ).

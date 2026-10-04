@@ -15,6 +15,7 @@ __pycache__/
 dist/
 build/
 .venv/
+.venv-research/
 venv/
 
 # macOS
