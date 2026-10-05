@@ -1450,6 +1450,33 @@ class TestCancelAllLogging:
         assert "cancel failed" in msgs
         assert "still OPEN" in msgs
         assert "b" in msgs
+# ── Live-Lock (#171/#248) ─────────────────────────────────────────────────────
+
+class TestLiveParityLock:
+    """KrakenBroker must refuse to construct while LIVE_PARITY_OK is False, so no
+    start path (dashboard, start.sh, main.py --no-confirm) can place real orders
+    before Paper/Live parity is established."""
+
+    def test_construction_blocked_while_locked(self):
+        import pytest
+        import execution.kraken as kraken_mod
+
+        assert kraken_mod.LIVE_PARITY_OK is False, (
+            "Live-Lock must ship disabled — flip to True only after parity is proven"
+        )
+        with pytest.raises(RuntimeError, match="hard-locked"):
+            kraken_mod.KrakenBroker("key", "secret")
+
+    def test_construction_allowed_when_parity_flag_set(self, monkeypatch):
+        """Flipping the single documented flag re-enables the live broker."""
+        import execution.kraken as kraken_mod
+
+        monkeypatch.setattr(kraken_mod, "LIVE_PARITY_OK", True)
+        # Must not raise the lock RuntimeError; ccxt client builds offline.
+        broker = kraken_mod.KrakenBroker("key", "secret")
+        assert broker._ex is not None
+
+
 # ── Live reconciler robustness (#76) ──────────────────────────────────────────
 
 class TestReconcileFeeNone:

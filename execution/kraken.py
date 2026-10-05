@@ -26,6 +26,14 @@ KRAKEN_FEE = 0.0016
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 1.5  # seconds
 
+# ── Live-Lock (siehe CLAUDE.md + Meta-Issue #171, #248) ───────────────────────
+# Der Live-Modus bleibt hart gesperrt, bis Paper/Live-Parität nachgewiesen ist.
+# Solange dies False ist, verweigert KrakenBroker die Instanziierung — damit kann
+# KEIN Start-Pfad (dashboard/app.py, start.sh, main.py) echte Orders platzieren,
+# auch nicht mit --no-confirm. Re-Aktivierung = bewusstes Umlegen DIESES einen
+# Flags (nach vollzogener Parität). Paper-Modus (PaperBroker) ist davon unberührt.
+LIVE_PARITY_OK = False
+
 
 def _with_retry(fn, *args, **kwargs):
     last_exc = None
@@ -45,6 +53,14 @@ def _with_retry(fn, *args, **kwargs):
 class KrakenBroker(Broker):
 
     def __init__(self, api_key: str, api_secret: str):
+        if not LIVE_PARITY_OK:
+            raise RuntimeError(
+                "Live trading is hard-locked (execution.kraken.LIVE_PARITY_OK=False). "
+                "Paper/Live parity has not been established — refusing to construct "
+                "KrakenBroker so no real orders can be placed. See CLAUDE.md and "
+                "issue #171/#248. Flip LIVE_PARITY_OK to True only after parity is "
+                "verified."
+            )
         self._ex = ccxt.kraken({
             "apiKey": api_key,
             "secret": api_secret,
