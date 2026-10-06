@@ -82,12 +82,24 @@ def _stop_bot_process():
             pid = int(pid_file.read_text().strip())
             if pid != os.getpid():           # nie sich selbst killen
                 os.kill(pid, signal.SIGTERM)
-                time.sleep(1)
-                try:
-                    os.kill(pid, 0)          # noch am Leben?
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass                     # bereits beendet
+                # #250: give the bot time to run _cleanup() (settle open paper
+                # positions' margin + unrealized PnL back into cash, #183) before
+                # escalating to SIGKILL. A flat 1 s grace was too short: SIGTERM
+                # landing mid-tick (the active ~2–3 s window of each 15 s cycle)
+                # left the tick running past 1 s → SIGKILL before _cleanup() →
+                # persistent margin leak. Poll up to 5 s (mirrors the subprocess
+                # path's _bot_process.wait(timeout=5)); a clean exit returns fast.
+                for _ in range(50):
+                    time.sleep(0.1)
+                    try:
+                        os.kill(pid, 0)      # noch am Leben?
+                    except ProcessLookupError:
+                        break                # bereits sauber beendet
+                else:
+                    try:
+                        os.kill(pid, signal.SIGKILL)   # Gnadenfrist abgelaufen
+                    except ProcessLookupError:
+                        pass
         except (ValueError, ProcessLookupError, PermissionError):
             pass
         pid_file.unlink(missing_ok=True)
