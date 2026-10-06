@@ -250,6 +250,39 @@ class TestReconcilerOrderCleanup:
         r.remove_order("c1")
         assert r.get_tracked_orders() == []
 
+    def test_tick_aborts_promptly_on_shutdown(self, monkeypatch):
+        """Regression for #250: once the ShutdownFlag is cleared (SIGTERM), a
+        _tick() must break out of its per-symbol loops immediately instead of
+        running the full N ticker fetches + 0.4 s sleeps. Otherwise the tick
+        outlives the dashboard SIGKILL grace and _cleanup()/MTM-settle never
+        runs → open paper positions' margin leaks from the persisted equity.
+
+        We assert the ticker-fetch loop performs zero fetches when the flag is
+        already down — i.e. the shutdown guard short-circuits before any work.
+        """
+        import data_fetcher
+        calls = []
+        monkeypatch.setattr(data_fetcher, "fetch_ticker",
+                            lambda s: calls.append(s) or {"last": 100.0})
+        monkeypatch.setattr(
+            data_fetcher, "fetch_ohlcv",
+            lambda *a, **k: pytest.fail("fetch_ohlcv must not run during shutdown"))
+
+        eng = self._engine(self._StubReconciler())
+        eng.symbols = ["A/USD", "B/USD", "C/USD"]
+        eng._loop_count = 1  # skip the BTC/funding/rebuild schedules (N % cycle)
+        # Neutralise DB-touching pre-loop housekeeping so the test is hermetic.
+        eng._check_dashboard_stop = lambda: None
+        eng._refresh_coin_settings = lambda: None
+        eng._check_daily_drawdown = lambda: None
+        eng._log_equity = lambda: None
+        eng._update_prediction_outcomes = lambda fn: None
+
+        eng._shutdown.stop()   # simulate SIGTERM having arrived
+        eng._tick()
+
+        assert calls == []     # broke before the first ticker fetch
+
 
 class TestRefreshRollbackFeatureNames:
 

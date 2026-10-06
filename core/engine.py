@@ -198,6 +198,19 @@ class Engine:
 
         prices: Dict[str, float] = {}
         for sym in self.symbols:
+            # #250: make the tick shutdown-aware. SIGTERM only flips the
+            # ShutdownFlag (core/lifecycle.py); it is checked in the outer while
+            # loop and the inter-tick sleep, but WITHOUT this guard the inner
+            # per-symbol work (N ticker fetches + N×0.4 s sleeps ≥ 2 s, plus the
+            # every-5-tick fetch_ohlcv + ML-predict below) always runs to
+            # completion. A dashboard "⏹ Stoppen" on an externally started bot
+            # then SIGKILLs after only a short grace (dashboard/app.py), landing
+            # before the loop exits → _cleanup()/_mtm_close_paper_positions()
+            # never runs → each open paper position's bound margin + unrealized
+            # PnL is silently dropped from the persisted equity (a #183 leak via
+            # a second path). Breaking out early lets _cleanup() settle in <1 s.
+            if not self._shutdown.is_running():
+                break
             try:
                 prices[sym] = float(fetch_ticker(sym)["last"])
                 time.sleep(0.4)
@@ -211,6 +224,11 @@ class Engine:
             self._last_price_ts[sym] = now
 
         for sym in self.symbols:
+            # #250: abort the per-symbol processing loop promptly on shutdown
+            # too (fetch_ohlcv + ML-predict + grid rebuild can each take seconds)
+            # so SIGTERM reaches _cleanup() well before the dashboard SIGKILL.
+            if not self._shutdown.is_running():
+                break
             price = prices.get(sym)
             if price is None:
                 continue
